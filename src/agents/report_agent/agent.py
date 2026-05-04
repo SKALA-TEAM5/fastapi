@@ -251,11 +251,13 @@ class ReportAgent:
                     missing[self._evidence_summary_key(str(req.evidence_type_code))] += 1
             for log in item.validation_logs:
                 if RESULT_TO_DECISION.get(log.result_code) in {"needs_review", "inappropriate"}:
-                    evidence_type = str(log.details.get("evidence_type_code") or "other")
+                    evidence_type = log.details.get("evidence_type_code")
+                    if not evidence_type and not self._is_evidence_validation_log(log):
+                        continue
                     evidence_key = self._evidence_summary_key(
-                        evidence_type,
+                        str(evidence_type or "other"),
                         log.details.get("original_filename") or log.details.get("filename"),
-                        log.details.get("evidence_detail_name") or log.details.get("document_name") or log.details.get("detail_name"),
+                        self._evidence_detail_from_log(log),
                     )
                     errors[evidence_key] += 1
                     major_errors.setdefault(evidence_key, []).append(str(log.details.get("summary") or log.details.get("reason") or log.result_code))
@@ -490,14 +492,14 @@ class ReportAgent:
     def _evidence_type_name(self, code: str) -> str:
         if code.startswith("other:"):
             detail = code.split(":", 1)[1]
-            return f"기타 서류({detail})" if detail else "기타 서류"
+            return f"기타 서류({detail})" if detail else "기타 서류(세부명 미확인)"
         return {
             "usage_statement": "사용내역서",
             "receipt": "영수증·거래명세서",
             "site_photo": "현장사진",
             "tax_invoice": "세금계산서",
-            "other_document": "기타 서류",
-            "other": "기타 서류",
+            "other_document": "기타 서류(세부명 미확인)",
+            "other": "기타 서류(세부명 미확인)",
         }.get(code, code)
 
     def _evidence_summary_key(self, code: str, filename: object | None = None, detail_name: object | None = None) -> str:
@@ -510,7 +512,25 @@ class ReportAgent:
         detail = str(detail_name).strip() if detail_name else ""
         if not detail and filename:
             detail = self._other_document_detail_from_filename(str(filename))
-        return f"other:{detail}" if detail else "other"
+        return f"other:{detail or '세부명 미확인'}"
+
+    def _is_evidence_validation_log(self, log) -> bool:
+        validation_type = str(log.validation_type_code).lower()
+        return any(keyword in validation_type for keyword in ["evidence", "ocr", "vision", "receipt", "tax"])
+
+    def _evidence_detail_from_log(self, log) -> str:
+        for key in [
+            "evidence_detail_name",
+            "document_name",
+            "detail_name",
+            "document_type_name",
+            "서류명",
+            "문서명",
+        ]:
+            value = log.details.get(key)
+            if value:
+                return str(value)
+        return ""
 
     def _other_document_detail_from_filename(self, filename: str) -> str:
         stem = Path(filename).stem.strip()

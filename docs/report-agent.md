@@ -24,17 +24,19 @@ DB rows
 
 이 모듈은 역할별로 파일을 분리합니다. 보고서 판단, 문장 작성, DOCX 렌더링 책임을 한 파일에 섞지 않는 것이 원칙입니다.
 
-| 파일 | 역할 |
-| --- | --- |
-| `schemas.py` | 보고서 agent가 주고받는 데이터 구조를 정의합니다. `ReportContext`는 입력, `ReportDraft`는 화면 편집 및 렌더링용 출력입니다. classifier/validator 결과와 법령 citation 구조도 여기서 정의합니다. |
-| `context_builder.py` | DB row를 `ReportContext`로 조립하는 경계 예시입니다. 실제 DB 구현은 하지 않고, FastAPI나 worker가 구현해야 할 repository 인터페이스를 정의합니다. |
-| `agent.py` | 보고서 초안을 만드는 핵심 파일입니다. 입력 데이터를 표, 이슈, 보완사항 구조로 바꾸고 classifier/validator 결과를 반영합니다. LLM 결과가 있으면 허용된 문장 필드만 병합합니다. |
-| `llm.py` | OpenAI API 호출 어댑터입니다. LLM에게 전체 보고서를 맡기지 않고 결론, 종합 의견, 필요 조치 같은 문장 필드만 JSON 패치로 요청합니다. |
-| `renderer.py` | `ReportDraft`를 DOCX 파일로 렌더링합니다. v2 샘플 보고서의 11개 표와 종합 의견 문단을 채우고, 6번 상세 내역 표를 이슈 개수에 맞게 늘리거나 줄입니다. |
-| `prompts/system.md` | LLM의 기본 역할과 금지사항을 정의합니다. 근거 없는 법령 생성, 금액/판정 변경을 금지합니다. |
-| `prompts/report_draft.md` | LLM에게 넘기는 작업 프롬프트입니다. 어떤 JSON 필드만 반환해야 하는지 정의합니다. |
-| `template_mapping.md` | v2 DOCX 샘플의 표와 본문이 `ReportDraft`의 어떤 필드와 연결되는지 정리한 유지보수용 문서입니다. 실행 코드는 아닙니다. |
-| `examples/sample_input.json` | 최소 샘플 `ReportContext`입니다. agent와 renderer 동작 확인에 사용합니다. |
+| 파일                                        | 역할                                                                                                                                                                                               |
+| ------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `schemas.py`                              | 보고서 agent가 주고받는 데이터 구조를 정의합니다.`ReportContext`는 입력, `ReportDraft`는 화면 편집 및 렌더링용 출력입니다. classifier/validator 결과와 법령 citation 구조도 여기서 정의합니다. |
+| `context_builder.py`                      | DB row를 `ReportContext`로 조립하는 경계 예시입니다. 실제 DB 구현은 하지 않고, FastAPI나 worker가 구현해야 할 repository 인터페이스를 정의합니다.                                                |
+| `agent.py`                                | 보고서 초안을 만드는 핵심 파일입니다. 입력 데이터를 표, 이슈, 보완사항 구조로 바꾸고 classifier/validator 결과를 반영합니다. LLM 결과가 있으면 허용된 문장 필드만 병합합니다.                      |
+| `llm.py`                                  | OpenAI API 호출 어댑터입니다. LLM에게 전체 보고서를 맡기지 않고 결론, 종합 의견, 필요 조치 같은 문장 필드만 JSON 패치로 요청합니다.                                                                |
+| `renderer.py`                             | `ReportDraft`를 DOCX 파일로 렌더링합니다. v2 샘플 보고서의 11개 표와 종합 의견 문단을 채우고, 6번 상세 내역 표를 이슈 개수에 맞게 늘리거나 줄입니다.                                             |
+| `templates/report_template.docx`          | 렌더러가 기본으로 사용하는 공식 보고서 DOCX 템플릿입니다.                                                                                                                                          |
+| `prompts/system_report.md`                | LLM의 기본 역할과 금지사항을 정의합니다. 근거 없는 법령 생성, 금액/판정 변경을 금지합니다.                                                                                                         |
+| `prompts/report_draft_template.md`        | LLM에게 넘기는 작업 프롬프트입니다. 어떤 JSON 필드만 반환해야 하는지 정의합니다.                                                                                                                   |
+| `docs/report-agent-template-mapping.md`   | DOCX 샘플의 표와 본문이 `ReportDraft`의 어떤 필드와 연결되는지 정리한 유지보수용 문서입니다.                                                                                                     |
+| `examples/report_agent/sample_input.json` | 최소 샘플 `ReportContext`입니다. agent와 renderer 동작 확인에 사용합니다.                                                                                                                        |
+| `examples/report_agent/sample_output.docx` | 공식 템플릿으로 만든 보고서 예시입니다. 형식 확인과 수동 비교에 사용합니다.                                                                                                                       |
 
 전체 흐름은 다음과 같습니다.
 
@@ -98,7 +100,7 @@ UsageStatementItemContext(
 `ReportAgent()`는 기본적으로 `OPENAI_API_KEY`가 있으면 LLM을 호출합니다. API 키가 없거나 호출이 실패하면 LLM 없이 만든 초안을 반환하고, 실패 사유를 `needs_human_review`에 남깁니다.
 
 ```python
-from agent.report_agent.agent import ReportAgent
+from src.agents.report_agent.agent import ReportAgent
 
 draft = ReportAgent().generate(context)
 ```
@@ -173,28 +175,6 @@ LLM은 다음 필드를 바꿀 수 없습니다.
 - 6번 상세 내역은 이슈 수에 맞춰 `6.1`, `6.2`, `6.3`... 블록과 표를 늘리거나 줄임
 - 추가 행은 기존 행 스타일을 복제해 표 음영/테두리 유지
 - 샘플 파일이 없으면 기본 12표 DOCX를 생성
-
-## FastAPI 연결 예시
-
-권장 API 흐름:
-
-```text
-POST /reports/drafts
-GET /reports/drafts/{draft_id}
-PATCH /reports/drafts/{draft_id}
-POST /reports/drafts/{draft_id}/render/docx
-POST /reports/drafts/{draft_id}/render/pdf
-```
-
-`POST /reports/drafts`에서 할 일:
-
-1. DB에서 프로젝트/사용내역서/항목/파일/검증 로그 조회
-2. classifier/validator 결과를 항목별로 붙임
-3. `ReportContext` 생성
-4. `ReportAgent().generate(context)` 호출
-5. `ReportDraft` 저장 및 반환
-
-`PATCH /reports/drafts/{draft_id}`에서는 사용자가 화면에서 수정한 문장/표 데이터를 저장합니다. 원본 validator 결과와 citation은 별도 보존하는 것이 좋습니다.
 
 ## 운영 원칙
 

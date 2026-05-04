@@ -34,9 +34,7 @@ except ImportError:  # 직접 스크립트로 실행할 때 사용하는 예비 
     )
 
 
-DEFAULT_TEMPLATE_PATH = Path(
-    r"C:\Users\Hyeon\Downloads\산업안전보건관리비_증빙검토_보고서_AR-2025-0312_v2.docx"
-)
+DEFAULT_TEMPLATE_PATH = Path(__file__).parent / "templates" / "report_template.docx"
 MIN_TABLE_COUNT = 11
 EMPTY_LABEL = "-"
 
@@ -101,9 +99,16 @@ def _apply_document_defaults(document: DocumentObject) -> None:
     section.left_margin = Cm(1.8)
     section.right_margin = Cm(1.8)
 
-    style = next((item for item in document.styles if item.style_id == "Normal"), None)
+    style = next(
+        (
+            item
+            for item in document.styles
+            if item.style_id == "Normal" or item.name in {"Normal", "표준"}
+        ),
+        None,
+    )
     if style is None:
-        style = document.styles["Normal"]
+        return
     style.font.name = "맑은 고딕"
     style._element.rPr.rFonts.set(qn("w:eastAsia"), "맑은 고딕")
     style.font.size = Pt(9)
@@ -122,6 +127,7 @@ def _fill_report_tables(document: DocumentObject, draft: ReportDraft) -> None:
     _fill_category_summaries(tables[3], draft)
     _fill_evidence_summaries(tables[4], draft)
     _fill_tax_rows(tables[5], draft)
+    _fill_tax_note_paragraph(document, draft)
     _fill_item_reviews(tables[6], draft)
     issue_tables = _ensure_issue_detail_blocks(document, tables[7:10], len(draft.issue_details))
     _fill_issue_detail_blocks(issue_tables, draft.issue_details)
@@ -218,6 +224,31 @@ def _fill_tax_rows(table: Table, draft: ReportDraft) -> None:
         for row in draft.tax_settlement_rows
     )
     _fill_grid(table, _with_empty_body(rows, 5))
+
+
+def _fill_tax_note_paragraph(document: DocumentObject, draft: ReportDraft) -> None:
+    """템플릿에 남아 있는 세금 검토 예시 메모를 현재 draft 기준으로 교체합니다."""
+
+    tax_heading_index = _find_paragraph_index(document, "4. 세금 및 정산 검토")
+    next_heading_index = _find_paragraph_index(document, "5. 항목별 적정성 검토 결과")
+    if tax_heading_index is None or next_heading_index is None:
+        return
+
+    note = ""
+    if draft.tax_settlement_rows:
+        differences = [
+            row
+            for row in draft.tax_settlement_rows
+            if row.difference_label and row.difference_label != EMPTY_LABEL
+        ]
+        if differences:
+            note = "※ 세금 및 정산 검토 결과 차이 확인 항목이 있어 담당자 확인이 필요합니다."
+        else:
+            note = "※ 세금 및 정산 검토 결과 특이사항 없음"
+
+    for paragraph in document.paragraphs[tax_heading_index + 1 : next_heading_index]:
+        if paragraph.text.strip().startswith("※"):
+            _set_paragraph_text(paragraph, note)
 
 
 def _fill_item_reviews(table: Table, draft: ReportDraft) -> None:
@@ -359,8 +390,10 @@ def _fill_overall_opinion_paragraphs(document: DocumentObject, draft: ReportDraf
             _set_paragraph_text(paragraph, f"검토 일자 :   {draft.written_date_label}")
             continue
         if opinion_written:
-            if text and "안전관리팀" in text:
+            if text and ("안전관리팀" in text or text == draft.department_label):
                 _set_paragraph_text(paragraph, draft.department_label)
+            elif text:
+                _set_paragraph_text(paragraph, "")
             continue
         if not opinion_written and text:
             _set_paragraph_text(paragraph, draft.overall_opinion or EMPTY_LABEL)
