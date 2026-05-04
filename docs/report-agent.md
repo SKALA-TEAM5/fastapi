@@ -1,6 +1,6 @@
 # Report Agent
 
-산업안전보건관리비 증빙 검토 결과를 보고서 초안으로 만드는 agent 모듈입니다. 이 모듈의 산출물은 화면에서 편집 가능한 `ReportDraft` JSON이며, DOCX/PDF 파일은 별도 renderer가 생성합니다.
+산업안전보건관리비 증빙 검토 결과를 `ReportDraft` JSON 보고서로 만드는 agent 모듈입니다.
 
 ## 역할
 
@@ -15,28 +15,24 @@ DB rows
   -> ReportAgent
   -> ReportDraft JSON
   -> UI edit
-  -> DOCX/PDF renderer
 ```
 
 이 agent는 DB를 직접 조회하지 않습니다. FastAPI 또는 worker가 DB와 다른 agent 결과를 모아 `ReportContext`를 만든 뒤 호출해야 합니다.
 
 ## 코드 구성과 책임
 
-이 모듈은 역할별로 파일을 분리합니다. 보고서 판단, 문장 작성, DOCX 렌더링 책임을 한 파일에 섞지 않는 것이 원칙입니다.
+이 모듈은 역할별로 파일을 분리합니다. 보고서 판단과 문장 작성, JSON 입출력 책임을 명확히 나누는 것이 원칙입니다.
 
 | 파일                                        | 역할                                                                                                                                                                                               |
 | ------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `schemas.py`                              | 보고서 agent가 주고받는 데이터 구조를 정의합니다.`ReportContext`는 입력, `ReportDraft`는 화면 편집 및 렌더링용 출력입니다. classifier/validator 결과와 법령 citation 구조도 여기서 정의합니다. |
 | `context_builder.py`                      | DB row를 `ReportContext`로 조립하는 경계 예시입니다. 실제 DB 구현은 하지 않고, FastAPI나 worker가 구현해야 할 repository 인터페이스를 정의합니다.                                                |
 | `agent.py`                                | 보고서 초안을 만드는 핵심 파일입니다. 입력 데이터를 표, 이슈, 보완사항 구조로 바꾸고 classifier/validator 결과를 반영합니다. LLM 결과가 있으면 허용된 문장 필드만 병합합니다.                      |
+| `cli.py`                                  | `ReportContext` JSON 파일을 읽어 `ReportDraft` JSON 보고서 파일을 생성하는 로컬 실행 진입점입니다.                                                                                                  |
 | `llm.py`                                  | OpenAI API 호출 어댑터입니다. LLM에게 전체 보고서를 맡기지 않고 결론, 종합 의견, 필요 조치 같은 문장 필드만 JSON 패치로 요청합니다.                                                                |
-| `renderer.py`                             | `ReportDraft`를 DOCX 파일로 렌더링합니다. v2 샘플 보고서의 11개 표와 종합 의견 문단을 채우고, 6번 상세 내역 표를 이슈 개수에 맞게 늘리거나 줄입니다.                                             |
-| `templates/report_template.docx`          | 렌더러가 기본으로 사용하는 공식 보고서 DOCX 템플릿입니다.                                                                                                                                          |
 | `prompts/system_report.md`                | LLM의 기본 역할과 금지사항을 정의합니다. 근거 없는 법령 생성, 금액/판정 변경을 금지합니다.                                                                                                         |
 | `prompts/report_draft_template.md`        | LLM에게 넘기는 작업 프롬프트입니다. 어떤 JSON 필드만 반환해야 하는지 정의합니다.                                                                                                                   |
-| `docs/report-agent-template-mapping.md`   | DOCX 샘플의 표와 본문이 `ReportDraft`의 어떤 필드와 연결되는지 정리한 유지보수용 문서입니다.                                                                                                     |
-| `examples/report_agent/sample_input.json` | 최소 샘플 `ReportContext`입니다. agent와 renderer 동작 확인에 사용합니다.                                                                                                                        |
-| `examples/report_agent/sample_output.docx` | 공식 템플릿으로 만든 보고서 예시입니다. 형식 확인과 수동 비교에 사용합니다.                                                                                                                       |
+| `examples/report_agent/sample_input.json` | 최소 샘플 `ReportContext`입니다. agent와 JSON 생성 CLI 동작 확인에 사용합니다.                                                                                                                     |
 
 전체 흐름은 다음과 같습니다.
 
@@ -53,8 +49,8 @@ agent.py
 llm.py
   ReportDraft의 문장 필드만 보강
 
-renderer.py
-  ReportDraft -> DOCX
+cli.py
+  ReportContext JSON -> ReportDraft JSON 파일
 ```
 
 ## 입력
@@ -134,7 +130,9 @@ LLM은 다음 필드를 바꿀 수 없습니다.
 
 ## 출력
 
-`ReportDraft`는 화면 편집과 렌더링을 위한 구조화 JSON입니다.
+`ReportDraft`는 화면 편집, 저장, API 응답에 사용하는 구조화 JSON 보고서입니다.
+
+`report_sections`는 웹 화면, PDF 출력, DOCX 변환기가 같은 보고서 형식을 재현할 수 있도록 템플릿 순서의 섹션과 표를 담습니다. 프론트엔드와 내보내기 로직은 이 필드를 기준으로 표지, 기본 정보, 집행 요약, 상세 내역, 종합 의견을 같은 순서와 제목으로 렌더링해야 합니다.
 
 주요 섹션:
 
@@ -147,8 +145,22 @@ LLM은 다음 필드를 바꿀 수 없습니다.
 - 부적정/검토 필요 상세 내역
 - 보완 필요 사항
 - 종합 의견
+- `report_sections`: 실제 보고서 형식 렌더링용 섹션/표/문단 구조
 
-프론트엔드에서는 `ReportDraft`를 편집 대상으로 두는 것이 권장됩니다. 사용자가 수정한 draft를 저장한 뒤 renderer에 넘겨 DOCX/PDF를 생성합니다.
+프론트엔드에서는 `ReportDraft`를 편집 대상으로 두는 것이 권장됩니다. 사용자가 수정한 draft도 같은 JSON 구조로 저장합니다.
+
+## JSON 보고서 생성
+
+샘플 입력으로 JSON 보고서를 생성하려면 다음 명령을 사용합니다.
+
+```bash
+uv run python -m src.agents.report_agent.cli \
+  examples/report_agent/sample_input.json \
+  output/report_agent/sample_report_draft.json \
+  --no-llm
+```
+
+`--no-llm`을 빼면 `OPENAI_API_KEY`가 있을 때 문장 필드 보강을 시도합니다. API 키가 없으면 LLM 없이 생성된 deterministic draft를 반환합니다.
 
 ## 증빙 유형 집계
 
@@ -164,17 +176,6 @@ LLM은 다음 필드를 바꿀 수 없습니다.
 ```
 
 세부명은 `EvidenceFileContext.evidence_detail_name`을 우선 사용하고, 없으면 파일명에서 `지급대장`, `건강검진 계약서`, `계약서`, `선임계`, `설치확인서` 등을 추출합니다.
-
-## DOCX 렌더링
-
-`renderer.py`는 `ReportDraft`를 DOCX로 렌더링합니다.
-
-렌더러 동작:
-
-- 표 목록 행은 데이터 개수에 맞춰 늘리거나 줄임
-- 6번 상세 내역은 이슈 수에 맞춰 `6.1`, `6.2`, `6.3`... 블록과 표를 늘리거나 줄임
-- 추가 행은 기존 행 스타일을 복제해 표 음영/테두리 유지
-- 샘플 파일이 없으면 기본 12표 DOCX를 생성
 
 ## 운영 원칙
 

@@ -3,7 +3,7 @@ from __future__ import annotations
 """보고서 생성 경계에서 사용하는 타입 계약입니다.
 
 ReportContext는 FastAPI나 worker가 DB row와 다른 agent 결과를 조립한 입력입니다.
-ReportDraft는 화면에서 편집하고 DOCX/PDF로 렌더링하는 JSON 산출물입니다.
+ReportDraft는 화면에서 편집하고 API 응답으로 반환하는 JSON 보고서 산출물입니다.
 """
 
 from datetime import date, datetime
@@ -237,9 +237,28 @@ class SupplementActionDraft(BaseModel):
     assignee: str
 
 
-class ReportDraft(BaseModel):
-    """화면에서 편집하고 renderer.py로 출력하는 구조화 보고서 초안입니다."""
+class ReportTableDraft(BaseModel):
+    """웹/PDF/DOCX 렌더러가 같은 표를 그릴 수 있도록 보존하는 표 구조입니다."""
 
+    title: str | None = None
+    headers: list[str] = Field(default_factory=list)
+    rows: list[list[str]] = Field(default_factory=list)
+
+
+class ReportSectionDraft(BaseModel):
+    """실제 보고서 형식의 섹션 단위 레이아웃입니다."""
+
+    section_id: str
+    title: str
+    kind: Literal["cover", "table", "detail", "opinion"]
+    paragraphs: list[str] = Field(default_factory=list)
+    tables: list[ReportTableDraft] = Field(default_factory=list)
+
+
+class ReportDraft(BaseModel):
+    """화면에서 편집하고 저장하는 구조화 JSON 보고서 초안입니다."""
+
+    layout_version: str = "safety_cost_report_v1"
     report_no: str
     title: str = "산업안전보건관리비 집행 증빙 검토 결과 보고서"
     site_name: str
@@ -257,4 +276,5 @@ class ReportDraft(BaseModel):
     issue_details: list[IssueDetailDraft]
     supplement_actions: list[SupplementActionDraft]
     overall_opinion: str
+    report_sections: list[ReportSectionDraft] = Field(default_factory=list)
     needs_human_review: list[str] = Field(default_factory=list)

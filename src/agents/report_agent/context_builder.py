@@ -3,7 +3,7 @@ from __future__ import annotations
 """저장소 row에서 ReportContext를 조립합니다.
 
 이 모듈은 DB 접근 경계만 정의합니다. 보고서 문장 작성, LLM 호출,
-DOCX 렌더링 로직은 여기에 두지 않습니다.
+JSON 보고서 파일 출력 로직은 여기에 두지 않습니다.
 """
 
 from collections import defaultdict

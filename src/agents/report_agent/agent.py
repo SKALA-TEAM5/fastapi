@@ -25,6 +25,8 @@ from .schemas import (
     LegalCitationDraft,
     ReportContext,
     ReportDraft,
+    ReportSectionDraft,
+    ReportTableDraft,
     SupplementActionDraft,
     TaxSettlementRowDraft,
 )
@@ -112,7 +114,7 @@ class ReportAgent:
             issue_count=len(issues),
         )
 
-        return ReportDraft(
+        draft = ReportDraft(
             report_no=context.report_no,
             site_name=project.project_name,
             report_period_label=context.report_period_label,
@@ -158,6 +160,7 @@ class ReportAgent:
             overall_opinion=overall_opinion,
             needs_human_review=self._find_missing_critical_inputs(context),
         )
+        return draft.model_copy(update={"report_sections": self._build_report_sections(draft)})
 
     def _build_item_review(self, no: int, item) -> ItemReviewDraft:
         worst_result = "ok"
@@ -239,9 +242,9 @@ class ReportAgent:
     def _build_evidence_summaries(self, context: ReportContext) -> list[EvidenceValidationSummaryDraft]:
         """증빙을 유형별로 집계하되 기타 서류는 세부명으로 분리합니다."""
 
-        submitted = Counter()
-        missing = Counter()
-        errors = Counter()
+        submitted: Counter[str] = Counter()
+        missing: Counter[str] = Counter()
+        errors: Counter[str] = Counter()
         major_errors: dict[str, list[str]] = {}
         for item in context.items:
             for file in item.evidence_files:
@@ -351,7 +354,142 @@ class ReportAgent:
         if actions is not draft.supplement_actions:
             update["supplement_actions"] = actions
 
-        return draft.model_copy(update=update)
+        merged = draft.model_copy(update=update)
+        return merged.model_copy(update={"report_sections": self._build_report_sections(merged)})
+
+    def _build_report_sections(self, draft: ReportDraft) -> list[ReportSectionDraft]:
+        """웹/PDF/DOCX가 동일한 보고서 형식을 그릴 수 있는 섹션 구조를 만듭니다."""
+
+        cover_rows = [
+            ["현장명", draft.site_name],
+            ["검토 대상 기간", draft.report_period_label],
+            ["보고서 번호", draft.report_no],
+            ["작성일", draft.written_date_label],
+            ["작성 부서", self._department_full_label(draft)],
+        ]
+        basic_info_rows = [
+            ["보고서 번호", draft.report_no, "검토 일자", draft.written_date_label],
+            ["현장명", draft.site_name, "현장코드", draft.basic_info.get("현장코드", "-")],
+            ["발주처", draft.basic_info.get("발주처", "-"), "시공사", draft.basic_info.get("시공사", "-")],
+            ["계약금액", draft.basic_info.get("계약금액", "-"), "공사기간", draft.basic_info.get("공사기간", "-")],
+            ["법정 계상액", draft.basic_info.get("법정 계상액", "-"), "검토자", draft.reviewer_label],
+            ["검토 대상 기간", draft.report_period_label, "검토 목적", draft.basic_info.get("검토 목적", "-")],
+        ]
+        amount_rows = [
+            [summary.label, self._money(summary.amount), summary.ratio_label, summary.count_label]
+            for summary in draft.amount_summary
+        ]
+        category_rows = [
+            [summary.category_name, self._money(summary.amount), f"{summary.count}건", summary.note]
+            for summary in draft.category_summaries
+        ]
+        evidence_rows = [
+            [
+                summary.evidence_type_name,
+                self._count(summary.submitted_count),
+                self._count(summary.passed_count),
+                self._count(summary.error_count),
+                self._count(summary.missing_count),
+                summary.major_error,
+            ]
+            for summary in draft.evidence_validation_summaries
+        ]
+        tax_rows = [
+            [
+                row.item_name,
+                self._money(row.document_supply_amount),
+                self._money(row.execution_supply_amount),
+                self._money(row.vat_amount),
+                row.difference_label,
+            ]
+            for row in draft.tax_settlement_rows
+        ] or [["-", "-", "-", "-", "-"]]
+        item_rows = [
+            [str(review.no), review.item_name, self._money(review.amount), review.decision_label, review.summary_reason]
+            for review in draft.item_reviews
+        ]
+        issue_tables = [
+            ReportTableDraft(
+                title=f"6.{index}  {'부적정' if issue.issue_type == 'inappropriate' else '검토 필요'} - No.{issue.no}  {issue.title}",
+                rows=[
+                    ["집행 금액", issue.amount_label],
+                    ["확인된 문제" if issue.issue_type == "needs_review" else "집행 경위", issue.problem or issue.agent_conclusion],
+                    ["판정 결론", "부적정" if issue.issue_type == "inappropriate" else "검토필요"],
+                    ["법령 근거", issue.legal_basis],
+                    ["조치 사항", issue.required_action or issue.agent_conclusion],
+                ],
+            )
+            for index, issue in enumerate(draft.issue_details, start=1)
+        ] or [ReportTableDraft(title="6.1  -", rows=[["확인된 문제", "-"], ["법령 근거", "-"], ["조치 사항", "-"]])]
+        action_rows = [
+            [str(action.no), action.title, action.action, action.due_date_label, action.assignee]
+            for action in draft.supplement_actions
+        ] or [["-", "-", "-", "-", "-"]]
+
+        return [
+            ReportSectionDraft(
+                section_id="cover",
+                title=draft.title,
+                kind="cover",
+                tables=[ReportTableDraft(rows=cover_rows)],
+            ),
+            ReportSectionDraft(
+                section_id="basic_info",
+                title="1. 기본 정보",
+                kind="table",
+                tables=[ReportTableDraft(rows=basic_info_rows)],
+            ),
+            ReportSectionDraft(
+                section_id="execution_summary",
+                title="2. 집행 내역 요약",
+                kind="table",
+                tables=[
+                    ReportTableDraft(title="집행 금액 요약", headers=["구분", "금액", "집행률", "비고"], rows=amount_rows),
+                    ReportTableDraft(title="항목별 집행 현황 (법정 9개 항목 기준)", headers=["집행 항목", "집행액 (원)", "건수", "비고"], rows=category_rows),
+                ],
+            ),
+            ReportSectionDraft(
+                section_id="evidence_validation",
+                title="3. 증빙 유효성 검증 결과",
+                kind="table",
+                tables=[ReportTableDraft(headers=["증빙 유형", "제출", "통과", "오류", "누락", "주요 내용"], rows=evidence_rows)],
+            ),
+            ReportSectionDraft(
+                section_id="tax_settlement",
+                title="4. 세금 및 정산 검토",
+                kind="table",
+                tables=[ReportTableDraft(headers=["항목", "세금계산서 금액", "영수증 기재액", "부가세", "일치 여부"], rows=tax_rows)],
+            ),
+            ReportSectionDraft(
+                section_id="item_reviews",
+                title="5. 항목별 적정성 검토 결과",
+                kind="table",
+                tables=[ReportTableDraft(headers=["No.", "집행 항목", "집행액", "판정", "요약 사유"], rows=item_rows)],
+            ),
+            ReportSectionDraft(
+                section_id="issue_details",
+                title="6. 부적정 및 검토 필요 상세 내역",
+                kind="detail",
+                tables=issue_tables,
+            ),
+            ReportSectionDraft(
+                section_id="supplement_actions",
+                title="7. 보완 필요 사항",
+                kind="table",
+                tables=[ReportTableDraft(headers=["No.", "보완 항목", "실행 내용", "완료 기한", "담당자"], rows=action_rows)],
+            ),
+            ReportSectionDraft(
+                section_id="overall_opinion",
+                title="8. 종합 의견",
+                kind="opinion",
+                paragraphs=[
+                    draft.overall_opinion,
+                    f"검 토 자 :   {draft.reviewer_label}          (서명)  ______________________",
+                    f"검토 일자 :   {draft.written_date_label}",
+                    draft.department_label,
+                ],
+            ),
+        ]
 
     def _merge_llm_issues(self, draft: ReportDraft, payload: object):
         if not isinstance(payload, list):
@@ -488,6 +626,16 @@ class ReportAgent:
 
     def _money(self, value: Decimal) -> str:
         return f"{value:,.0f}원"
+
+    def _count(self, value: int) -> str:
+        return "-" if value == 0 else f"{value}건"
+
+    def _department_full_label(self, draft: ReportDraft) -> str:
+        company = draft.basic_info.get("시공사", "").strip()
+        department = draft.department_label.strip()
+        if company and department and company not in department:
+            return f"{company} {department}"
+        return department or company or "-"
 
     def _evidence_type_name(self, code: str) -> str:
         if code.startswith("other:"):

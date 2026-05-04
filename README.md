@@ -91,8 +91,10 @@ src/agents/safety_doc_agent/
 src/agents/report_agent/
   __init__.py
   agent.py
+  cli.py
   context_builder.py
-  renderer.py
+  schemas.py
+  llm.py
 ```
 
 ### `src/ocr/`
@@ -282,8 +284,8 @@ tests/
 `report_agent`
 
 - `agent.py`
+- `cli.py`
 - `context_builder.py`
-- `renderer.py`
 - `schemas.py`
 - `llm.py`
 
