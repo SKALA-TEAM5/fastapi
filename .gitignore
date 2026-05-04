@@ -1,0 +1,74 @@
+# --- Python ---
+__pycache__/
+*.py[cod]
+*.pyd
+*.so
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# --- Build / packaging ---
+build/
+dist/
+wheels/
+*.egg-info/
+
+# --- Virtual environment / toolchain ---
+.venv/
+.python-version
+
+# --- Secrets / local env ---
+.env
+.env.*
+!.env.example
+
+# --- OS / IDE ---
+.DS_Store
+.AppleDouble
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# --- Jupyter ---
+.ipynb_checkpoints/
+*.ipynb
+
+# --- Local app / agent folders ---
+.claude/
+
+# --- RAG / retrieval generated data ---
+outputs/
+chroma_db/
+processed_data_docling/
+.cache/
+
+# --- Local source documents / large raw data ---
+data/
+
+# --- Generated artifacts / exports ---
+artifacts/
+!artifacts/.gitkeep
+
+# --- Generated docs ---
+docs/swagger.html
+
+# --- Test / eval outputs ---
+tests/**/output/
+eval_results_*.json
+tests/eval_results_*.json
+compliance_check_result.json
+
+# --- ML / model cache ---
+inference/
+paddle_model/
+huggingface_cache/
+.hf_cache/
+*.pdmodel
+*.pdiparams
+*.onnx
+
+# --- Optional local databases ---
+*.db
+*.sqlite
+*.sqlite3
