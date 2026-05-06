@@ -11,15 +11,25 @@
 # --------------------------------------------------------------------------
 import json
 import math
+import os
 import re
 from dataclasses import dataclass
 from pathlib import Path
 
+import psycopg2
+import psycopg2.extras
+from dotenv import load_dotenv
+
 from src.schemas.classifier import CATEGORIES
 
+load_dotenv()
 
 DEFAULT_RULES_PATH = Path("artifacts/legal_rules_payload.json")
 DEFAULT_RULE_CONFIG_PATH = Path("config/legal_rule_profiles.json")
+DEFAULT_DATABASE_URL = os.environ.get(
+    "DATABASE_URL",
+    "postgresql://safety_user:safety_password@localhost:5432/safety",
+)
 
 
 def _load_static_rule_config(rule_config_path: Path = DEFAULT_RULE_CONFIG_PATH) -> dict:
@@ -66,37 +76,83 @@ class LegalRulesRepository:
         self,
         payload_path: str | Path = DEFAULT_RULES_PATH,
         rule_config_path: str | Path = DEFAULT_RULE_CONFIG_PATH,
+        database_url: str = DEFAULT_DATABASE_URL,
     ) -> None:
-        # TODO(postgres): 현재는 JSON payload 기반 repository다.
-        # PostgreSQL 연결 이후에도 호출부는 유지하고 내부 구현만 DB 조회 기반으로 교체할 수 있다.
         self.payload_path = Path(payload_path)
         self.rule_config_path = Path(rule_config_path)
+        self.database_url = database_url
         self._payload: dict | None = None
         self._rule_config: dict | None = None
         self._rule_index: list[dict] | None = None
         self._token_df: dict[str, int] | None = None
 
     def _load(self) -> dict:
-        # TODO(postgres): rules를 파일 대신 PostgreSQL에서 읽게 되면
-        # 이 메서드는 fetch + 메모리 캐시 초기화 지점이 된다.
-        if self._payload is None:
-            if not self.payload_path.exists():
-                self._payload = {"rules": []}
-            else:
-                self._payload = json.loads(self.payload_path.read_text(encoding="utf-8"))
+        if self._payload is not None:
+            return self._payload
+        conn = psycopg2.connect(self.database_url)
+        with conn:
+            with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+                cur.execute("""
+                    SELECT
+                        master_id, source_id, rule_type, category_code, category_name,
+                        item_key AS keyword, item_pattern, body AS rule_text,
+                        legal_basis, allowed, limit_pct, cited_laws, keywords, metadata
+                    FROM legal_rag.legal_rule_master
+                    WHERE record_type = 'rule'
+                """)
+                rows = cur.fetchall()
+        conn.close()
+        rules = []
+        for row in rows:
+            r = dict(row)
+            r["cited_laws"] = list(r.get("cited_laws") or [])
+            r["keywords"] = list(r.get("keywords") or [])
+            metadata = dict(r.get("metadata") or {})
+            r["metadata"] = metadata
+            # V2 매핑 이전 원본 rule_type 복원 (스코어링 로직 유지)
+            original_rule_type = metadata.get("original_rule_type")
+            if original_rule_type:
+                r["rule_type"] = original_rule_type
+            if r.get("limit_pct") is not None:
+                r["limit_pct"] = float(r["limit_pct"])
+            rules.append(r)
+        self._payload = {"rules": rules}
         return self._payload
 
     def _load_rule_config(self) -> dict:
-        if self._rule_config is None:
-            if not self.rule_config_path.exists():
-                self._rule_config = {
-                    "validator_synonyms": {},
-                    "validator_profiles": {},
-                    "classifier_profiles": {},
-                    "generic_item_policies": {},
-                }
-            else:
-                self._rule_config = json.loads(self.rule_config_path.read_text(encoding="utf-8"))
+        if self._rule_config is not None:
+            return self._rule_config
+        conn = psycopg2.connect(self.database_url)
+        with conn:
+            with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+                cur.execute("""
+                    SELECT profile_scope, category_code, profile_key, values_json, metadata
+                    FROM legal_rag.legal_rule_profiles
+                """)
+                rows = cur.fetchall()
+        conn.close()
+        config: dict = {
+            "validator_synonyms": {},
+            "validator_profiles": {},
+            "classifier_profiles": {},
+            "generic_item_policies": {},
+        }
+        for row in rows:
+            key = row["profile_key"]
+            values = row["values_json"]
+            category = row["category_code"]
+            metadata = dict(row.get("metadata") or {})
+            # V2 매핑 이전 원본 scope 복원 (global→validator_synonym, category→validator/classifier_profile, item→generic)
+            scope = metadata.get("original_scope", row["profile_scope"])
+            if scope == "validator_synonym":
+                config["validator_synonyms"][key] = values
+            elif scope == "validator_profile" and category:
+                config["validator_profiles"].setdefault(category, {})[key] = values
+            elif scope == "classifier_profile" and category:
+                config["classifier_profiles"].setdefault(category, {})[key] = values
+            elif scope == "generic_item_policy":
+                config["generic_item_policies"][key] = values
+        self._rule_config = config
         return self._rule_config
 
     def _build_index(self) -> None:
@@ -216,6 +272,60 @@ class LegalRulesRepository:
         ranked = [candidate for candidate in categories.values() if candidate.score > 0]
         ranked.sort(key=lambda item: item.score, reverse=True)
         return ranked[:limit]
+
+    def find_category_hints(
+        self,
+        *,
+        category_codes: list[str],
+        limit_per_category: int = 6,
+    ) -> dict[str, dict[str, list[str]]]:
+        hints: dict[str, dict[str, list[str]]] = {}
+        wanted = {code for code in category_codes if code in CATEGORIES}
+        if not wanted:
+            return hints
+
+        for category_code in wanted:
+            cited_laws: list[str] = []
+            keywords: list[str] = []
+            seen_laws: set[str] = set()
+            seen_keywords: set[str] = set()
+
+            for rule in self.rules:
+                if rule.get("category_code") != category_code:
+                    continue
+                for law in _rule_laws(rule, category_code):
+                    law_norm = str(law).strip()
+                    if law_norm and law_norm not in seen_laws:
+                        seen_laws.add(law_norm)
+                        cited_laws.append(law_norm)
+
+                candidates = list(rule.get("keywords") or [])
+                keyword = str(rule.get("keyword") or "").strip()
+                pattern = str(rule.get("item_pattern") or "").strip()
+                if keyword:
+                    candidates.append(keyword)
+                if pattern:
+                    candidates.append(pattern)
+
+                for token in candidates:
+                    token_norm = str(token).strip()
+                    if (
+                        token_norm
+                        and len(token_norm) >= 2
+                        and token_norm not in seen_keywords
+                    ):
+                        seen_keywords.add(token_norm)
+                        keywords.append(token_norm)
+
+                if len(cited_laws) >= limit_per_category and len(keywords) >= limit_per_category:
+                    break
+
+            hints[category_code] = {
+                "cited_laws": cited_laws[:limit_per_category],
+                "keywords": keywords[:limit_per_category],
+            }
+
+        return hints
 
     def resolve_category(self, category: str) -> tuple[str | None, str]:
         if category in CATEGORIES:

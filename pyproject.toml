@@ -28,8 +28,7 @@ dependencies = [
     "langchain-community>=0.4.1",
     "langchain-text-splitters>=1.1.2",
     "docling>=2.90.0",
-    "chromadb>=0.6.0",
-    "langchain-chroma>=0.2.0",
+    "qdrant-client>=1.15.1",
     "sentence-transformers>=5.4.1",
     "langchain-anthropic>=1.4.1",
     "langchain-openai>=1.2.0",
@@ -37,4 +36,6 @@ dependencies = [
     "kiwipiepy>=0.23.1",
     "rank-bm25>=0.2.2",
     "uvicorn>=0.46.0",
+    "psycopg2-binary>=2.9.12",
+    "langchain-qdrant>=1.1.0",
 ]

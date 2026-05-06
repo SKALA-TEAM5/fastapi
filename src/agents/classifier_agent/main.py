@@ -13,6 +13,7 @@ import json
 from pathlib import Path
 
 from src.agents.classifier_agent.agent import review_usage_statement
+from src.core.storage import DEFAULT_COLLECTION
 from src.schemas.classifier import UsageStatementReviewRequest
 
 
@@ -25,7 +26,7 @@ def _parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--collection",
-        default="documents",
+        default=DEFAULT_COLLECTION,
         help="조회에 사용할 벡터스토어 컬렉션명",
     )
     parser.add_argument(

@@ -14,9 +14,16 @@ from dataclasses import dataclass
 from typing import Any
 
 from langchain_core.documents import Document
+try:
+    from langsmith import traceable
+except ImportError:  # pragma: no cover
+    def traceable(*args, **kwargs):  # type: ignore
+        def decorator(func):
+            return func
+        return decorator
 
 from src.core.rag import MAX_RETRY, build_retriever, rerank, retrieve, rewrite_query
-from src.core.storage import load_vectorstore
+from src.core.storage import DEFAULT_COLLECTION, load_vectorstore
 from src.repositories import LegalRulesRepository
 from src.schemas.classifier import (
     CATEGORIES,
@@ -70,6 +77,12 @@ class _ClassificationSignals:
     total_amount: float
 
 
+@dataclass
+class _ClassificationOutcome:
+    classification: DocumentClassification
+    signals: _ClassificationSignals
+
+
 def _get_generic_item_policy(item_name: str, category_id: str | None = None) -> dict | None:
     normalized = re.sub(r"\s+", " ", (item_name or "").strip().lower())
     for policy in _rules_repo.generic_item_policies.values():
@@ -104,20 +117,20 @@ def _apply_generic_review_policy(
 
 def _retrieve_docs(question: str, collection: str) -> list[Document]:
     vectorstore = load_vectorstore(collection_name=collection)
-    retriever = build_retriever(vectorstore)
+    retriever = build_retriever(vectorstore, collection_name=collection)
     state = {
         "question": question,
-        "documents": [],
+        "retrieved_docs": [],
         "judgment": None,
         "retry_count": 0,
     }
     state = retrieve(state, retriever)
     state = rerank(state)
-    while not state["documents"] and state.get("retry_count", 0) < MAX_RETRY:
+    while not state["retrieved_docs"] and state.get("retry_count", 0) < MAX_RETRY:
         state = rewrite_query(state)
         state = retrieve(state, retriever)
         state = rerank(state)
-    return state["documents"]
+    return state["retrieved_docs"]
 
 
 def _build_classification_signals(
@@ -130,31 +143,61 @@ def _build_classification_signals(
     total_amount = sum(items.values())
     representative = ", ".join(item_names[:3])
     basic_info_query = " ".join(f"{k} {v}" for k, v in basic_info.items())
-    query = f"산안비에서 '{representative}' 항목이 해당하는 카테고리와 법령 조항 {basic_info_query}".strip()
+    base_query = f"{representative} {basic_info_query}".strip()
+    initial_candidates = _rules_repo.find_category_candidates(
+        query_text=base_query,
+        retrieved_context="",
+        limit=3,
+    )
+
+    hint_parts: list[str] = []
+    law_hints: list[str] = []
+    keyword_hints: list[str] = []
+    if initial_candidates:
+        category_hints = _rules_repo.find_category_hints(
+            category_codes=[candidate.category_code for candidate in initial_candidates],
+            limit_per_category=3,
+        )
+        for candidate in initial_candidates:
+            hint_parts.append(candidate.category_code)
+            hint_parts.append(candidate.category_name)
+            hints = category_hints.get(candidate.category_code, {})
+            law_hints.extend(hints.get("cited_laws", []))
+            keyword_hints.extend(hints.get("keywords", []))
+
+    category_hint = ", ".join(
+        dict.fromkeys(part.strip() for part in hint_parts if part and part.strip())
+    )
+    law_hint = ", ".join(
+        dict.fromkeys(part.strip() for part in law_hints if part and part.strip())
+    )
+    keyword_hint = ", ".join(
+        dict.fromkeys(part.strip() for part in keyword_hints if part and part.strip())
+    )
+
+    query_parts = [
+        f"산업안전보건관리비 항목 '{representative}'의 분류 기준",
+        f"기본정보 {basic_info_query}" if basic_info_query else "",
+        f"우선 검토 카테고리 {category_hint}" if category_hint else "",
+        f"관련 조항 {law_hint}" if law_hint else "",
+        f"관련 키워드 {keyword_hint}" if keyword_hint else "",
+    ]
+    query = " | ".join(part for part in query_parts if part).strip()
 
     docs = _retrieve_docs(question=query, collection=collection)
-    if not docs:
-        return _ClassificationSignals(
-            docs=[],
-            candidates=[],
-            vote_scores={},
-            item_names=item_names,
-            total_amount=total_amount,
-        )
-
     context = "\n\n---\n\n".join(
         f"[출처: {d.metadata.get('source', '알 수 없음')}]\n{d.page_content}"
         for d in docs
-    )
+    ) if docs else ""
     candidates = _rules_repo.find_category_candidates(
-        query_text=f"{representative} {basic_info_query}".strip(),
+        query_text=base_query,
         retrieved_context=context,
         limit=5,
     )
     vote_scores = _vote_category_from_chunks(docs)
     return _ClassificationSignals(
         docs=docs,
-        candidates=candidates,
+        candidates=candidates or initial_candidates,
         vote_scores=vote_scores,
         item_names=item_names,
         total_amount=total_amount,
@@ -298,11 +341,12 @@ def _confidence_from_candidates(candidates: list) -> float:
     return round(max(0.0, min(0.35 + 0.55 * ratio * score_factor, 0.95)), 2)
 
 
+@traceable(name="classifier.classify_document")
 def classify_document(
     items: dict[str, float] | None = None,
     basic_info: dict[str, Any] | None = None,
     document: dict[str, Any] | None = None,
-    collection: str = "documents",
+    collection: str = DEFAULT_COLLECTION,
 ) -> DocumentClassification:
     """
     증빙자료 1건(항목:금액 딕셔너리)을 받아 산안비 카테고리 하나로 분류한다.
@@ -311,7 +355,21 @@ def classify_document(
     2순위: RDB TF-IDF 규칙 매칭 (폴백)
     """
     items, basic_info = _coerce_input(items=items, basic_info=basic_info, document=document)
-    signals = _build_classification_signals(
+    return _classify_document_with_signals(
+        items=items,
+        basic_info=basic_info,
+        collection=collection,
+    ).classification
+
+
+def _classify_document_with_signals(
+    *,
+    items: dict[str, float],
+    basic_info: dict[str, Any],
+    collection: str,
+    signals: _ClassificationSignals | None = None,
+) -> _ClassificationOutcome:
+    signals = signals or _build_classification_signals(
         items=items,
         basic_info=basic_info,
         collection=collection,
@@ -322,14 +380,17 @@ def classify_document(
     docs = signals.docs
 
     if not docs:
-        return DocumentClassification(
-            category_id=UNCLASSIFIED,
-            category_name=UNCLASSIFIED,
-            confidence=0.0,
-            total_amount=total_amount,
-            items=items,
-            needs_human_review=True,
-            review_reason="관련 법령 문맥을 검색하지 못했습니다.",
+        return _ClassificationOutcome(
+            classification=DocumentClassification(
+                category_id=UNCLASSIFIED,
+                category_name=UNCLASSIFIED,
+                confidence=0.0,
+                total_amount=total_amount,
+                items=items,
+                needs_human_review=True,
+                review_reason="관련 법령 문맥을 검색하지 못했습니다.",
+            ),
+            signals=signals,
         )
 
     candidates = signals.candidates
@@ -351,14 +412,17 @@ def classify_document(
             review_reason=review_reason,
         )
         log.debug("rdb-dominant: item=%s cat=%s score=%.1f", representative, category_id, rdb_top_score)
-        return DocumentClassification(
-            category_id=category_id,
-            category_name=CATEGORIES.get(category_id, UNCLASSIFIED),
-            confidence=confidence,
-            total_amount=total_amount,
-            items=items,
-            needs_human_review=needs_human_review,
-            review_reason=review_reason,
+        return _ClassificationOutcome(
+            classification=DocumentClassification(
+                category_id=category_id,
+                category_name=CATEGORIES.get(category_id, UNCLASSIFIED),
+                confidence=confidence,
+                total_amount=total_amount,
+                items=items,
+                needs_human_review=needs_human_review,
+                review_reason=review_reason,
+            ),
+            signals=signals,
         )
 
     # 인용 투표 신호가 명확하면 청크 기반 결과 사용
@@ -379,14 +443,17 @@ def classify_document(
                 "citation-vote: item=%s top=%s ratio=%.2f confidence=%.2f",
                 representative, top_cat, vote_ratio, confidence,
             )
-            return DocumentClassification(
-                category_id=top_cat,
-                category_name=CATEGORIES.get(top_cat, UNCLASSIFIED),
-                confidence=confidence,
-                total_amount=total_amount,
-                items=items,
-                needs_human_review=needs_human_review,
-                review_reason=review_reason,
+            return _ClassificationOutcome(
+                classification=DocumentClassification(
+                    category_id=top_cat,
+                    category_name=CATEGORIES.get(top_cat, UNCLASSIFIED),
+                    confidence=confidence,
+                    total_amount=total_amount,
+                    items=items,
+                    needs_human_review=needs_human_review,
+                    review_reason=review_reason,
+                ),
+                signals=signals,
             )
 
     # RDB 폴백 (인용 투표 신호 약함)
@@ -404,38 +471,47 @@ def classify_document(
             review_reason=review_reason,
         )
         log.debug("rdb-fallback: item=%s cat=%s score=%.1f", representative, category_id, rdb_top_score)
-        return DocumentClassification(
-            category_id=category_id,
-            category_name=CATEGORIES.get(category_id, UNCLASSIFIED),
-            confidence=confidence,
-            total_amount=total_amount,
-            items=items,
-            needs_human_review=needs_human_review,
-            review_reason=review_reason,
+        return _ClassificationOutcome(
+            classification=DocumentClassification(
+                category_id=category_id,
+                category_name=CATEGORIES.get(category_id, UNCLASSIFIED),
+                confidence=confidence,
+                total_amount=total_amount,
+                items=items,
+                needs_human_review=needs_human_review,
+                review_reason=review_reason,
+            ),
+            signals=signals,
         )
 
     # 헤더 힌트 폴백: 청크 섹션 제목에서 카테고리 추론
     hint_cat = _hint_from_chunk_headers(docs)
     if hint_cat:
         log.debug("header-hint: item=%s cat=%s", representative, hint_cat)
-        return DocumentClassification(
-            category_id=hint_cat,
-            category_name=CATEGORIES.get(hint_cat, UNCLASSIFIED),
-            confidence=0.72,
-            total_amount=total_amount,
-            items=items,
-            needs_human_review=False,
-            review_reason="",
+        return _ClassificationOutcome(
+            classification=DocumentClassification(
+                category_id=hint_cat,
+                category_name=CATEGORIES.get(hint_cat, UNCLASSIFIED),
+                confidence=0.72,
+                total_amount=total_amount,
+                items=items,
+                needs_human_review=False,
+                review_reason="",
+            ),
+            signals=signals,
         )
 
-    return DocumentClassification(
-        category_id=UNCLASSIFIED,
-        category_name=UNCLASSIFIED,
-        confidence=0.0,
-        total_amount=total_amount,
-        items=items,
-        needs_human_review=True,
-        review_reason="RDB 및 청크 인용 투표 모두 카테고리 후보를 찾지 못했습니다.",
+    return _ClassificationOutcome(
+        classification=DocumentClassification(
+            category_id=UNCLASSIFIED,
+            category_name=UNCLASSIFIED,
+            confidence=0.0,
+            total_amount=total_amount,
+            items=items,
+            needs_human_review=True,
+            review_reason="RDB 및 청크 인용 투표 모두 카테고리 후보를 찾지 못했습니다.",
+        ),
+        signals=signals,
     )
 
 
@@ -456,6 +532,8 @@ def _item_status(
     # 분류 Agent는 적정/부적정을 판단하지 않으므로, 현재 카테고리에 분류 근거가 남아 있고
     # 대체 카테고리 우위가 강하지 않다면 기존 카테고리를 우선 유지한다.
     if given_code and predicted.category_id != given_code:
+        if not candidates and predicted.confidence < 0.8:
+            return "유지", given_code, ""
         if given_score > 0 and predicted_score <= 0:
             if given_score >= top_score:
                 return "유지", given_code, ""
@@ -478,13 +556,14 @@ def _item_status(
     return "카테고리변경", predicted.category_id, f"{predicted.category_name} 카테고리로 변경이 필요함."
 
 
+@traceable(name="classifier.review_usage_statement")
 def review_usage_statement(
     payload: dict[str, Any] | None = None,
     *,
     usage_statement_id: int | str | None = None,
     rows: list[dict[str, Any]] | list[UsageStatementRow] | None = None,
     basic_info: dict[str, Any] | None = None,
-    collection: str = "documents",
+    collection: str = DEFAULT_COLLECTION,
 ) -> UsageStatementReviewResponse:
     """
     사용내역서 row 목록을 받아 각 항목의 카테고리가 맞는지 검토하고
@@ -499,16 +578,13 @@ def review_usage_statement(
 
     results: list[RowReviewResult] = []
     for row in request.rows:
-        predicted = classify_document(
+        outcome = _classify_document_with_signals(
             items={row.item_name: row.total_amount},
             basic_info=request.basic_info,
             collection=collection,
         )
-        signals = _build_classification_signals(
-            items={row.item_name: row.total_amount},
-            basic_info=request.basic_info,
-            collection=collection,
-        )
+        predicted = outcome.classification
+        signals = outcome.signals
         decision_status, final_category_code, reason = _item_status(
             predicted=predicted,
             given_code=row.given_category_code,
@@ -537,7 +613,7 @@ def review_usage_statement(
 def verify_categories(
     categories: dict[str, dict[str, float]],
     basic_info: dict[str, Any] | None = None,
-    collection: str = "documents",
+    collection: str = DEFAULT_COLLECTION,
 ) -> UsageStatementReviewResponse:
     """
     구형 카테고리맵 입력을 row 기반 입력으로 변환하는 호환용 래퍼.

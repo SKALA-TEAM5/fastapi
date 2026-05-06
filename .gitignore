@@ -37,6 +37,9 @@ wheels/
 # --- Local app / agent folders ---
 .claude/
 
+# --- Docker volumes ---
+volumes/
+
 # --- RAG / retrieval generated data ---
 outputs/
 chroma_db/

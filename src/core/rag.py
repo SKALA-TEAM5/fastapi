@@ -2,7 +2,6 @@ import logging
 from typing import NamedTuple
 
 from kiwipiepy import Kiwi
-from langchain_chroma import Chroma
 from langchain_classic.retrievers.ensemble import EnsembleRetriever
 from langchain_community.cross_encoders import HuggingFaceCrossEncoder
 from langchain_community.retrievers import BM25Retriever
@@ -13,6 +12,7 @@ from langchain_core.retrievers import BaseRetriever
 import src.core.llm_config as llm_config
 from src.prompts import REWRITE_PROMPT
 from src.schemas.shared import AgenticRAGState
+from src.core.storage import load_collection_documents
 
 log = logging.getLogger(__name__)
 
@@ -49,43 +49,39 @@ def _tokenize(text: str) -> list[str]:
 
 
 def _get_corpus_and_bm25(
-    vectorstore: Chroma,
+    vectorstore,
+    collection_name: str,
     use_pdf_only: bool,
     k: int,
 ) -> tuple[list[Document], BM25Retriever]:
     global _retriever_cache
 
-    where = {"source": {"$ne": "web_법령"}} if use_pdf_only else None
-    id_result = vectorstore.get(where=where, include=[])
-    fingerprint = (use_pdf_only, len(id_result["ids"]))
+    corpus = load_collection_documents(
+        collection_name,
+        source_exclude="web_법령" if use_pdf_only else None,
+    )
+    fingerprint = (collection_name, use_pdf_only, len(corpus))
 
     if _retriever_cache and _retriever_cache.fingerprint == fingerprint:
         log.info("Retriever 캐시 적중 — corpus/BM25 재구축 스킵")
         _retriever_cache.bm25.k = k
         return _retriever_cache.corpus, _retriever_cache.bm25
 
-    log.info(f"BM25 인덱스 구축 중 (문서 {len(id_result['ids'])}개)")
-    full = vectorstore.get(where=where)
-    corpus = [
-        Document(page_content=text, metadata=meta)
-        for text, meta in zip(full["documents"], full["metadatas"])
-    ]
+    log.info(f"BM25 인덱스 구축 중 (문서 {len(corpus)}개)")
     bm25 = BM25Retriever.from_documents(corpus, preprocess_func=_tokenize, k=k)
     _retriever_cache = _RetrieverCache(fingerprint=fingerprint, corpus=corpus, bm25=bm25)
     return corpus, bm25
 
 
-def build_retriever(vectorstore: Chroma, k: int = 8) -> EnsembleRetriever:
-    pdf_ids = vectorstore.get(where={"source": {"$ne": "web_법령"}}, include=[])
-    use_pdf_only = len(pdf_ids["ids"]) > 0
+def build_retriever(vectorstore, collection_name: str, k: int = 8) -> EnsembleRetriever:
+    pdf_corpus = load_collection_documents(collection_name, source_exclude="web_법령")
+    use_pdf_only = len(pdf_corpus) > 0
 
-    _, bm25_retriever = _get_corpus_and_bm25(vectorstore, use_pdf_only, k)
+    _, bm25_retriever = _get_corpus_and_bm25(vectorstore, collection_name, use_pdf_only, k)
 
     if use_pdf_only:
-        log.info(f"PDF 청크 {len(pdf_ids['ids'])}개로 Ensemble 구성")
-        vector_retriever = vectorstore.as_retriever(
-            search_kwargs={"k": k, "filter": {"source": {"$ne": "web_법령"}}},
-        )
+        log.info(f"PDF 청크 {len(pdf_corpus)}개로 Ensemble 구성")
+        vector_retriever = vectorstore.as_retriever(search_kwargs={"k": k})
     else:
         log.info("PDF 청크 없음 — 웹 전체로 Ensemble 구성")
         vector_retriever = vectorstore.as_retriever(search_kwargs={"k": k})
@@ -98,7 +94,7 @@ def build_retriever(vectorstore: Chroma, k: int = 8) -> EnsembleRetriever:
 
 def retrieve(state: AgenticRAGState, retriever: BaseRetriever) -> AgenticRAGState:
     docs = retriever.invoke(state["question"])
-    return {**state, "documents": docs}
+    return {**state, "retrieved_docs": docs}
 
 
 def _get_rerank_model() -> HuggingFaceCrossEncoder:
@@ -124,7 +120,7 @@ def _score_in_batches(model: HuggingFaceCrossEncoder, pairs: list) -> list[float
 
 
 def rerank(state: AgenticRAGState) -> AgenticRAGState:
-    docs = state["documents"]
+    docs = state["retrieved_docs"]
     if not docs:
         return state
 
@@ -139,4 +135,4 @@ def rerank(state: AgenticRAGState) -> AgenticRAGState:
     top_docs = [doc for _, doc in ranked[:_TOP_N]]
 
     log.info(f"ReRanker: {len(docs)}개 → {len(top_docs)}개 (상위 점수: {ranked[0][0]:.3f})")
-    return {**state, "documents": top_docs}
+    return {**state, "retrieved_docs": top_docs}
