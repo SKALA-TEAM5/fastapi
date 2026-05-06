@@ -22,6 +22,7 @@ from src.agents.validator_agent.parser import (
     parse_usage_statement,
 )
 from src.agents.validator_agent.rule_matcher import match_category_rules
+from src.core.storage import DEFAULT_COLLECTION
 from src.schemas.validator import AuditResponse, CategoryAuditResult
 
 
@@ -29,7 +30,7 @@ def run_audit_service(
     *,
     base_amount: float,
     categories: dict[str, dict[str, float]],
-    collection: str = "documents",
+    collection: str = DEFAULT_COLLECTION,
     basic_info_by_category: dict[str, dict[str, Any]] | None = None,
     summaries_by_category: dict[str, dict[str, Any]] | None = None,
     progress_rate: float | None = None,
@@ -51,7 +52,7 @@ def validate_document_service(
     basic_info: dict[str, Any] | None = None,
     base_amount: float | None = None,
     document: dict[str, Any] | None = None,
-    collection: str = "documents",
+    collection: str = DEFAULT_COLLECTION,
 ) -> CategoryAuditResult:
     block = parse_single_category_request(
         category=category,
@@ -67,7 +68,7 @@ def validate_document_service(
 def validate_usage_statement_service(
     *,
     document: dict[str, Any],
-    collection: str = "documents",
+    collection: str = DEFAULT_COLLECTION,
 ) -> AuditResponse:
     parsed = parse_usage_statement(document)
     return _validate_blocks(parsed.base_amount, parsed.blocks, collection=collection)

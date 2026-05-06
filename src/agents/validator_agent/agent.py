@@ -10,7 +10,16 @@
 # 4. to_summary_response() : 요약 응답 구조 변환
 # --------------------------------------------------------------------------
 
+try:
+    from langsmith import traceable
+except ImportError:  # pragma: no cover
+    def traceable(*args, **kwargs):  # type: ignore
+        def decorator(func):
+            return func
+        return decorator
+
 from src.agents.validator_agent.presenter import summarize_audit_response, to_validator_response
+from src.core.storage import DEFAULT_COLLECTION
 from src.schemas.validator import (
     AuditResponse,
     CategoryAuditResult,
@@ -24,10 +33,11 @@ from src.services.validator_service import (
 )
 
 
+@traceable(name="validator.run_audit")
 def run_audit(
     base_amount: float,
     categories: dict[str, dict[str, float]],
-    collection: str = "documents",
+    collection: str = DEFAULT_COLLECTION,
     basic_info_by_category: dict[str, dict] | None = None,
     summaries_by_category: dict[str, dict] | None = None,
     progress_rate: float | None = None,
@@ -42,6 +52,7 @@ def run_audit(
     )
 
 
+@traceable(name="validator.validate_document")
 def validate_document(
     *,
     category: str,
@@ -49,7 +60,7 @@ def validate_document(
     basic_info: dict | None = None,
     base_amount: float | None = None,
     document: dict | None = None,
-    collection: str = "documents",
+    collection: str = DEFAULT_COLLECTION,
 ) -> CategoryAuditResult:
     return validate_document_service(
         category=category,
@@ -61,10 +72,11 @@ def validate_document(
     )
 
 
+@traceable(name="validator.validate_usage_statement")
 def validate_usage_statement(
     *,
     document: dict,
-    collection: str = "documents",
+    collection: str = DEFAULT_COLLECTION,
 ) -> AuditResponse:
     return validate_usage_statement_service(document=document, collection=collection)
 

@@ -32,6 +32,19 @@ _EXCEPTION_PATTERNS = (
     re.compile(r"이내"),
 )
 
+_DUPLICATE_COST_KEYWORDS = (
+    "중복",
+    "이중",
+    "이중계상",
+    "타 비용",
+    "환경관리비",
+    "공사비",
+    "기포함",
+    "별도 계상",
+    "동일 목적",
+    "타 법령",
+)
+
 
 class CategoryDecisionOutput(BaseModel):
     status: Literal["적절", "부적절", "검토필요"] = Field(description="카테고리 최종 판정")
@@ -91,6 +104,8 @@ def decide_category(
         exceeded=computation.exceeded,
         limit_rule=rule_bundle.limit_rule,
         rejection_reason=rejection_reason,
+        llm_interpretation=decision.interpretation if decision else "",
+        llm_improvements=decision.improvements if decision else "",
         items=item_judgments,
         referenced_laws=final_laws,
         evidence_snippets=evidence_snippets,
@@ -157,10 +172,14 @@ def _hard_status(
         )
 
     disallowed_items = []
+    duplicate_risk_items = []
     review_items = []
     for bundle in rule_bundle.items:
         if not bundle.matches:
             review_items.append(bundle.item.item_name)
+            continue
+        if _has_duplicate_cost_risk(bundle):
+            duplicate_risk_items.append(bundle.item.item_name)
             continue
         allowed = bundle.top_allowed
         disallowed = bundle.top_disallowed
@@ -174,6 +193,11 @@ def _hard_status(
             review_items.append(bundle.item.item_name)
     if disallowed_items:
         return ("부적절", f"직접적인 사용불가 근거가 확인된 항목: {', '.join(disallowed_items)}")
+    if duplicate_risk_items:
+        return (
+            "검토필요",
+            f"타 비용과의 중복 계상 가능성이 있는 항목: {', '.join(duplicate_risk_items)}",
+        )
     if computation.has_progress_shortfall and computation.usage_shortfall_amount is not None:
         return (
             "검토필요",
@@ -495,6 +519,14 @@ def _build_item_review_reason(*, needs_review: bool, exception_summary: str, has
     if has_conflict:
         return "허용 근거와 불가 근거가 함께 확인되어 추가 검토가 필요합니다."
     return "예외 문구 또는 근거 충돌 확인이 필요합니다."
+
+
+def _has_duplicate_cost_risk(bundle: ItemRuleBundle) -> bool:
+    texts = [bundle.context_text, bundle.item_exception_text]
+    for match in bundle.matches[:4]:
+        texts.append(match.evidence or "")
+    normalized = " ".join(_clean_text(text, limit=600) for text in texts if text)
+    return any(keyword in normalized for keyword in _DUPLICATE_COST_KEYWORDS)
 
 
 def _exception_snippet_score(text: str) -> tuple[int, int]:

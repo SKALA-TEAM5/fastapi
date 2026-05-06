@@ -48,6 +48,8 @@ class CategoryAuditResult(BaseModel):
     exceeded: bool = Field(description="한도 초과 여부")
     limit_rule: str = Field(default="", description="한도 규정 원문 (RAG 추출)")
     rejection_reason: str = Field(default="", description="부적절/검토필요 사유")
+    llm_interpretation: str = Field(default="", description="LLM이 청크 기반으로 생성한 판정 해석")
+    llm_improvements: str = Field(default="", description="LLM이 청크 기반으로 생성한 보완사항")
     items: List[ItemJudgment] = Field(default=[])
     referenced_laws: List[str] = Field(default=[])
     evidence_snippets: List[str] = Field(default=[])
