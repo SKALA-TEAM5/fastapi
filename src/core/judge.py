@@ -383,7 +383,7 @@ def _fallback_audit_result(*, question: str, context: str, laws: list[str], top_
 
 def judge(state: AgenticRAGState) -> AgenticRAGState:
     """관련 문서를 바탕으로 산안비 적합성을 구조화된 형태로 판정."""
-    if not state["documents"]:
+    if not state["retrieved_docs"]:
         result = AuditResult(
             is_compliant=False,
             confidence=0.0,
@@ -394,10 +394,10 @@ def judge(state: AgenticRAGState) -> AgenticRAGState:
     else:
         context = "\n\n---\n\n".join(
             f"[출처: {d.metadata.get('source', '알 수 없음')}]\n{d.page_content}"
-            for d in state["documents"]
+            for d in state["retrieved_docs"]
         )
         available_laws = _extract_available_laws(context)
-        top_source = state["documents"][0].metadata.get("source", "")
+        top_source = state["retrieved_docs"][0].metadata.get("source", "")
         law_list = _extract_available_law_list(context)
         try:
             llm = llm_config.get()

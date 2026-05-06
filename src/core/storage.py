@@ -1,12 +1,11 @@
 import json
 import logging
+import os
 import re
 import time
 from pathlib import Path
 from typing import Any
 
-import chromadb
-from langchain_chroma import Chroma
 from langchain_core.documents import Document
 from langchain_huggingface import HuggingFaceEmbeddings
 
@@ -15,10 +14,12 @@ log = logging.getLogger(__name__)
 DEFAULT_TTL = 7 * 24 * 3600
 DEFAULT_DIR = Path(".cache")
 DEFAULT_EMBED_MODEL = "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2"
-DEFAULT_CHROMA_DIR = "chroma_db"
+DEFAULT_QDRANT_URL = "http://localhost:6333"
+DEFAULT_COLLECTION = "legal_documents"
 
 _embeddings_cache: dict[str, HuggingFaceEmbeddings] = {}
-_vectorstore_cache: dict[tuple, Chroma] = {}
+_vectorstore_cache: dict[tuple, Any] = {}
+_collection_docs_cache: dict[tuple[str, str], list[Document]] = {}
 
 
 class LocalJSONCache:
@@ -77,50 +78,132 @@ def _get_embeddings(model_name: str = DEFAULT_EMBED_MODEL) -> HuggingFaceEmbeddi
     return _embeddings_cache[model_name]
 
 
-def reset_chroma_collection(
+def _get_qdrant_url(qdrant_url: str | None = None) -> str:
+    return qdrant_url or os.getenv("QDRANT_URL", DEFAULT_QDRANT_URL)
+
+
+def _get_qdrant_client(qdrant_url: str | None = None):
+    from qdrant_client import QdrantClient
+
+    return QdrantClient(url=_get_qdrant_url(qdrant_url))
+
+
+def reset_collection(
     collection_name: str,
-    persist_dir: str = DEFAULT_CHROMA_DIR,
+    *,
+    qdrant_url: str | None = None,
 ) -> None:
     collection = _sanitize_name(collection_name)
+    _invalidate_collection_cache(collection)
     try:
-        client = chromadb.PersistentClient(path=persist_dir)
+        client = _get_qdrant_client(qdrant_url)
         client.delete_collection(collection)
-        log.info(f"ChromaDB 컬렉션 삭제: {collection}")
+        log.info(f"Qdrant collection deleted: {collection}")
     except Exception as e:
-        log.info(f"컬렉션 삭제 스킵 (없거나 오류): {e}")
+        log.info(f"Collection reset skipped (missing or failed): {e}")
 
 
-def save_chunks_to_chroma(
-    chunks: list[Document],
+def upsert_documents(
     collection_name: str,
-    persist_dir: str = DEFAULT_CHROMA_DIR,
+    documents: list[Document],
+    *,
+    qdrant_url: str | None = None,
     embed_model: str = DEFAULT_EMBED_MODEL,
-) -> Chroma:
+) -> Any:
+    from langchain_qdrant import QdrantVectorStore
+    from qdrant_client.models import Distance, VectorParams
+
     collection = _sanitize_name(collection_name)
     embeddings = _get_embeddings(embed_model)
-    print(f"ChromaDB 임베딩 및 저장 중 (컬렉션: {collection}, 청크 수: {len(chunks)})...")
-    vectorstore = Chroma.from_documents(
-        documents=chunks,
-        embedding=embeddings,
+    url = _get_qdrant_url(qdrant_url)
+    client = _get_qdrant_client(url)
+    key = (collection, url, embed_model)
+
+    try:
+        collection_exists = bool(client.collection_exists(collection))
+    except Exception:
+        collection_exists = False
+
+    print(f"Qdrant embedding/upsert in progress (collection: {collection}, docs: {len(documents)})...")
+    if not collection_exists:
+        sample_vector = embeddings.embed_query(documents[0].page_content if documents else "legal")
+        client.create_collection(
+            collection_name=collection,
+            vectors_config=VectorParams(size=len(sample_vector), distance=Distance.COSINE),
+        )
+
+    vectorstore = QdrantVectorStore(
+        client=client,
         collection_name=collection,
-        persist_directory=persist_dir,
+        embedding=embeddings,
+        validate_collection_config=False,
     )
-    print(f"✅ ChromaDB 저장 완료 → {Path(persist_dir).resolve() / collection}")
+    if documents:
+        vectorstore.add_documents(documents)
+    _vectorstore_cache[key] = vectorstore
+    _invalidate_collection_cache(collection)
+    print(f"Qdrant upsert complete -> {url} / {collection}")
     return vectorstore
 
 
 def load_vectorstore(
     collection_name: str,
-    persist_dir: str = DEFAULT_CHROMA_DIR,
+    *,
+    qdrant_url: str | None = None,
     embed_model: str = DEFAULT_EMBED_MODEL,
-) -> Chroma:
+) -> Any:
+    from langchain_qdrant import QdrantVectorStore
+
     collection = _sanitize_name(collection_name)
-    key = (collection, persist_dir, embed_model)
+    url = _get_qdrant_url(qdrant_url)
+    key = (collection, url, embed_model)
     if key not in _vectorstore_cache:
         embeddings = _get_embeddings(embed_model)
-        _vectorstore_cache[key] = Chroma(
+        _vectorstore_cache[key] = QdrantVectorStore(
+            client=_get_qdrant_client(url),
             collection_name=collection,
-            embedding_function=embeddings,
-            persist_directory=persist_dir,
+            embedding=embeddings,
         )
     return _vectorstore_cache[key]
+
+
+def load_collection_documents(
+    collection_name: str,
+    *,
+    qdrant_url: str | None = None,
+    source_exclude: str | None = None,
+) -> list[Document]:
+    collection = _sanitize_name(collection_name)
+    url = _get_qdrant_url(qdrant_url)
+    cache_key = (collection, url)
+    docs = _collection_docs_cache.get(cache_key)
+    if docs is None:
+        client = _get_qdrant_client(url)
+        offset = None
+        docs = []
+        while True:
+            points, next_offset = client.scroll(
+                collection_name=collection,
+                with_payload=True,
+                with_vectors=False,
+                limit=256,
+                offset=offset,
+            )
+            for point in points:
+                payload = point.payload or {}
+                metadata = dict(payload.get("metadata") or {})
+                page_content = payload.get("page_content") or ""
+                docs.append(Document(page_content=page_content, metadata=metadata))
+            if next_offset is None:
+                break
+            offset = next_offset
+        _collection_docs_cache[cache_key] = docs
+    if source_exclude:
+        return [doc for doc in docs if doc.metadata.get("source") != source_exclude]
+    return docs
+
+
+def _invalidate_collection_cache(collection: str) -> None:
+    target_keys = [key for key in _collection_docs_cache if key[0] == collection]
+    for key in target_keys:
+        _collection_docs_cache.pop(key, None)
