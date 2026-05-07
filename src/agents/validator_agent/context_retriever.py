@@ -82,6 +82,11 @@ def expand_exception_context(*, base_docs: list[Document], collection: str) -> l
         return []
 
     heads = set()
+    preferred_sources = {
+        str(doc.metadata.get("source", "")).strip()
+        for doc in base_docs
+        if str(doc.metadata.get("source", "")).strip()
+    }
     for doc in base_docs:
         heads |= set(_ARTICLE_PATTERN.findall(doc.page_content or ""))
     if not heads:
@@ -89,12 +94,22 @@ def expand_exception_context(*, base_docs: list[Document], collection: str) -> l
 
     expanded: list[Document] = []
     seen: set[tuple[str, str]] = set()
+    per_head_count: dict[str, int] = {}
     for doc in load_collection_documents(collection):
-        if any(head in doc.page_content for head in heads):
-            key = _doc_key(doc)
-            if key not in seen:
-                seen.add(key)
-                expanded.append(doc)
+        source = str(doc.metadata.get("source", "")).strip()
+        if preferred_sources and source and source not in preferred_sources:
+            continue
+        matched_heads = [head for head in heads if head in (doc.page_content or "")]
+        if not matched_heads:
+            continue
+        primary_head = matched_heads[0]
+        if per_head_count.get(primary_head, 0) >= 6:
+            continue
+        key = _doc_key(doc)
+        if key not in seen:
+            seen.add(key)
+            expanded.append(doc)
+            per_head_count[primary_head] = per_head_count.get(primary_head, 0) + 1
     return expanded
 
 

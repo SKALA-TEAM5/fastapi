@@ -2,7 +2,6 @@ from typing import List, Literal, Optional
 
 from pydantic import BaseModel, ConfigDict, Field
 
-
 # ── Audit engine models ──────────────────────────────────────────────
 
 CategoryStatus = Literal["적절", "부적절", "검토필요"]
@@ -10,10 +9,13 @@ CategoryStatus = Literal["적절", "부적절", "검토필요"]
 
 class _ItemJudgeLLMOutput(BaseModel):
     """LLM이 채우는 항목 판정 결과. category는 입력에서 이미 알고 있으므로 LLM 미결정."""
+
     allowed: bool = Field(description="해당 항목 산안비 집행 허용 여부")
     confidence: float = Field(description="판정 확신도 (0.0~1.0)")
     reasoning: str = Field(description="판정 근거 (법령 조항 인용 포함)")
-    evidence_snippets: List[str] = Field(default=[], description="Context 원문 발췌 1~3개")
+    evidence_snippets: List[str] = Field(
+        default=[], description="Context 원문 발췌 1~3개"
+    )
     referenced_laws: List[str] = Field(default=[], description="참조 법령 조항 목록")
     category_limit_pct: Optional[float] = Field(
         default=None,
@@ -48,17 +50,31 @@ class CategoryAuditResult(BaseModel):
     exceeded: bool = Field(description="한도 초과 여부")
     limit_rule: str = Field(default="", description="한도 규정 원문 (RAG 추출)")
     rejection_reason: str = Field(default="", description="부적절/검토필요 사유")
-    llm_interpretation: str = Field(default="", description="LLM이 청크 기반으로 생성한 판정 해석")
-    llm_improvements: str = Field(default="", description="LLM이 청크 기반으로 생성한 보완사항")
+    llm_interpretation: str = Field(
+        default="", description="LLM이 청크 기반으로 생성한 판정 해석"
+    )
+    llm_improvements: str = Field(
+        default="", description="LLM이 청크 기반으로 생성한 보완사항"
+    )
     items: List[ItemJudgment] = Field(default=[])
     referenced_laws: List[str] = Field(default=[])
     evidence_snippets: List[str] = Field(default=[])
     needs_human_review: bool = Field(default=False)
-    progress_rate: Optional[float] = Field(default=None, description="현재 누계 공정률 (%)")
-    required_usage_rate: Optional[float] = Field(default=None, description="공정률 구간상 요구 최소 사용률 (0~1)")
-    required_used_amount: Optional[float] = Field(default=None, description="공정률 기준 요구 최소 사용액 (원)")
-    cumulative_used_amount: Optional[float] = Field(default=None, description="실제 누적 사용액 (원)")
-    usage_shortfall_amount: Optional[float] = Field(default=None, description="공정률 기준 부족액 (원)")
+    progress_rate: Optional[float] = Field(
+        default=None, description="현재 누계 공정률 (%)"
+    )
+    required_usage_rate: Optional[float] = Field(
+        default=None, description="공정률 구간상 요구 최소 사용률 (0~1)"
+    )
+    required_used_amount: Optional[float] = Field(
+        default=None, description="공정률 기준 요구 최소 사용액 (원)"
+    )
+    cumulative_used_amount: Optional[float] = Field(
+        default=None, description="실제 누적 사용액 (원)"
+    )
+    usage_shortfall_amount: Optional[float] = Field(
+        default=None, description="공정률 기준 부족액 (원)"
+    )
 
 
 class AuditResponse(BaseModel):
@@ -276,16 +292,16 @@ class UsageStatementValidatorEmbeddedResponse(_KoreanAliasModel):
                             "출처": [
                                 {
                                     "조항": "제7조제1항제2호",
-                                    "요지": "산업재해 예방을 위한 안전시설, 안전장비, 화재위험작업용 소화기 등은 안전시설비 항목에 해당합니다."
+                                    "요지": "산업재해 예방을 위한 안전시설, 안전장비, 화재위험작업용 소화기 등은 안전시설비 항목에 해당합니다.",
                                 },
                                 {
                                     "조항": "별표 3 공사진척에 따른 산업안전보건관리비 사용기준",
-                                    "요지": "공정률 70% 이상 90% 미만 구간에서는 산업안전보건관리비를 70% 이상 사용해야 합니다."
-                                }
-                            ]
-                        }
+                                    "요지": "공정률 70% 이상 90% 미만 구간에서는 산업안전보건관리비를 70% 이상 사용해야 합니다.",
+                                },
+                            ],
+                        },
                     }
-                ]
+                ],
             }
         },
     )
@@ -332,11 +348,11 @@ class UsageStatementValidatorCategoryEmbeddedResponse(_KoreanAliasModel):
                         "출처": [
                             {
                                 "조항": "제7조제1항제2호",
-                                "요지": "산업재해 예방을 위한 안전시설, 안전장비, 화재위험작업용 소화기 등은 안전시설비 항목에 해당합니다."
+                                "요지": "산업재해 예방을 위한 안전시설, 안전장비, 화재위험작업용 소화기 등은 안전시설비 항목에 해당합니다.",
                             }
-                        ]
-                    }
-                }
+                        ],
+                    },
+                },
             }
         },
     )

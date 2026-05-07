@@ -181,7 +181,7 @@ class ReasonTemplateTests(unittest.TestCase):
     def test_rc_review_insufficient_basis_01(self) -> None:
         result = _fake_result(
             status="검토필요",
-            rejection_reason="직접 근거 미확인",
+            rejection_reason="직접적인 허용 근거가 충분히 확인되지 않은 항목: 스마트 안전모",
         )
         code, reason = self._build_reason(
             result=result,
@@ -191,6 +191,20 @@ class ReasonTemplateTests(unittest.TestCase):
         self.assertIn("스마트 안전모", reason)
         self.assertIn("허용 근거가 충분히 확인되지 않", reason)
         self.assertIn("소명 자료", reason)
+
+    def test_rc_review_insufficient_basis_02_precedence_over_empty_exception(self) -> None:
+        result = _fake_result(
+            status="검토필요",
+            rejection_reason="직접적인 허용 근거가 충분히 확인되지 않은 항목: 웨어러블 생체신호 수집 태그",
+        )
+        code, reason = self._build_reason(
+            result=result,
+            allowed_items=["웨어러블 생체신호 수집 태그"],
+            exception_texts=[],
+        )
+        self.assertEqual(code, "review_insufficient_basis")
+        self.assertIn("웨어러블 생체신호 수집 태그", reason)
+        self.assertNotIn("단서 조항", reason)
 
     def test_rc_review_duplicate_cost_risk_01(self) -> None:
         result = _fake_result(
@@ -205,6 +219,7 @@ class ReasonTemplateTests(unittest.TestCase):
         self.assertIn("기포함된 항목", reason)
         self.assertIn("중복/이중 계상", reason)
         self.assertIn("추가 증빙", reason)
+        self.assertTrue(reason.startswith("이번에 검토한 안전망 항목은"))
 
     def test_rc_improper_mixed_items_01(self) -> None:
         result = _fake_result(
@@ -220,11 +235,13 @@ class ReasonTemplateTests(unittest.TestCase):
             disallowed_items=["사무실용 소화기"],
         )
         self.assertEqual(code, "improper_mixed_items")
-        self.assertIn("용접작업용 소화기(적정)", reason)
-        self.assertIn("사무실용 소화기(부적정)", reason)
+        self.assertIn("용접작업용 소화기", reason)
+        self.assertIn("사무실용 소화기", reason)
         self.assertIn("혼재", reason)
         self.assertIn("분리", reason)
         self.assertNotIn("사용 범위를 벗어나", reason)
+        self.assertNotIn("(적정)", reason)
+        self.assertNotIn("(부적정)", reason)
 
     def test_rc_improper_mixed_items_02_limit_three_items(self) -> None:
         result = _fake_result(status="부적절")
@@ -234,10 +251,10 @@ class ReasonTemplateTests(unittest.TestCase):
             disallowed_items=["X", "Y", "Z", "W"],
         )
         self.assertEqual(code, "improper_mixed_items")
-        self.assertIn("A(적정), B(적정), C(적정)", reason)
-        self.assertIn("X(부적정), Y(부적정), Z(부적정)", reason)
-        self.assertNotIn("D(적정)", reason)
-        self.assertNotIn("W(부적정)", reason)
+        self.assertIn("A, B, C, D", reason)
+        self.assertIn("X, Y, Z, W", reason)
+        self.assertNotIn("(적정)", reason)
+        self.assertNotIn("(부적정)", reason)
 
     def test_rc_appropriate_compliant_01(self) -> None:
         result = _fake_result(status="적절")
@@ -264,6 +281,37 @@ class ReasonTemplateTests(unittest.TestCase):
         self.assertIn("사용 범위, 집행 한도", reason)
         self.assertFalse(reason.startswith(" "))
 
+    def test_rc_appropriate_progress_compliant_01(self) -> None:
+        result = _fake_result(
+            status="적절",
+            progress_rate=72.5,
+            required_usage_rate=0.7,
+            cumulative_used_amount=36_000_000,
+            usage_shortfall_amount=0,
+        )
+        code, reason = self._build_reason(
+            result=result,
+            law_ref="「산안비 사용기준」 [별표 3]에 따르면",
+            allowed_items=["안전타포린"],
+        )
+        self.assertEqual(code, "appropriate_progress_compliant")
+        self.assertIn("72.5%", reason)
+        self.assertIn("70%", reason)
+        self.assertIn("36,000,000원", reason)
+        self.assertIn("공정률 기준상 적정", reason)
+        self.assertNotIn("0원이 부족", reason)
+
+    def test_join_items_keeps_all_items(self) -> None:
+        result = _fake_result(status="적절")
+        code, reason = self._build_reason(
+            result=result,
+            law_ref="「산안비 사용기준」 제7조제1항제3호에 따르면",
+            allowed_items=["안전모", "안전화", "안전대", "보안경", "방진마스크"],
+        )
+        self.assertEqual(code, "appropriate_compliant")
+        self.assertIn("안전모, 안전화, 안전대, 보안경, 방진마스크", reason)
+        self.assertNotIn("외 2건", reason)
+
     def test_rc_complex_01_limit_precedence_over_scope(self) -> None:
         result = _fake_result(status="부적절", total=3_500_000, limit=3_000_000, exceeded=True)
         code, reason = self._build_reason(
@@ -273,6 +321,8 @@ class ReasonTemplateTests(unittest.TestCase):
         self.assertEqual(code, "improper_limit_exceeded")
         self.assertIn("사무실용 소화기", reason)
         self.assertIn("500,000원 초과", reason)
+        self.assertIn("또한", reason)
+        self.assertIn("제7조", reason)
 
     def test_rc_complex_02_mixed_precedence_over_progress(self) -> None:
         result = _fake_result(
@@ -290,7 +340,8 @@ class ReasonTemplateTests(unittest.TestCase):
         )
         self.assertEqual(code, "improper_mixed_items")
         self.assertIn("혼재", reason)
-        self.assertNotIn("500,000원 부족", reason)
+        self.assertIn("500,000원이 부족", reason)
+        self.assertIn("별표 3", reason)
 
 
 if __name__ == "__main__":

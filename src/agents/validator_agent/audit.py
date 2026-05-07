@@ -32,6 +32,13 @@ _EXCEPTION_PATTERNS = (
     re.compile(r"이내"),
 )
 
+# fallback evidence: RDB 미매칭 시 _build_fallback_validator_match()가 생성하는 진단 문자열 패턴
+_FALLBACK_EVIDENCE_PATTERNS = (
+    "카테고리의 일반 허용 범위와",
+    "신호가 일치합니다",
+    "예외 또는 제한 조건으로 다뤄질 수 있습니다",
+)
+
 _DUPLICATE_COST_KEYWORDS = (
     "중복",
     "이중",
@@ -48,9 +55,6 @@ _DUPLICATE_COST_KEYWORDS = (
 
 class CategoryDecisionOutput(BaseModel):
     status: Literal["적절", "부적절", "검토필요"] = Field(description="카테고리 최종 판정")
-    legal_basis: str = Field(description="법령 근거")
-    interpretation: str = Field(description="판정 해석")
-    improvements: str = Field(description="보완점")
     referenced_laws: list[str] = Field(default_factory=list)
 
 
@@ -104,8 +108,8 @@ def decide_category(
         exceeded=computation.exceeded,
         limit_rule=rule_bundle.limit_rule,
         rejection_reason=rejection_reason,
-        llm_interpretation=decision.interpretation if decision else "",
-        llm_improvements=decision.improvements if decision else "",
+        llm_interpretation="",
+        llm_improvements="",
         items=item_judgments,
         referenced_laws=final_laws,
         evidence_snippets=evidence_snippets,
@@ -173,16 +177,19 @@ def _hard_status(
 
     disallowed_items = []
     duplicate_risk_items = []
-    review_items = []
+    no_match_items = []
+    conflict_items = []
+    exception_review_items = []
     for bundle in rule_bundle.items:
         if not bundle.matches:
-            review_items.append(bundle.item.item_name)
+            no_match_items.append(bundle.item.item_name)
             continue
         if _has_duplicate_cost_risk(bundle):
             duplicate_risk_items.append(bundle.item.item_name)
             continue
         allowed = bundle.top_allowed
         disallowed = bundle.top_disallowed
+        exception_summary = _extract_exception_summary(_best_exception_source(bundle))
         if disallowed and (
             not allowed
             or disallowed.score >= allowed.score + 0.5
@@ -190,7 +197,9 @@ def _hard_status(
         ):
             disallowed_items.append(bundle.item.item_name)
         elif disallowed and allowed and abs(disallowed.score - allowed.score) < 1.0:
-            review_items.append(bundle.item.item_name)
+            conflict_items.append(bundle.item.item_name)
+        elif exception_summary:
+            exception_review_items.append(bundle.item.item_name)
     if disallowed_items:
         return ("부적절", f"직접적인 사용불가 근거가 확인된 항목: {', '.join(disallowed_items)}")
     if duplicate_risk_items:
@@ -203,9 +212,58 @@ def _hard_status(
             "검토필요",
             f"공정률 기준 부족: 누적 사용액이 {computation.usage_shortfall_amount:,.0f}원 부족합니다.",
         )
-    if review_items:
-        return ("검토필요", f"예외 조건 또는 근거 충돌로 검토가 필요한 항목: {', '.join(review_items)}")
+    if no_match_items and not (conflict_items or exception_review_items):
+        return (
+            "검토필요",
+            f"직접적인 허용 근거가 충분히 확인되지 않은 항목: {', '.join(no_match_items)}",
+        )
+    if conflict_items or exception_review_items or no_match_items:
+        segments: list[str] = []
+        if conflict_items or exception_review_items:
+            review_targets = conflict_items + [item for item in exception_review_items if item not in conflict_items]
+            if review_targets:
+                segments.append(
+                    f"예외 조건 또는 근거 충돌로 검토가 필요한 항목: {', '.join(review_targets)}"
+                )
+        if no_match_items:
+            segments.append(
+                f"직접적인 허용 근거가 충분히 확인되지 않은 항목: {', '.join(no_match_items)}"
+            )
+        return ("검토필요", " ".join(segments).strip())
     return ("적절", "")
+
+
+def _is_fallback_evidence(text: str) -> bool:
+    """RDB 미매칭 시 _build_fallback_validator_match()가 생성한 진단 문자열인지 판별."""
+    return any(pattern in text for pattern in _FALLBACK_EVIDENCE_PATTERNS)
+
+
+def _verbalize_from_match(
+    *,
+    item_name: str,
+    category_name: str,
+    best,
+    item_allowed: bool,
+) -> str:
+    """
+    fallback evidence가 감지된 경우, DB 필드(referenced_laws, rule_type)만을 사용해
+    최소한의 법령 기반 근거 문장을 생성한다.
+    하드코딩된 도메인 지식 없이 DB에서 가져온 조항 번호와 허용 여부만 활용한다.
+    """
+    law = best.referenced_laws[0] if best.referenced_laws else ""
+    rule_type = getattr(best, "rule_type", "") or ""
+
+    if not law:
+        return ""
+
+    if item_allowed:
+        return f"{law}에 따른 허용 항목으로 확인됩니다."
+
+    # disallowed rule_type이 명시된 경우 제외 근거 표현
+    if any(tag in rule_type for tag in ("disallowed", "profile_disallowed")):
+        return f"{law} 기준 집행 제외 대상으로 확인됩니다."
+
+    return f"{law} 기준 허용 범위를 벗어난 것으로 확인됩니다."
 
 
 def _build_item_judgment(bundle: ItemRuleBundle, *, category_name: str) -> ItemJudgment:
@@ -220,18 +278,19 @@ def _build_item_judgment(bundle: ItemRuleBundle, *, category_name: str) -> ItemJ
     reasoning = "직접 매칭된 규칙이 없습니다."
     referenced_laws: list[str] = []
     if best is not None:
-        reasoning = _compose_item_reasoning(
-            bundle=bundle,
-            best=best,
-            item_allowed=item_allowed,
-            category_name=category_name,
-        )
+        raw_evidence = _clean_text(best.evidence or "", limit=220)
+        if raw_evidence and not _is_fallback_evidence(raw_evidence):
+            # 실제 법령 원문 → Zero Verbalization (그대로 사용)
+            reasoning = raw_evidence
+        else:
+            # fallback 진단 문자열 → DB 필드 기반 최소 verbalization
+            reasoning = _verbalize_from_match(
+                item_name=bundle.item.item_name,
+                category_name=category_name,
+                best=best,
+                item_allowed=item_allowed,
+            ) or "직접 매칭된 규칙이 없습니다."
         referenced_laws = best.referenced_laws[:]
-    reasoning = _polish_item_reasoning(
-        reasoning=reasoning,
-        exception_summary=exception_summary,
-        needs_review=needs_review,
-    )
 
     return ItemJudgment(
         item=bundle.item.item_name,
@@ -271,8 +330,6 @@ def _resolve_final_status(
         retrieved=retrieved,
     )
     if conservative_review:
-        if decision and decision.status != "적절":
-            return decision.status
         return "검토필요"
 
     return "적절"
@@ -354,22 +411,7 @@ def _compose_category_reason(
     hard_reason: str,
     decision: CategoryDecisionOutput | None,
 ) -> str:
-    if decision is None:
-        return hard_reason
-    if status == "적절" and not hard_reason:
-        interpretation = decision.interpretation.strip()
-        if any(keyword in interpretation for keyword in ("검토", "추가 확인", "불확실")):
-            return decision.legal_basis.strip()
-    parts = [decision.legal_basis.strip(), decision.interpretation.strip()]
-    if status == "검토필요" and decision.improvements.strip():
-        parts.append(decision.improvements.strip())
-    merged = " ".join(part for part in parts if part)
-    if hard_reason:
-        if merged:
-            if hard_reason not in merged:
-                return f"{hard_reason} {merged}".strip()
-        return hard_reason
-    return merged
+    return hard_reason
 
 
 def _needs_conservative_review(
@@ -438,77 +480,6 @@ def _best_exception_source(bundle: ItemRuleBundle) -> str:
     return ""
 
 
-def _compose_item_reasoning(*, bundle: ItemRuleBundle, best, item_allowed: bool, category_name: str) -> str:
-    item_name = bundle.item.item_name
-    detail = _naturalize_evidence_statement(
-        _summarize_match_evidence(best.evidence, item_name=item_name),
-        item_allowed=item_allowed,
-    )
-    law = best.referenced_laws[0] if best.referenced_laws else ""
-
-    if item_allowed:
-        opening = f"{item_name} 항목은 {category_name} 카테고리에서 허용되는 집행 항목에 해당합니다."
-    else:
-        opening = f"{item_name} 항목은 {category_name} 카테고리의 허용 범위를 벗어납니다."
-
-    if law:
-        opening = f"{law} 기준상 {opening}"
-
-    if detail:
-        return f"{opening} {detail}".strip()
-    return opening
-
-
-def _summarize_match_evidence(text: str, *, item_name: str) -> str:
-    cleaned = re.sub(r"\s+", " ", text or "").strip()
-    if not cleaned:
-        return ""
-
-    segments = re.split(r"\s*[-\u2022\u25cf\u25a3]\s*|\s*\s*", cleaned)
-    candidates = []
-    for segment in segments:
-        seg = segment.strip(" -")
-        if not seg:
-            continue
-        if len(seg) < 8:
-            continue
-        candidates.append(seg)
-
-    item_tokens = [token for token in re.findall(r"[0-9A-Za-z가-힣]{2,}", item_name) if len(token) >= 2]
-    preferred = max(
-        candidates or [cleaned],
-        key=lambda segment: _evidence_segment_score(segment, item_tokens=item_tokens),
-    )
-
-    preferred = _normalize_evidence_segment(preferred)
-    if "가능한지" in preferred:
-        tail = preferred.split("가능한지", 1)[1].strip(" :.-")
-        if tail:
-            preferred = tail
-    if "사용 가능함." in preferred:
-        preferred = preferred.split("사용 가능함.", 1)[-1].strip(" :.-") or preferred
-    if "사용이 가능함." in preferred:
-        tail = preferred.split("사용이 가능함.", 1)[-1].strip(" :.-")
-        if tail:
-            preferred = tail
-
-    preferred = _normalize_evidence_segment(preferred)
-    if len(preferred) > 140:
-        preferred = preferred[:140].rstrip(" ,.") + "..."
-    return preferred
-
-
-def _polish_item_reasoning(*, reasoning: str, exception_summary: str, needs_review: bool) -> str:
-    text = re.sub(r"\s+", " ", reasoning or "").strip()
-    text = re.sub(r"\s*다만 예외 또는 단서 문구가 함께 확인되었습니다\.?\s*$", "", text)
-    text = re.sub(r"\s*다만 예외 또는 단서 문구가 함께 확인되었습니다", "", text)
-    if exception_summary:
-        if needs_review:
-            return f"{text} 다만 \"{exception_summary}\"라는 단서가 함께 확인되어 적용 대상을 한 번 더 확인할 필요가 있습니다.".strip()
-        return f"{text} 참고로 \"{exception_summary}\"라는 단서 문구도 함께 확인되었습니다.".strip()
-    return text or "직접 매칭된 규칙이 없습니다."
-
-
 def _build_item_review_reason(*, needs_review: bool, exception_summary: str, has_conflict: bool) -> str:
     if not needs_review:
         return ""
@@ -542,49 +513,3 @@ def _contains_exception_phrase(text: str) -> bool:
     return any(pattern.search(normalized) for pattern in _EXCEPTION_PATTERNS)
 
 
-def _evidence_segment_score(text: str, *, item_tokens: list[str]) -> tuple[int, int, int, int]:
-    segment = _normalize_evidence_segment(text)
-    token_hits = sum(1 for token in item_tokens if token in segment)
-    answer_hits = sum(1 for keyword in ("가능", "불가", "제외", "해당", "사용", "구입", "지급", "아닌", "비용") if keyword in segment)
-    question_penalty = 0
-    if "가능한지" in segment:
-        question_penalty = 3
-        if any(keyword in segment for keyword in ("불가", "제외", "아닌")):
-            question_penalty = 1
-    law_boilerplate_penalty = 1 if "제7조제1항" in segment and token_hits == 0 and len(segment) > 80 else 0
-    length_score = min(len(segment), 160)
-    return (
-        token_hits + answer_hits - question_penalty - law_boilerplate_penalty,
-        token_hits,
-        answer_hits,
-        length_score,
-    )
-
-
-def _normalize_evidence_segment(text: str) -> str:
-    segment = re.sub(r"\s+", " ", text or "").strip()
-    segment = re.sub(r"^[0-9]+[.)]?\s*", "", segment)
-    segment = segment.replace("으로 사용 가능한지 으로 사용 가능한지", "으로 사용 가능한지")
-    segment = segment.strip(" -:.")
-    return segment
-
-
-def _naturalize_evidence_statement(text: str, *, item_allowed: bool) -> str:
-    segment = _normalize_evidence_segment(text)
-    if not segment:
-        return ""
-
-    if item_allowed and any(keyword in segment for keyword in ("화재 위험작업", "용접", "인화성물질")):
-        return "화재 위험작업 구간에서 근로자 보호를 위해 사용하는 항목은 해당 카테고리 범위에 포함됩니다."
-    if (not item_allowed) and any(keyword in segment for keyword in ("사무실", "분전반", "근로자 보호 목적이 아닌")):
-        return "근로자 보호 목적이 아닌 장소나 용도로 사용하는 항목은 해당 카테고리로 집행할 수 없습니다."
-    if (not item_allowed) and any(keyword in segment for keyword in ("불가", "제외")):
-        return "해당 항목은 예외 또는 제외 대상으로 분류되어 이 카테고리로 집행할 수 없습니다."
-
-    if "보호구 항목으로 사용이 가능함" in segment:
-        return "법정 보호구의 구입·수리·관리 비용에 해당하므로 이 카테고리에서 집행할 수 있습니다."
-
-    if "일반 허용 범위와" in segment and "신호가 일치합니다" in segment:
-        return segment.rstrip(".") + "."
-
-    return segment.rstrip(".") + "."

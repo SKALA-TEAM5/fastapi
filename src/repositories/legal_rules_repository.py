@@ -653,13 +653,16 @@ def _primary_laws(category_code: str | None) -> list[str]:
 
 
 def _rule_laws(rule: dict, category_code: str | None) -> list[str]:
-    laws = _primary_laws(category_code)
+    laws: list[str] = []
     legal_basis = str(rule.get("legal_basis") or "").strip()
     if legal_basis and legal_basis not in laws:
         laws.append(legal_basis)
     rule_text = str(rule.get("rule_text") or "")
-    for law in re.findall(r"제\d+조(?:제\d+항)?(?:제\d+호)?", rule_text):
+    for law in re.findall(r"제\d+조(?:제\d+항)?(?:제\d+호)?|별표\s*\d+", rule_text):
         if law not in laws:
+            laws.append(law)
+    for law in _primary_laws(category_code):
+        if law and law not in laws:
             laws.append(law)
     return laws
 
