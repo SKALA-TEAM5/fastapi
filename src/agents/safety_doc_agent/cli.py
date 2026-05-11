@@ -2,15 +2,21 @@ from __future__ import annotations
 
 import argparse
 import json
+import sys
 from dataclasses import asdict
+from pathlib import Path
 
-from .config import load_settings, project_data_dir
-from .parser import parse_guide, save_parsed_guide
-from .vector_store import get_openai_client, index_chunks
-from prompts.safety_doc_agent_evidence_requirement_prompt import build_user_prompt
-from repositories.safety_doc_agent_postgres_evidence_repository import PostgresEvidenceRepository
-from services.safety_doc_agent_evidence_check_service import EvidenceCheckService
-from services.safety_doc_agent_evidence_requirement_service import EvidenceRequirementService
+ROOT_DIR = Path(__file__).resolve().parents[3]
+if str(ROOT_DIR) not in sys.path:
+    sys.path.insert(0, str(ROOT_DIR))
+
+from src.agents.safety_doc_agent.config import load_settings, project_data_dir
+from src.agents.safety_doc_agent.parser import parse_guide, save_parsed_guide
+from src.agents.safety_doc_agent.vector_store import get_openai_client, index_chunks
+from src.prompts.safety_doc_agent_evidence_requirement_prompt import build_user_prompt
+from src.repositories.safety_doc_agent_postgres_evidence_repository import PostgresEvidenceRepository
+from src.services.safety_doc_agent_evidence_check_service import EvidenceCheckService
+from src.services.safety_doc_agent_evidence_requirement_service import EvidenceRequirementService
 
 
 def _normalize_collection_name(value: str) -> str:

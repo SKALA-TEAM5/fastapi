@@ -1,5 +1,5 @@
-from src.prompts.shared_prompt import JUDGE_PROMPT, REWRITE_PROMPT
-from src.prompts.validator_prompt import (
+from .shared_prompt import JUDGE_PROMPT, REWRITE_PROMPT
+from .validator_prompt import (
     AUDIT_REASON_SYNTHESIS_PROMPT,
     CATEGORY_DECISION_PROMPT,
     CATEGORY_REASON_APPROPRIATE_PROMPT,

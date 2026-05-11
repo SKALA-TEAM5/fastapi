@@ -16,8 +16,8 @@ import re
 from dataclasses import dataclass
 from pathlib import Path
 
-import psycopg2
-import psycopg2.extras
+import psycopg
+from psycopg.rows import dict_row
 from dotenv import load_dotenv
 
 from src.schemas.classifier import CATEGORIES
@@ -122,9 +122,9 @@ class LegalRulesRepository:
     def _load(self) -> dict:
         if self._payload is not None:
             return self._payload
-        conn = psycopg2.connect(self.database_url)
+        conn = psycopg.connect(self.database_url)
         with conn:
-            with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+            with conn.cursor(row_factory=dict_row) as cur:
                 cur.execute("""
                     SELECT
                         master_id, source_id, rule_type, category_code, category_name,
@@ -155,9 +155,9 @@ class LegalRulesRepository:
     def _load_rule_config(self) -> dict:
         if self._rule_config is not None:
             return self._rule_config
-        conn = psycopg2.connect(self.database_url)
+        conn = psycopg.connect(self.database_url)
         with conn:
-            with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+            with conn.cursor(row_factory=dict_row) as cur:
                 cur.execute("""
                     SELECT profile_scope, category_code, profile_key, values_json, metadata
                     FROM legal_rag.legal_rule_profiles
@@ -438,9 +438,9 @@ class LegalRulesRepository:
             self._progress_rules = structured_rules
             return self._progress_rules
 
-        conn = psycopg2.connect(self.database_url)
+        conn = psycopg.connect(self.database_url)
         with conn:
-            with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+            with conn.cursor(row_factory=dict_row) as cur:
                 cur.execute(
                     """
                     SELECT body

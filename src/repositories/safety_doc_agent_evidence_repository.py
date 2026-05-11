@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from typing import Protocol
 
-from schemas.safety_doc_agent_evidence import (
+from src.schemas.safety_doc_agent_evidence import (
     EvidenceRequirementItemContext,
     EvidenceFileLink,
     EvidenceRequirement,

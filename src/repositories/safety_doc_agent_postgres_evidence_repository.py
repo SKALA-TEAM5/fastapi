@@ -8,9 +8,9 @@ import psycopg
 from psycopg.rows import dict_row
 from psycopg.errors import InsufficientPrivilege, UndefinedTable
 
-from agents.safety_doc_agent.config import Settings, app_root_dir
-from repositories.safety_doc_agent_evidence_repository import EvidenceRepository
-from repositories.safety_doc_agent_postgres_queries import (
+from src.agents.safety_doc_agent.config import Settings, app_root_dir
+from src.repositories.safety_doc_agent_evidence_repository import EvidenceRepository
+from src.repositories.safety_doc_agent_postgres_queries import (
     DEACTIVATE_ACTIVE_REQUIREMENTS,
     GET_EVIDENCE_REQUIREMENT_ITEM_CONTEXT,
     GET_EVIDENCE_REQUIREMENT_ITEM_CONTEXT_FALLBACK,
@@ -24,7 +24,7 @@ from repositories.safety_doc_agent_postgres_queries import (
     LIST_LINKED_FILE_CONTEXTS_FALLBACK,
     MARK_SATISFIED_REQUIREMENTS,
 )
-from schemas.safety_doc_agent_evidence import (
+from src.schemas.safety_doc_agent_evidence import (
     EvidenceRequirementItemContext,
     EvidenceFileLink,
     EvidenceRequirement,
