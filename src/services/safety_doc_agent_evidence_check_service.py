@@ -1,7 +1,7 @@
 from __future__ import annotations
 
-from fastapi.src.repositories.safety_doc_agent_evidence_repository import EvidenceRepository
-from fastapi.src.schemas.safety_doc_agent_evidence import EvidenceStatusDetail, EvidenceStatusResult
+from repositories.safety_doc_agent_evidence_repository import EvidenceRepository
+from schemas.safety_doc_agent_evidence import EvidenceStatusDetail, EvidenceStatusResult
 
 
 class EvidenceCheckService:

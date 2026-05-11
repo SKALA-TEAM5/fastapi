@@ -7,10 +7,10 @@ from dataclasses import asdict
 from .config import load_settings, project_data_dir
 from .parser import parse_guide, save_parsed_guide
 from .vector_store import get_openai_client, index_chunks
-from fastapi.src.prompts.safety_doc_agent_evidence_requirement_prompt import build_user_prompt
-from fastapi.src.repositories.safety_doc_agent_postgres_evidence_repository import PostgresEvidenceRepository
-from fastapi.src.services.safety_doc_agent_evidence_check_service import EvidenceCheckService
-from fastapi.src.services.safety_doc_agent_evidence_requirement_service import EvidenceRequirementService
+from prompts.safety_doc_agent_evidence_requirement_prompt import build_user_prompt
+from repositories.safety_doc_agent_postgres_evidence_repository import PostgresEvidenceRepository
+from services.safety_doc_agent_evidence_check_service import EvidenceCheckService
+from services.safety_doc_agent_evidence_requirement_service import EvidenceRequirementService
 
 
 def _normalize_collection_name(value: str) -> str:
