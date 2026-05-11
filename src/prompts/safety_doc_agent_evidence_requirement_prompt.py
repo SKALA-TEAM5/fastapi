@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import json
 
-from schemas.safety_doc_agent_evidence import AIEvidenceRequirementInput
+from src.schemas.safety_doc_agent_evidence import AIEvidenceRequirementInput
 
 
 SYSTEM_PROMPT = """

@@ -7,10 +7,10 @@ from dataclasses import asdict
 from langsmith import traceable
 from openai import OpenAI
 
-from agents.safety_doc_agent.config import Settings
-from prompts.safety_doc_agent_evidence_requirement_prompt import SYSTEM_PROMPT, build_user_prompt
-from repositories.safety_doc_agent_evidence_repository import EvidenceRepository
-from schemas.safety_doc_agent_evidence import (
+from src.agents.safety_doc_agent.config import Settings
+from src.prompts.safety_doc_agent_evidence_requirement_prompt import SYSTEM_PROMPT, build_user_prompt
+from src.repositories.safety_doc_agent_evidence_repository import EvidenceRepository
+from src.schemas.safety_doc_agent_evidence import (
     AIEvidenceRequirementInput,
     AIEvidenceRequirementOutput,
 )

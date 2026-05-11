@@ -1,0 +1,75 @@
+# Environment and secrets
+.env
+.env.*
+!.env.example
+config_local.py
+secrets.py
+
+# Python cache and build artifacts
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.so
+.Python
+build/
+dist/
+.eggs/
+*.egg
+*.egg-info/
+
+# Virtual environments and tool caches
+.venv/
+venv/
+env/
+.uv/
+.uv-cache/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.cache/
+
+# Coverage and logs
+.coverage
+.coverage.*
+htmlcov/
+*.log
+logs/
+
+# Jupyter
+.ipynb_checkpoints/
+*.ipynb
+
+# Local generated outputs
+artifacts/
+data/
+output/
+outputs/
+results/
+ocr_results/
+parsed_results/
+match_results/
+matching_receipts/
+colpali_output/
+chunks_output*/
+scratch/
+tmp/
+
+# Local vector/database storage
+.qdrant/
+.chroma/
+volumes/
+
+# OS / IDE
+.DS_Store
+.AppleDouble
+.LSOverride
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Local misc
+.gitmessage.txt
+.python-version
+.claude/

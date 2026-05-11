@@ -92,13 +92,13 @@ uv run safety-doc-agent ingest \
 필수 증빙 추론과 충족 여부 계산을 수행합니다.
 
 ```bash
-uv run safety-doc-agent run-db-flow --item-id 101
+uv run safety-doc-agent run-db-flow --item-id 1
 ```
 
 저장 없이 입력과 출력만 확인하려면:
 
 ```bash
-uv run safety-doc-agent run-db-flow --item-id 101 --dry-run
+uv run safety-doc-agent run-db-flow --item-id 1 --dry-run
 ```
 
 출력에는 아래 정보가 포함됩니다.

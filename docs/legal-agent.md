@@ -157,7 +157,7 @@ run_pipeline()
 `outputs/`의 파싱 결과와 `scripts/seed_legal_rule_profiles.json`을 읽어 PostgreSQL seed 파일을 생성합니다.
 
 ```bash
-uv run python -m src.repositories.legal_rules_export \
+uv run python -m src.repositories.legal_rules_exporter \
   --outputs-dir outputs \
   --rule-config-path scripts/seed_legal_rule_profiles.json \
   --json-out artifacts/legal_rules_payload.json \
@@ -179,7 +179,7 @@ uv run python -m src.repositories.legal_rules_export \
 **방법 A — `--apply` 플래그 (권장)**
 
 ```bash
-uv run python -m src.repositories.legal_rules_export \
+uv run python -m src.repositories.legal_rules_exporter \
   --outputs-dir outputs \
   --apply \
   --database-url "postgresql://safety_user:safety_password@localhost:5432/safety"
@@ -239,10 +239,10 @@ run_pipeline(force=True)
    uv run python -c "from src.services.ingestion_service import run_pipeline; run_pipeline()"
         ↓
 4. Payload 생성 (JSON + SQL)
-   uv run python -m src.repositories.legal_rules_export
+   uv run python -m src.repositories.legal_rules_exporter
         ↓
 5. PostgreSQL 적재 (Flyway 스키마 생성 선행 필수)
-   uv run python -m src.repositories.legal_rules_export --apply
+   uv run python -m src.repositories.legal_rules_exporter --apply
 ```
 
 ---
@@ -266,7 +266,7 @@ rag/
 │   ├── agents/
 │   │   ├── classifier_agent/
 │   │   │   ├── agent.py             # 분류 에이전트 메인 로직
-│   │   │   └── main.py              # CLI 진입점
+│   │   │   └── cli.py               # CLI 진입점
 │   │   └── validator_agent/
 │   │       ├── agent.py             # 검증 에이전트 메인 로직
 │   │       ├── audit.py             # 카테고리 최종 판정
@@ -275,18 +275,18 @@ rag/
 │   │       ├── parser.py            # 요청 파싱
 │   │       ├── presenter.py         # 감사 결과 DTO 변환 및 사유 생성
 │   │       ├── rule_matcher.py      # 허용/불가 규칙 매칭
-│   │       └── main.py              # CLI 진입점
+│   │       └── cli.py               # CLI 진입점
 │   ├── core/
 │   │   ├── judge.py                 # LangGraph 판정 노드
 │   │   ├── llm_config.py            # 전역 LLM 설정
 │   │   ├── rag.py                   # 앙상블 리트리버 + Reranker
 │   │   └── storage.py               # Qdrant 연동
 │   ├── prompts/
-│   │   ├── shared.py                # JUDGE_PROMPT, REWRITE_PROMPT
-│   │   └── validator.py             # CATEGORY_DECISION_PROMPT, AUDIT_REASON_SYNTHESIS_PROMPT
+│   │   ├── shared_prompt.py         # JUDGE_PROMPT, REWRITE_PROMPT
+│   │   └── validator_prompt.py      # CATEGORY_DECISION_PROMPT, AUDIT_REASON_SYNTHESIS_PROMPT
 │   ├── repositories/
 │   │   ├── legal_rules_repository.py  # PostgreSQL 법령 조회
-│   │   └── legal_rules_export.py      # PDF 파싱 → payload → SQL export
+│   │   └── legal_rules_exporter.py    # PDF 파싱 → payload → SQL export
 │   ├── schemas/
 │   │   ├── classifier.py            # 분류 스키마 (CATEGORIES 포함)
 │   │   ├── shared.py                # 공통 스키마
@@ -297,15 +297,16 @@ rag/
 │       └── validator_service.py     # 검증 서비스 계층
 │
 ├── tests/
-│   ├── classifier/
-│   │   ├── cases/                   # inputs.json, expected.json
-│   │   ├── output/                  # 평가 결과 (자동 생성)
-│   │   └── eval.py                  # Classifier 평가 스크립트
-│   └── validator/
-│       ├── cases/                   # inputs.json, expected.json
-│       ├── output/                  # 평가 결과 (자동 생성)
-│       ├── eval.py                  # Validator 평가 스크립트
-│       └── query.py                 # 단건 쿼리 테스트
+│   └── agents/
+│       ├── classifier_agent/
+│       │   ├── cases/               # inputs.json, expected.json
+│       │   ├── output/              # 평가 결과 (자동 생성)
+│       │   └── test_classifier_agent.py  # Classifier 평가 스크립트
+│       └── validator_agent/
+│           ├── cases/               # inputs.json, expected.json
+│           ├── output/              # 평가 결과 (자동 생성)
+│           ├── test_validator_agent.py   # Validator 평가 스크립트
+│           └── test_validator_query.py   # 단건 쿼리 테스트
 │
 ├── examples/                        # 샘플 입력 JSON
 └── docs/                            # 설계 문서
@@ -337,19 +338,17 @@ PR 대상 브랜치는 항상 `main`입니다.
 
 ```bash
 # Classifier 평가
-uv run python -m tests.classifier.eval --verbose
+uv run python -m tests.agents.classifier_agent.test_classifier_agent
 
 # Validator 평가
-uv run python -m tests.validator.eval --verbose
+uv run python -m tests.agents.validator_agent.test_validator_agent
 
-# 특정 케이스만 실행 (Classifier)
-uv run python -m tests.classifier.eval --id <케이스ID> --verbose
-
-# 모델 지정 (Validator, 기본값: gpt-4o-mini)
-uv run python -m tests.validator.eval --model gpt-4o --verbose
+# 단건 쿼리 테스트
+uv run python -m tests.agents.validator_agent.test_validator_query
+uv run python -m tests.agents.validator_agent.test_validator_query --question "안전모 구입 비용은 산안비 항목인가?"
 ```
 
-결과 파일은 `tests/<agent>/output/results_YYYYMMDD_HHMM.json` 에 저장됩니다.
+결과 파일은 `tests/agents/<agent>/output/results_YYYYMMDD_HHMM.json` 에 저장됩니다.
 
 ### Coding Standards
 
@@ -372,7 +371,7 @@ uv run python -m tests.validator.eval --model gpt-4o --verbose
 - Python 모듈: 소문자 + 스네이크 케이스
 - 서비스 파일: `*_service.py`
 - 저장소 파일: `*_repository.py`
-- 테스트 파일: `eval.py` 또는 `test_*.py`
+- 테스트 파일: `test_*.py`
 
 ---
 
@@ -381,7 +380,7 @@ uv run python -m tests.validator.eval --model gpt-4o --verbose
 ### Classifier Agent 실행
 
 ```bash
-uv run python -m src.agents.classifier_agent.main \
+uv run python -m src.agents.classifier_agent.cli \
   --input examples/classifier_agent/sample_input.json \
   --collection legal_documents
 ```
@@ -389,7 +388,7 @@ uv run python -m src.agents.classifier_agent.main \
 ### Validator Agent 실행
 
 ```bash
-uv run python -m src.agents.validator_agent.main \
+uv run python -m src.agents.validator_agent.cli \
   --input examples/validator_agent/sample_input.json \
   --collection legal_documents
 ```
