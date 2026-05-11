@@ -1,0 +1,39 @@
+{
+  "source_file": "2026년4월_안전관리비사용내역서.pdf",
+  "parse_status": "SUCCESS",
+  "meta": {
+    "project_name": "스카라 건설 현장",
+    "report_month": "2026-04",
+    "document_written_date": "2026-04-24"
+  },
+  "items": [
+    {
+      "seq": 1,
+      "category_code": "CAT_01",
+      "used_on": "2026-04-24",
+      "item_name": "안전관리자 임금",
+      "total_amount": 3500000
+    },
+    {
+      "seq": 2,
+      "category_code": "CAT_03",
+      "used_on": "2026-04-15",
+      "item_name": "안전모",
+      "total_amount": 150000
+    },
+    {
+      "seq": 3,
+      "category_code": "CAT_03",
+      "used_on": "2026-03-27",
+      "item_name": "안전화",
+      "total_amount": 150000
+    },
+    {
+      "seq": 4,
+      "category_code": "CAT_03",
+      "used_on": "2026-04-22",
+      "item_name": "안전조끼",
+      "total_amount": 200000
+    }
+  ]
+}

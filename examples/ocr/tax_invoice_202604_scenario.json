@@ -1,0 +1,13 @@
+[
+  {
+    "invoice_id": "inv_202604_001",
+    "doc_type": "tax_invoice",
+    "supplier": { "company_name": "한국안전용품", "business_number": "123-45-67890" },
+    "issue_date": "2026-04-23",
+    "total_amount": 330000,
+    "items": [
+      { "name": "안전모", "supply_amount": 150000 },
+      { "name": "안전화", "supply_amount": 150000 }
+    ]
+  }
+]

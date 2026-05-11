@@ -1,0 +1,51 @@
+[
+  {
+    "receipt_id": "rec_wage_001",
+    "doc_type": "wage_statement",
+    "vendor": null,
+    "date": "2026-04-22",
+    "total_amount": 3500000,
+    "items": [],
+    "tax_invoice_status": "exempt"
+  },
+  {
+    "receipt_id": "rec_helmet_001",
+    "doc_type": "transaction_statement",
+    "vendor": "한국안전용품",
+    "date": "2026-04-15",
+    "total_amount": 150000,
+    "items": [
+      { "item_name": "안전모", "count": 5, "unit_price": 30000, "amount": 150000 }
+    ]
+  },
+  {
+    "receipt_id": "rec_shoes_001",
+    "doc_type": "receipt",
+    "vendor": "한국안전용품",
+    "date": "2026-03-27",
+    "total_amount": 150000,
+    "items": [
+      { "item_name": "안전화", "count": 5, "unit_price": 30000, "amount": 150000 }
+    ]
+  },
+  {
+    "receipt_id": "rec_vest_001",
+    "doc_type": "transaction_statement",
+    "vendor": "현장안전물자",
+    "date": "2026-04-22",
+    "total_amount": 200000,
+    "items": [
+      { "item_name": "안전조끼", "count": 8, "unit_price": 25000, "amount": 200000 }
+    ]
+  },
+  {
+    "receipt_id": "rec_error_001",
+    "doc_type": "receipt",
+    "vendor": "오류상점",
+    "date": "2026-04-23",
+    "total_amount": 50000,
+    "items": [
+      { "item_name": "테이프", "count": 10, "unit_price": 5000, "amount": 50000 }
+    ]
+  }
+]

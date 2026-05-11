@@ -1,0 +1,121 @@
+{
+  "batch_id": "b1000001-0000-0000-0000-000000000001",
+  "created_at": "2025-04-30T18:00:00",
+  "thresholds": {
+    "matched": 0.85,
+    "review": 0.75
+  },
+  "summary": {
+    "total": 4,
+    "matched": 2,
+    "review_needed": 0,
+    "unmatched": 2,
+    "rejected": 0,
+    "match_rate_pct": 50.0,
+    "review_rate_pct": 0.0
+  },
+  "results": [
+    {
+      "usage_item": {
+        "seq": 1,
+        "category_code": "CAT_01",
+        "used_on": "2025-04-30",
+        "item_name": "안전관리자 임금",
+        "total_amount": 3000000
+      },
+      "receipt": null,
+      "match_status": "unmatched",
+      "similarity_score": 0.0,
+      "component_scores": {
+        "date": null,
+        "amount": null,
+        "vendor": null,
+        "item_desc": null,
+        "photo_text": null
+      },
+      "gate_failed": ["no_receipt"],
+      "reject_reason": null
+    },
+    {
+      "usage_item": {
+        "seq": 2,
+        "category_code": "CAT_03",
+        "used_on": "2025-04-15",
+        "item_name": "안전모",
+        "total_amount": 150000
+      },
+      "receipt": {
+        "receipt_id": "receipt_001",
+        "source_file": "보호구_거래명세표_20250415.jpg",
+        "vendor": "한국안전용품",
+        "date": "2025-04-15",
+        "total_amount": 300000
+      },
+      "match_status": "matched",
+      "similarity_score": 0.97,
+      "component_scores": {
+        "date": 1.0,
+        "amount": 1.0,
+        "vendor": 0.85,
+        "item_desc": 1.0,
+        "photo_text": null
+      },
+      "gate_failed": [],
+      "reject_reason": null
+    },
+    {
+      "usage_item": {
+        "seq": 3,
+        "category_code": "CAT_03",
+        "used_on": "2025-04-15",
+        "item_name": "안전화",
+        "total_amount": 150000
+      },
+      "receipt": {
+        "receipt_id": "receipt_001",
+        "source_file": "보호구_거래명세표_20250415.jpg",
+        "vendor": "한국안전용품",
+        "date": "2025-04-15",
+        "total_amount": 300000
+      },
+      "match_status": "matched",
+      "similarity_score": 0.95,
+      "component_scores": {
+        "date": 1.0,
+        "amount": 1.0,
+        "vendor": 0.85,
+        "item_desc": 0.93,
+        "photo_text": null
+      },
+      "gate_failed": [],
+      "reject_reason": null
+    },
+    {
+      "usage_item": {
+        "seq": 4,
+        "category_code": "CAT_03",
+        "used_on": "2025-04-22",
+        "item_name": "안전조끼",
+        "total_amount": 200000
+      },
+      "receipt": {
+        "receipt_id": "receipt_002",
+        "source_file": "보호구_거래명세표_20250422.jpg",
+        "vendor": "현장안전물자",
+        "date": "2025-04-22",
+        "total_amount": 160000
+      },
+      "match_status": "unmatched",
+      "similarity_score": 0.62,
+      "component_scores": {
+        "date": 1.0,
+        "amount": 0.0,
+        "vendor": 0.72,
+        "item_desc": 1.0,
+        "photo_text": null
+      },
+      "gate_failed": ["amount_gate"],
+      "reject_reason": null
+    }
+  ]
+}
