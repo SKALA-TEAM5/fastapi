@@ -288,6 +288,7 @@ tests/
 - `context_builder.py`
 - `schemas.py`
 - `llm.py`
+- `templates/report_template.json`
 
 ### 프롬프트 파일명 예시
 

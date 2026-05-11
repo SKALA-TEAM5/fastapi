@@ -32,6 +32,7 @@ DB rows
 | `llm.py`                                  | OpenAI API 호출 어댑터입니다. LLM에게 전체 보고서를 맡기지 않고 결론, 종합 의견, 필요 조치 같은 문장 필드만 JSON 패치로 요청합니다.                                                                |
 | `prompts/system_report.md`                | LLM의 기본 역할과 금지사항을 정의합니다. 근거 없는 법령 생성, 금액/판정 변경을 금지합니다.                                                                                                         |
 | `prompts/report_draft_template.md`        | LLM에게 넘기는 작업 프롬프트입니다. 어떤 JSON 필드만 반환해야 하는지 정의합니다.                                                                                                                   |
+| `templates/report_template.json`          | 웹 화면과 DOCX 추출기가 같은 보고서 형식을 재현할 수 있도록 섹션, 표, 반복 행 구조를 정의하는 구조 기반 JSON 템플릿입니다.                                                                        |
 | `examples/report_agent/sample_input.json` | 최소 샘플 `ReportContext`입니다. agent와 JSON 생성 CLI 동작 확인에 사용합니다.                                                                                                                     |
 
 전체 흐름은 다음과 같습니다.
@@ -132,7 +133,16 @@ LLM은 다음 필드를 바꿀 수 없습니다.
 
 `ReportDraft`는 화면 편집, 저장, API 응답에 사용하는 구조화 JSON 보고서입니다.
 
-`report_sections`는 웹 화면, PDF 출력, DOCX 변환기가 같은 보고서 형식을 재현할 수 있도록 템플릿 순서의 섹션과 표를 담습니다. 프론트엔드와 내보내기 로직은 이 필드를 기준으로 표지, 기본 정보, 집행 요약, 상세 내역, 종합 의견을 같은 순서와 제목으로 렌더링해야 합니다.
+`report_sections`는 `templates/report_template.json`을 `ReportDraft` 값으로 채운 결과입니다. 웹 화면과 DOCX 추출기는 이 필드를 기준으로 표지, 기본 정보, 집행 요약, 상세 내역, 종합 의견을 같은 순서와 제목으로 렌더링해야 합니다.
+
+템플릿은 절대 좌표 대신 문서 구조를 저장합니다.
+
+- `sections`: 보고서 섹션 순서, 제목, 종류
+- `tables`: 섹션 내부 표 구조
+- `headers`, `rows`: 고정 표 머리글과 행
+- `repeat_for`, `row_template`: 배열 필드를 반복 렌더링하는 행 템플릿
+- `repeat_mode: tables`: 상세 이슈처럼 항목마다 별도 표가 필요한 영역
+- `{{draft.site_name}}`, `{{item.amount|money}}`: 값 바인딩과 표시 필터
 
 주요 섹션:
 

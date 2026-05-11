@@ -238,7 +238,7 @@ class SupplementActionDraft(BaseModel):
 
 
 class ReportTableDraft(BaseModel):
-    """웹/PDF/DOCX 렌더러가 같은 표를 그릴 수 있도록 보존하는 표 구조입니다."""
+    """웹 화면과 DOCX 추출기가 같은 표를 그릴 수 있도록 보존하는 표 구조입니다."""
 
     title: str | None = None
     headers: list[str] = Field(default_factory=list)

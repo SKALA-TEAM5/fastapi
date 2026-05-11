@@ -8,10 +8,11 @@ from __future__ import annotations
 """
 
 import json
+import re
 from collections import Counter
 from decimal import Decimal
 from pathlib import Path
-from typing import Callable
+from typing import Any, Callable
 
 from .context_builder import decimal_ratio
 from .llm import OpenAIReportLLMClient, ReportLLMError
@@ -33,6 +34,8 @@ from .schemas import (
 
 
 LLMClient = Callable[[str, dict], dict]
+REPORT_TEMPLATE_PATH = Path(__file__).parent / "templates" / "report_template.json"
+TEMPLATE_TOKEN_PATTERN = re.compile(r"{{\s*([^}]+?)\s*}}")
 
 
 RESULT_TO_DECISION: dict[str, DecisionCode] = {
@@ -358,138 +361,138 @@ class ReportAgent:
         return merged.model_copy(update={"report_sections": self._build_report_sections(merged)})
 
     def _build_report_sections(self, draft: ReportDraft) -> list[ReportSectionDraft]:
-        """웹/PDF/DOCX가 동일한 보고서 형식을 그릴 수 있는 섹션 구조를 만듭니다."""
+        """구조 기반 JSON 템플릿을 ReportDraft 값으로 채워 report_sections를 만듭니다."""
 
-        cover_rows = [
-            ["현장명", draft.site_name],
-            ["검토 대상 기간", draft.report_period_label],
-            ["보고서 번호", draft.report_no],
-            ["작성일", draft.written_date_label],
-            ["작성 부서", self._department_full_label(draft)],
-        ]
-        basic_info_rows = [
-            ["보고서 번호", draft.report_no, "검토 일자", draft.written_date_label],
-            ["현장명", draft.site_name, "현장코드", draft.basic_info.get("현장코드", "-")],
-            ["발주처", draft.basic_info.get("발주처", "-"), "시공사", draft.basic_info.get("시공사", "-")],
-            ["계약금액", draft.basic_info.get("계약금액", "-"), "공사기간", draft.basic_info.get("공사기간", "-")],
-            ["법정 계상액", draft.basic_info.get("법정 계상액", "-"), "검토자", draft.reviewer_label],
-            ["검토 대상 기간", draft.report_period_label, "검토 목적", draft.basic_info.get("검토 목적", "-")],
-        ]
-        amount_rows = [
-            [summary.label, self._money(summary.amount), summary.ratio_label, summary.count_label]
-            for summary in draft.amount_summary
-        ]
-        category_rows = [
-            [summary.category_name, self._money(summary.amount), f"{summary.count}건", summary.note]
-            for summary in draft.category_summaries
-        ]
-        evidence_rows = [
-            [
-                summary.evidence_type_name,
-                self._count(summary.submitted_count),
-                self._count(summary.passed_count),
-                self._count(summary.error_count),
-                self._count(summary.missing_count),
-                summary.major_error,
-            ]
-            for summary in draft.evidence_validation_summaries
-        ]
-        tax_rows = [
-            [
-                row.item_name,
-                self._money(row.document_supply_amount),
-                self._money(row.execution_supply_amount),
-                self._money(row.vat_amount),
-                row.difference_label,
-            ]
-            for row in draft.tax_settlement_rows
-        ] or [["-", "-", "-", "-", "-"]]
-        item_rows = [
-            [str(review.no), review.item_name, self._money(review.amount), review.decision_label, review.summary_reason]
-            for review in draft.item_reviews
-        ]
-        issue_tables = [
-            ReportTableDraft(
-                title=f"6.{index}  {'부적정' if issue.issue_type == 'inappropriate' else '검토 필요'} - No.{issue.no}  {issue.title}",
-                rows=[
-                    ["집행 금액", issue.amount_label],
-                    ["확인된 문제" if issue.issue_type == "needs_review" else "집행 경위", issue.problem or issue.agent_conclusion],
-                    ["판정 결론", "부적정" if issue.issue_type == "inappropriate" else "검토필요"],
-                    ["법령 근거", issue.legal_basis],
-                    ["조치 사항", issue.required_action or issue.agent_conclusion],
-                ],
+        template = self._load_report_template()
+        data = draft.model_dump(mode="python")
+        data["department_full_label"] = self._department_full_label(draft)
+
+        sections: list[ReportSectionDraft] = []
+        for section_template in template.get("sections", []):
+            section_context = {"draft": data}
+            tables: list[ReportTableDraft] = []
+            for table_template in section_template.get("tables", []):
+                tables.extend(self._render_table_templates(table_template, section_context))
+            sections.append(
+                ReportSectionDraft(
+                    section_id=str(section_template["section_id"]),
+                    title=self._render_template_text(str(section_template["title"]), section_context),
+                    kind=section_template["kind"],
+                    paragraphs=[
+                        self._render_template_text(str(paragraph), section_context)
+                        for paragraph in section_template.get("paragraphs", [])
+                    ],
+                    tables=tables,
+                )
             )
-            for index, issue in enumerate(draft.issue_details, start=1)
-        ] or [ReportTableDraft(title="6.1  -", rows=[["확인된 문제", "-"], ["법령 근거", "-"], ["조치 사항", "-"]])]
-        action_rows = [
-            [str(action.no), action.title, action.action, action.due_date_label, action.assignee]
-            for action in draft.supplement_actions
-        ] or [["-", "-", "-", "-", "-"]]
+        return sections
+
+    def _load_report_template(self) -> dict[str, Any]:
+        return json.loads(REPORT_TEMPLATE_PATH.read_text(encoding="utf-8"))
+
+    def _render_table_templates(self, table_template: dict[str, Any], context: dict[str, Any]) -> list[ReportTableDraft]:
+        repeat_for = table_template.get("repeat_for")
+        repeat_mode = table_template.get("repeat_mode", "rows")
+        if repeat_for and repeat_mode == "tables":
+            items = self._get_template_value(context, f"draft.{repeat_for}")
+            if not isinstance(items, list) or not items:
+                return [
+                    ReportTableDraft(
+                        title=self._render_template_text(str(table_template.get("empty_title", table_template.get("title", "-"))), context),
+                        headers=[str(header) for header in table_template.get("headers", [])],
+                        rows=[
+                            [self._render_template_text(str(cell), context) for cell in row]
+                            for row in table_template.get("empty_rows", [["-"]])
+                        ],
+                    )
+                ]
+            rendered_tables: list[ReportTableDraft] = []
+            for index, item in enumerate(items, start=1):
+                item_context = {**context, "item": self._augment_repeat_item(str(repeat_for), item, index), "index": index}
+                rendered_tables.append(
+                    ReportTableDraft(
+                        title=self._render_template_text(str(table_template.get("title", "")), item_context) or None,
+                        headers=[str(header) for header in table_template.get("headers", [])],
+                        rows=[
+                            [self._render_template_text(str(cell), item_context) for cell in row]
+                            for row in table_template.get("rows", [])
+                        ],
+                    )
+                )
+            return rendered_tables
+
+        rows = [
+            [self._render_template_text(str(cell), context) for cell in row]
+            for row in table_template.get("rows", [])
+        ]
+        if repeat_for:
+            items = self._get_template_value(context, f"draft.{repeat_for}")
+            if isinstance(items, list) and items:
+                for index, item in enumerate(items, start=1):
+                    item_context = {**context, "item": self._augment_repeat_item(str(repeat_for), item, index), "index": index}
+                    rows.append(
+                        [
+                            self._render_template_text(str(cell), item_context)
+                            for cell in table_template.get("row_template", [])
+                        ]
+                    )
+            else:
+                rows.append([str(cell) for cell in table_template.get("empty_row", ["-"])])
 
         return [
-            ReportSectionDraft(
-                section_id="cover",
-                title=draft.title,
-                kind="cover",
-                tables=[ReportTableDraft(rows=cover_rows)],
-            ),
-            ReportSectionDraft(
-                section_id="basic_info",
-                title="1. 기본 정보",
-                kind="table",
-                tables=[ReportTableDraft(rows=basic_info_rows)],
-            ),
-            ReportSectionDraft(
-                section_id="execution_summary",
-                title="2. 집행 내역 요약",
-                kind="table",
-                tables=[
-                    ReportTableDraft(title="집행 금액 요약", headers=["구분", "금액", "집행률", "비고"], rows=amount_rows),
-                    ReportTableDraft(title="항목별 집행 현황 (법정 9개 항목 기준)", headers=["집행 항목", "집행액 (원)", "건수", "비고"], rows=category_rows),
-                ],
-            ),
-            ReportSectionDraft(
-                section_id="evidence_validation",
-                title="3. 증빙 유효성 검증 결과",
-                kind="table",
-                tables=[ReportTableDraft(headers=["증빙 유형", "제출", "통과", "오류", "누락", "주요 내용"], rows=evidence_rows)],
-            ),
-            ReportSectionDraft(
-                section_id="tax_settlement",
-                title="4. 세금 및 정산 검토",
-                kind="table",
-                tables=[ReportTableDraft(headers=["항목", "세금계산서 금액", "영수증 기재액", "부가세", "일치 여부"], rows=tax_rows)],
-            ),
-            ReportSectionDraft(
-                section_id="item_reviews",
-                title="5. 항목별 적정성 검토 결과",
-                kind="table",
-                tables=[ReportTableDraft(headers=["No.", "집행 항목", "집행액", "판정", "요약 사유"], rows=item_rows)],
-            ),
-            ReportSectionDraft(
-                section_id="issue_details",
-                title="6. 부적정 및 검토 필요 상세 내역",
-                kind="detail",
-                tables=issue_tables,
-            ),
-            ReportSectionDraft(
-                section_id="supplement_actions",
-                title="7. 보완 필요 사항",
-                kind="table",
-                tables=[ReportTableDraft(headers=["No.", "보완 항목", "실행 내용", "완료 기한", "담당자"], rows=action_rows)],
-            ),
-            ReportSectionDraft(
-                section_id="overall_opinion",
-                title="8. 종합 의견",
-                kind="opinion",
-                paragraphs=[
-                    draft.overall_opinion,
-                    f"검 토 자 :   {draft.reviewer_label}          (서명)  ______________________",
-                    f"검토 일자 :   {draft.written_date_label}",
-                    draft.department_label,
-                ],
-            ),
+            ReportTableDraft(
+                title=self._render_template_text(str(table_template.get("title", "")), context) or None,
+                headers=[str(header) for header in table_template.get("headers", [])],
+                rows=rows,
+            )
         ]
+
+    def _augment_repeat_item(self, repeat_for: str, item: object, index: int) -> dict[str, Any]:
+        item_data = item if isinstance(item, dict) else {"value": item}
+        augmented = {**item_data, "index": index}
+        if repeat_for == "issue_details":
+            issue_type = str(item_data.get("issue_type", ""))
+            augmented["issue_label"] = "부적정" if issue_type == "inappropriate" else "검토 필요"
+            augmented["problem_label"] = "확인된 문제" if issue_type == "needs_review" else "집행 경위"
+            augmented["decision_label"] = "부적정" if issue_type == "inappropriate" else "검토필요"
+            augmented["problem_text"] = item_data.get("problem") or item_data.get("agent_conclusion") or "-"
+            augmented["action_text"] = item_data.get("required_action") or item_data.get("agent_conclusion") or "-"
+        return augmented
+
+    def _render_template_text(self, template_text: str, context: dict[str, Any]) -> str:
+        def replace(match) -> str:
+            expression = match.group(1)
+            path, *filters = [part.strip() for part in expression.split("|")]
+            value = self._get_template_value(context, path)
+            for filter_name in filters:
+                value = self._apply_template_filter(value, filter_name)
+            return "-" if value in (None, "") else str(value)
+
+        return TEMPLATE_TOKEN_PATTERN.sub(replace, template_text)
+
+    def _get_template_value(self, context: dict[str, Any], path: str) -> Any:
+        value: Any = context
+        for part in path.split("."):
+            if isinstance(value, dict):
+                value = value.get(part)
+            else:
+                value = getattr(value, part, None)
+            if value is None:
+                return None
+        return value
+
+    def _apply_template_filter(self, value: Any, filter_name: str) -> Any:
+        if filter_name == "money":
+            try:
+                return self._money(Decimal(str(value)))
+            except Exception:
+                return value
+        if filter_name == "count":
+            try:
+                return self._count(int(value))
+            except Exception:
+                return value
+        return value
 
     def _merge_llm_issues(self, draft: ReportDraft, payload: object):
         if not isinstance(payload, list):
