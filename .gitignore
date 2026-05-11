@@ -46,6 +46,7 @@ data/
 output/
 outputs/
 results/
+examples/
 ocr_results/
 parsed_results/
 match_results/
