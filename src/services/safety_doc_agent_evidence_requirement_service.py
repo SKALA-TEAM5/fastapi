@@ -8,9 +8,9 @@ from langsmith import traceable
 from openai import OpenAI
 
 from agents.safety_doc_agent.config import Settings
-from fastapi.src.prompts.safety_doc_agent_evidence_requirement_prompt import SYSTEM_PROMPT, build_user_prompt
-from fastapi.src.repositories.safety_doc_agent_evidence_repository import EvidenceRepository
-from fastapi.src.schemas.safety_doc_agent_evidence import (
+from prompts.safety_doc_agent_evidence_requirement_prompt import SYSTEM_PROMPT, build_user_prompt
+from repositories.safety_doc_agent_evidence_repository import EvidenceRepository
+from schemas.safety_doc_agent_evidence import (
     AIEvidenceRequirementInput,
     AIEvidenceRequirementOutput,
 )
