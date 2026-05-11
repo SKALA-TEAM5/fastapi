@@ -30,8 +30,8 @@ DB rows
 | `agent.py`                                | 보고서 초안을 만드는 핵심 파일입니다. 입력 데이터를 표, 이슈, 보완사항 구조로 바꾸고 classifier/validator 결과를 반영합니다. LLM 결과가 있으면 허용된 문장 필드만 병합합니다.                      |
 | `cli.py`                                  | `ReportContext` JSON 파일을 읽어 `ReportDraft` JSON 보고서 파일을 생성하는 로컬 실행 진입점입니다.                                                                                                  |
 | `llm.py`                                  | OpenAI API 호출 어댑터입니다. LLM에게 전체 보고서를 맡기지 않고 결론, 종합 의견, 필요 조치 같은 문장 필드만 JSON 패치로 요청합니다.                                                                |
-| `prompts/system_report.md`                | LLM의 기본 역할과 금지사항을 정의합니다. 근거 없는 법령 생성, 금액/판정 변경을 금지합니다.                                                                                                         |
-| `prompts/report_draft_template.md`        | LLM에게 넘기는 작업 프롬프트입니다. 어떤 JSON 필드만 반환해야 하는지 정의합니다.                                                                                                                   |
+| `src/prompts/report_agent_system.md`      | LLM의 기본 역할과 금지사항을 정의합니다. 근거 없는 법령 생성, 금액/판정 변경을 금지합니다.                                                                                                         |
+| `src/prompts/report_agent_draft_template.md` | LLM에게 넘기는 작업 프롬프트입니다. 어떤 JSON 필드만 반환해야 하는지 정의합니다.                                                                                                                |
 | `templates/report_template.json`          | 웹 화면과 DOCX 추출기가 같은 보고서 형식을 재현할 수 있도록 섹션, 표, 반복 행 구조를 정의하는 구조 기반 JSON 템플릿입니다.                                                                        |
 | `examples/report_agent/sample_input.json` | 최소 샘플 `ReportContext`입니다. agent와 JSON 생성 CLI 동작 확인에 사용합니다.                                                                                                                     |
 

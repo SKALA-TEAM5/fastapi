@@ -65,7 +65,7 @@ class OpenAIReportLLMClient:
             "input": [
                 {
                     "role": "system",
-                    "content": [{"type": "input_text", "text": _read_prompt("system_report.md")}],
+                    "content": [{"type": "input_text", "text": _read_prompt("report_agent_system.md")}],
                 },
                 {
                     "role": "user",
@@ -111,7 +111,7 @@ class OpenAIReportLLMClient:
 
 
 def _build_user_prompt(payload: dict[str, Any]) -> str:
-    instruction = _read_prompt("report_draft_template.md")
+    instruction = _read_prompt("report_agent_draft_template.md")
     context_json = json.dumps(payload.get("context", {}), ensure_ascii=False, indent=2)
     draft_json = json.dumps(payload.get("draft", {}), ensure_ascii=False, indent=2)
     return (
@@ -140,7 +140,7 @@ def _parse_response_json(raw: str) -> dict[str, Any]:
 
 
 def _read_prompt(filename: str) -> str:
-    return (Path(__file__).parent / "prompts" / filename).read_text(encoding="utf-8")
+    return (Path(__file__).parents[2] / "prompts" / filename).read_text(encoding="utf-8")
 
 
 def _response_schema() -> dict[str, Any]:
