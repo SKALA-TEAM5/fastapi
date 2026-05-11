@@ -1,0 +1,80 @@
+{
+  "source_file": "2025년4월_안전관리비사용내역서.pdf",
+  "parse_status": "SUCCESS",
+  "meta": {
+    "project_name": "한강뷰 아파트 신축공사",
+    "construction_company": "한강건설(주)",
+    "site_location": "서울특별시 마포구 상암동 123-45",
+    "report_month": "2025-04",
+    "document_written_date": "2025-04-30",
+    "cumulative_progress_rate": 18.5,
+    "contract_amount": 5000000000,
+    "appropriated_amount": 50000000
+  },
+  "items": [
+    {
+      "seq": 1,
+      "category_code": "CAT_01",
+      "used_on": "2025-04-30",
+      "item_name": "안전관리자 임금",
+      "unit": "명",
+      "quantity": 1.0,
+      "unit_price": 3000000.0,
+      "total_amount": 3000000,
+      "remark": null,
+      "page_no": 2,
+      "line_no": 1
+    },
+    {
+      "seq": 2,
+      "category_code": "CAT_03",
+      "used_on": "2025-04-15",
+      "item_name": "안전모",
+      "unit": "개",
+      "quantity": 10.0,
+      "unit_price": 15000.0,
+      "total_amount": 150000,
+      "remark": null,
+      "page_no": 3,
+      "line_no": 1
+    },
+    {
+      "seq": 3,
+      "category_code": "CAT_03",
+      "used_on": "2025-04-15",
+      "item_name": "안전화",
+      "unit": "켤레",
+      "quantity": 5.0,
+      "unit_price": 30000.0,
+      "total_amount": 150000,
+      "remark": null,
+      "page_no": 3,
+      "line_no": 2
+    },
+    {
+      "seq": 4,
+      "category_code": "CAT_03",
+      "used_on": "2025-04-22",
+      "item_name": "안전조끼",
+      "unit": "개",
+      "quantity": 8.0,
+      "unit_price": 25000.0,
+      "total_amount": 200000,
+      "remark": null,
+      "page_no": 3,
+      "line_no": 3
+    }
+  ],
+  "summary_by_category": {
+    "CAT_01": {
+      "previous_amount": 5500000,
+      "current_amount": 3000000,
+      "cumulative_amount": 8500000
+    },
+    "CAT_03": {
+      "previous_amount": 1200000,
+      "current_amount": 500000,
+      "cumulative_amount": 1700000
+    }
+  }
+}

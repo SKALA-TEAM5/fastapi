@@ -1,0 +1,53 @@
+[
+  {
+    "receipt_id": "receipt_001",
+    "source_file": "보호구_거래명세표_20250415.jpg",
+    "infer_result": "SUCCESS",
+    "vendor": "한국안전용품",
+    "date": "2025-04-15",
+    "total_amount": 300000,
+    "items": [
+      {
+        "item_name": "안전모",
+        "count": 10,
+        "unit_price": 15000,
+        "amount": 150000,
+        "roi_box": [120, 340, 280, 60]
+      },
+      {
+        "item_name": "안전화",
+        "count": 5,
+        "unit_price": 30000,
+        "amount": 150000,
+        "roi_box": [120, 410, 280, 60]
+      }
+    ],
+    "validation": {
+      "is_valid": true,
+      "items_sum_match": true,
+      "warnings": []
+    }
+  },
+  {
+    "receipt_id": "receipt_002",
+    "source_file": "보호구_거래명세표_20250422.jpg",
+    "infer_result": "SUCCESS",
+    "vendor": "현장안전물자",
+    "date": "2025-04-22",
+    "total_amount": 160000,
+    "items": [
+      {
+        "item_name": "안전조끼",
+        "count": 8,
+        "unit_price": 20000,
+        "amount": 160000,
+        "roi_box": [100, 320, 300, 60]
+      }
+    ],
+    "validation": {
+      "is_valid": true,
+      "items_sum_match": true,
+      "warnings": ["단가 이상: 사용내역서(25,000원) ≠ 영수증(20,000원)"]
+    }
+  }
+]
