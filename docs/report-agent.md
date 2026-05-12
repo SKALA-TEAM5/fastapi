@@ -94,18 +94,12 @@ UsageStatementItemContext(
 
 ## LLM 사용
 
-`ReportAgent()`는 기본적으로 `OPENAI_API_KEY`가 있으면 LLM을 호출합니다. API 키가 없거나 호출이 실패하면 LLM 없이 만든 초안을 반환하고, 실패 사유를 `needs_human_review`에 남깁니다.
+`ReportAgent()`는 항상 LLM을 호출합니다. 총평(`overall_opinion`)은 반드시 LLM 응답으로 작성되어야 하므로 `OPENAI_API_KEY`가 없거나 LLM 호출이 실패하면 보고서 생성을 실패시킵니다. 감사 보고서 본문에 들어갈 수 있도록 총평은 최소 350자 이상이어야 합니다.
 
 ```python
 from src.agents.report_agent.agent import ReportAgent
 
 draft = ReportAgent().generate(context)
-```
-
-LLM을 끄려면 다음처럼 호출합니다.
-
-```python
-draft = ReportAgent(use_default_llm=False).generate(context)
 ```
 
 기본 모델은 `gpt-5.2`이며, `OPENAI_REPORT_MODEL` 환경변수로 바꿀 수 있습니다.
@@ -165,12 +159,12 @@ LLM은 다음 필드를 바꿀 수 없습니다.
 
 ```bash
 uv run python -m src.agents.report_agent.cli \
-  examples/report_agent/sample_input.json \
-  output/report_agent/sample_report_draft.json \
-  --no-llm
+  examples/report_agent/sample_input.json
 ```
 
-`--no-llm`을 빼면 `OPENAI_API_KEY`가 있을 때 문장 필드 보강을 시도합니다. API 키가 없으면 LLM 없이 생성된 deterministic draft를 반환합니다.
+테스트로 생성한 보고서 JSON은 기본적으로 `examples/report_agent/sample_report_llm_output.json`에 저장됩니다. 출력 파일명만 지정하면 `examples/report_agent/<파일명>`으로 저장됩니다.
+
+실행 환경에는 `OPENAI_API_KEY`가 반드시 있어야 합니다. `.env`를 사용하는 로컬 환경에서는 먼저 `set -a; source .env; set +a`로 환경변수를 로드한 뒤 실행합니다.
 
 ## 증빙 유형 집계
 
