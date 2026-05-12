@@ -51,6 +51,7 @@ import json
 import uuid
 import logging
 import argparse
+import calendar
 from pathlib import Path
 from datetime import datetime, timedelta
 from difflib import SequenceMatcher
@@ -73,8 +74,13 @@ THRESHOLD_REVIEW:  float       = 0.75
 MATCH_THRESHOLD:   float       = THRESHOLD_REVIEW
 
 # ── Hard Gate 허용 오차 ─────────────────────────────────────────────
-# 날짜: ±1일  /  금액: ±1%  /  업체명: 정규화 후 완전일치
-GATE_DATE_DAYS:   int   = 1     # 날짜 허용 오차 (일)
+# 날짜: 정산 사이클 범위 내 (전달 마지막 목요일 다음날 ~ 이번달 마지막 수요일)
+# 금액: ±1%  /  업체명: 정규화 후 완전일치
+#
+# [정산 사이클 정의]
+#   결제: 마지막 수요일 / 세금계산서: 목요일 / 사용내역서: 금요일
+#   해당 주에 수·목·금 없으면 전주 실행
+#   → 한 달 정산 범위: 전달 마지막 목요일 다음날 ~ 이번달 마지막 수요일
 GATE_AMOUNT_PCT:  float = 0.01  # 금액 허용 오차 (1%)
 
 
@@ -185,6 +191,120 @@ def _parse_date_safe(date_str: Optional[str]) -> Optional[datetime]:
         return datetime.strptime(str(date_str).strip()[:10], "%Y-%m-%d")
     except ValueError:
         return None
+
+
+# ══════════════════════════════════════════════════════════════
+# 2-a. 정산 사이클 기반 날짜 Gate (Gate 1)
+# ══════════════════════════════════════════════════════════════
+
+def _last_weekday_of_month(year: int, month: int, weekday: int) -> datetime:
+    """
+    해당 연월의 마지막 특정 요일 반환.
+    weekday: 0=월, 1=화, 2=수, 3=목, 4=금, 5=토, 6=일
+    """
+    last_day  = calendar.monthrange(year, month)[1]
+    last_date = datetime(year, month, last_day)
+    days_back = (last_date.weekday() - weekday) % 7
+    return last_date - timedelta(days=days_back)
+
+
+def _get_settlement_cycle(ref_date: datetime) -> tuple[datetime, datetime]:
+    """
+    ref_date 달 기준 정산 사이클의 시작·종료일 반환.
+
+    cycle_end   = ref_date 달의 마지막 수요일 (결제일)
+    cycle_start = 전달 마지막 목요일 + 1일
+
+    예) ref_date = 2026-04-15
+      4월 마지막 수요일 → 4/29  (cycle_end)
+      3월 마지막 목요일 → 3/26
+      cycle_start       → 3/27
+    """
+    last_wed = _last_weekday_of_month(ref_date.year, ref_date.month, weekday=2)
+
+    first_of_month  = ref_date.replace(day=1)
+    prev_month_last = first_of_month - timedelta(days=1)
+    last_thu_prev   = _last_weekday_of_month(
+        prev_month_last.year, prev_month_last.month, weekday=3
+    )
+
+    cycle_start = last_thu_prev + timedelta(days=1)
+    cycle_end   = last_wed
+    return cycle_start, cycle_end
+
+
+def _which_cycle(date: datetime) -> tuple[datetime, datetime]:
+    """
+    특정 날짜가 실제로 귀속되는 정산 사이클 반환.
+
+    탐색 순서: 현재달 사이클 → 다음달 사이클 (최대 2단계)
+
+    예) 2026-03-27
+      · 3월 사이클: 2026-02-27 ~ 2026-03-25  → 03-27 범위 밖
+      · 4월 사이클: 2026-03-27 ~ 2026-04-29  → 03-27 범위 안 ✅
+    """
+    cs, ce = _get_settlement_cycle(date)
+    if cs <= date <= ce:
+        return cs, ce
+    # 현재달 사이클 밖 → 다음달 사이클에 귀속
+    next_month_first = (date.replace(day=1) + timedelta(days=32)).replace(day=1)
+    return _get_settlement_cycle(next_month_first)
+
+
+def _date_gate_cycle(usage_date: Optional[str], doc_date: Optional[str]) -> bool:
+    """
+    정산 사이클 기반 날짜 Gate.
+
+    통과 조건:
+      ① 날짜 중 하나라도 없거나 파싱 실패 → 통과 (면제)
+      ② usage_date 가 속한 정산 사이클 내에 doc_date 포함 → 통과
+      ③ 그 외 → 실패
+    """
+    if not usage_date or not doc_date:
+        return True
+
+    d_usage = _parse_date_safe(usage_date)
+    d_doc   = _parse_date_safe(doc_date)
+
+    if d_usage is None or d_doc is None:
+        return True
+
+    cycle_start, cycle_end = _which_cycle(d_usage)
+    return cycle_start <= d_doc <= cycle_end
+
+
+# ══════════════════════════════════════════════════════════════
+# 2-b. 영수증 필드 추출 헬퍼 — 신·구 포맷 공통 지원
+# ══════════════════════════════════════════════════════════════
+
+def _extract_receipt_date(receipt: dict) -> Optional[str]:
+    """
+    영수증 딕셔너리에서 날짜를 추출한다.
+
+    포맷 우선순위:
+      ① 신버전 통합 포맷: receipt["date"]
+         (영수증: 카드 승인일시 / 거래명세표: 작성일자)
+      ② 구버전 CLOVA 포맷: receipt["payment"]["date"]
+      ③ match_format 변환 후: receipt["payment"]["date"]  (동일)
+    """
+    date_top = receipt.get("date")
+    if date_top:
+        return date_top
+    return (receipt.get("payment") or {}).get("date")
+
+
+def _extract_receipt_vendor(receipt: dict) -> str:
+    """
+    영수증 딕셔너리에서 업체명을 추출한다.
+
+    포맷 우선순위:
+      ① 신버전 통합 포맷: receipt["vendor"]
+      ② match_format / 구버전: receipt["store"]["name"]
+    """
+    vendor_top = receipt.get("vendor") or ""
+    if vendor_top:
+        return vendor_top
+    return (receipt.get("store") or {}).get("name") or ""
 
 
 def date_score(date1: Optional[str], date2: Optional[str]) -> Optional[float]:
@@ -330,13 +450,16 @@ def _check_rejection(usage_item: dict, receipt: dict) -> Optional[str]:
         if infer:
             return f"영수증 OCR 인식 실패 (상태: {infer})"
 
-    items = receipt.get("items", [])
-    has_named_item = any(
-        item.get("name") and str(item["name"]).strip()
-        for item in items
-    )
-    if not has_named_item:
-        return "영수증 품목명 없음 — 반려 처리"
+    # 임금명세서(wage_statement)는 items가 없는 것이 구조적으로 정상 → 품목명 검사 면제
+    if receipt.get("doc_type") != "wage_statement":
+        items = receipt.get("items", [])
+        has_named_item = any(
+            (item.get("name") and str(item["name"]).strip())
+            or (item.get("item_name") and str(item.get("item_name", "")).strip())
+            for item in items
+        )
+        if not has_named_item:
+            return "영수증 품목명 없음 — 반려 처리"
 
     if not usage_item.get("name") and not usage_item.get("description") and not usage_item.get("category"):
         return "사용내역서 항목에 내용 설명 누락"
@@ -357,80 +480,125 @@ def _check_hard_gates(
     모두 통과해야 후보 영수증으로 인정.
     하나라도 실패하면 즉시 unmatched.
 
-    Gate 1 — 날짜 : |usage_date − receipt_date| ≤ GATE_DATE_DAYS (1일)
-    Gate 2 — 금액 : |usage_amount − receipt_amount| / max ≤ GATE_AMOUNT_PCT (1%)
-    Gate 3 — 업체명: 정규화 후 문자열 완전일치
-              사용내역서에 업체명이 없으면 면제
+    Gate 1 — 날짜  : 정산 사이클 기반 (전달 마지막 목요일+1 ~ 이번달 마지막 수요일)
+    Gate 2 — 금액  : |사용금액 − 영수증금액| / max ≤ GATE_AMOUNT_PCT (1%)
+    Gate 3 — 업체명: 정규화 후 완전일치
+              · wage_statement(임금명세서)는 업체명 개념이 없으므로 자동 면제
+              · 사용내역서에 업체명이 기재되지 않은 경우에도 면제
 
     Returns:
         (passed: bool, failed_gates: list[str])
     """
     failed: list[str] = []
 
-    # ── Gate 1: 날짜 ─────────────────────────────────────────
+    # ── Gate 1: 날짜 (정산 사이클 기반) ──────────────────────
     usage_date   = usage_item.get("date")
-    receipt_date = receipt.get("payment", {}).get("date")
+    receipt_date = _extract_receipt_date(receipt)
     if usage_date and receipt_date:
-        d1 = _parse_date_safe(usage_date)
-        d2 = _parse_date_safe(receipt_date)
-        if d1 and d2:
-            diff_days = abs((d1 - d2).days)
-            if diff_days > GATE_DATE_DAYS:
-                failed.append(
-                    f"날짜 {diff_days}일 차이 "
-                    f"(내역서: {usage_date} / 영수증: {receipt_date}, "
-                    f"허용: ±{GATE_DATE_DAYS}일)"
-                )
+        if not _date_gate_cycle(usage_date, receipt_date):
+            d_usage = _parse_date_safe(usage_date)
+            if d_usage:
+                cs, ce    = _which_cycle(d_usage)
+                cycle_str = f"{cs.strftime('%Y-%m-%d')} ~ {ce.strftime('%Y-%m-%d')}"
+            else:
+                cycle_str = "계산 불가"
+            failed.append(
+                f"날짜 정산 사이클 불일치 "
+                f"(내역서: {usage_date} / 영수증: {receipt_date}, "
+                f"허용 사이클: {cycle_str})"
+            )
 
     # ── Gate 2: 금액 ─────────────────────────────────────────
-    usage_amount   = usage_item.get("amount")
-    receipt_amount = receipt.get("total_amount")
-    if usage_amount is not None and receipt_amount is not None:
-        try:
-            a1, a2 = int(usage_amount), int(receipt_amount)
-            if max(a1, a2) > 0:
+    # [다품목 영수증 대응]
+    # 영수증 한 장에 여러 품목이 있을 경우 total_amount는 항목 합산이므로
+    # 사용내역서 단일 항목 금액과 직접 비교하면 항상 실패한다.
+    # 우선순위:
+    #   1순위 — 품목명 유사도 기반 라인 소계 (item.amount: count × unit_price)
+    #   2순위 — 영수증 총액 (단품 영수증 또는 1순위 미탐지 시)
+    #   3순위 — 공급가액 (VAT 포함 total 대응: total / 1.1 추정)
+    # 후보 중 하나라도 ±1% 이내면 Gate 통과.
+    usage_amount = usage_item.get("amount")
+
+    if usage_amount is not None:
+        receipt_items = receipt.get("items", [])
+        usage_desc    = usage_item.get("name") or usage_item.get("description", "")
+
+        # 1순위: 품목명 유사도로 찾은 라인 소계
+        _, best_item_amt = _find_best_receipt_item_amount(usage_desc, receipt_items)
+
+        # 2순위: 영수증 총액
+        total_amt = receipt.get("total_amount")
+
+        # 3순위: 공급가액 (필드 있으면 사용, 없으면 총액 / 1.1 추정)
+        supply_amt = receipt.get("supply_amount")
+        if supply_amt is None and total_amt is not None:
+            supply_amt = round(total_amt / 1.1)
+
+        candidates = [a for a in [best_item_amt, total_amt, supply_amt] if a is not None]
+
+        gate_amount_passed = False
+        best_diff_pct      = float("inf")
+        best_pair          = (int(usage_amount), int(total_amt) if total_amt else 0)
+
+        for cand in candidates:
+            try:
+                a1, a2 = int(usage_amount), int(cand)
+                if max(a1, a2) == 0:
+                    gate_amount_passed = True
+                    break
                 diff_pct = abs(a1 - a2) / max(a1, a2)
-                if diff_pct > GATE_AMOUNT_PCT:
-                    failed.append(
-                        f"금액 {diff_pct * 100:.1f}% 차이 "
-                        f"(내역서: {a1:,}원 / 영수증: {a2:,}원, "
-                        f"허용: ±{GATE_AMOUNT_PCT * 100:.0f}%)"
-                    )
-        except (TypeError, ValueError):
-            failed.append("금액 파싱 오류")
+                if diff_pct <= GATE_AMOUNT_PCT:
+                    gate_amount_passed = True
+                    break
+                if diff_pct < best_diff_pct:
+                    best_diff_pct = diff_pct
+                    best_pair     = (a1, a2)
+            except (TypeError, ValueError):
+                continue
 
-    # ── Gate 3: 업체명 (사용내역서 업체명이 있을 때만 적용) ─────
-    usage_vendor_raw  = usage_item.get("vendor", "") or ""
-    receipt_store_raw = receipt.get("store", {}).get("name", "") or ""
+        if not gate_amount_passed:
+            if candidates:
+                a1, a2 = best_pair
+                failed.append(
+                    f"금액 {best_diff_pct * 100:.1f}% 차이 "
+                    f"(내역서: {a1:,}원 / 영수증 최근접: {a2:,}원, "
+                    f"허용: ±{GATE_AMOUNT_PCT * 100:.0f}%)"
+                )
+            else:
+                failed.append("영수증 금액 정보 없음")
 
-    def _vendor_for_gate(text: str) -> str:
-        """
-        Gate 비교 전용 업체명 정규화.
-        (주) / ㈜ / (유) 등 법인 단자(주·사·유)를 완전히 제거하고
-        공백·특수문자를 없앤 뒤 소문자로 반환.
-        예) "(주)한국건설안전기술원" → "한국건설안전기술원"
-            "한국건설안전기술원(주)" → "한국건설안전기술원"
-        """
-        if not text:
-            return ""
-        # 1단계: 법인 표기 → 단자("주"/"사"/"유")로 통일
-        t = _normalize_vendor(text)
-        # 2단계: 앞/뒤에 붙은 법인 단자 제거
-        t = re.sub(r"^[주사유]\s*", "", t)
-        t = re.sub(r"\s*[주사유]$", "", t)
-        # 3단계: 공백·특수문자 완전 제거
-        t = re.sub(r"[^가-힣a-zA-Z0-9]", "", t)
-        return t.lower()
+    # ── Gate 3: 업체명 ────────────────────────────────────────
+    # wage_statement(임금명세서)는 업체명 개념이 없으므로 Gate 3 자동 면제.
+    # 임금명세서 외 문서라도 사용내역서에 업체명 미기재 시 비교 불가 → 면제.
+    if receipt.get("doc_type") != "wage_statement":
+        usage_vendor_raw  = usage_item.get("vendor", "") or ""
+        receipt_store_raw = _extract_receipt_vendor(receipt)
 
-    u_clean = _vendor_for_gate(usage_vendor_raw)
-    r_clean = _vendor_for_gate(receipt_store_raw)
+        def _vendor_for_gate(text: str) -> str:
+            """
+            Gate 비교 전용 업체명 정규화.
+            (주) / ㈜ / (유) 등 법인 단자(주·사·유)를 완전히 제거하고
+            공백·특수문자를 없앤 뒤 소문자로 반환.
+            예) "(주)한국건설안전기술원" → "한국건설안전기술원"
+                "한국건설안전기술원(주)" → "한국건설안전기술원"
+            """
+            if not text:
+                return ""
+            t = _normalize_vendor(text)
+            t = re.sub(r"^[주사유]\s*", "", t)
+            t = re.sub(r"\s*[주사유]$", "", t)
+            t = re.sub(r"[^가-힣a-zA-Z0-9]", "", t)
+            return t.lower()
 
-    if u_clean:  # 사용내역서에 업체명이 있는 경우에만 gate 적용
-        if not r_clean or u_clean != r_clean:
-            failed.append(
-                f"업체명 불일치 "
-                f"(내역서: '{usage_vendor_raw}' / 영수증: '{receipt_store_raw}')"
-            )
+        u_clean = _vendor_for_gate(usage_vendor_raw)
+        r_clean = _vendor_for_gate(receipt_store_raw)
+
+        if u_clean:  # 사용내역서에 업체명이 기재된 경우에만 비교
+            if not r_clean or u_clean != r_clean:
+                failed.append(
+                    f"업체명 불일치 "
+                    f"(내역서: '{usage_vendor_raw}' / 영수증: '{receipt_store_raw}')"
+                )
 
     return (len(failed) == 0), failed
 
@@ -504,7 +672,7 @@ def compute_component_scores(
     """
     # ── (1) 날짜 ──────────────────────────────────────────────
     usage_date   = usage_item.get("date")
-    receipt_date = receipt.get("payment", {}).get("date")
+    receipt_date = _extract_receipt_date(receipt)
     score_date   = date_score(usage_date, receipt_date)
 
     # ── (2) 금액 ──────────────────────────────────────────────
@@ -543,7 +711,7 @@ def compute_component_scores(
         return re.sub(r"[^가-힣a-zA-Z0-9]", "", t).lower()
 
     usage_vendor_raw  = usage_item.get("vendor", "") or ""
-    receipt_store_raw = receipt.get("store", {}).get("name", "") or ""
+    receipt_store_raw = _extract_receipt_vendor(receipt)
     u_vn = _vendor_normalized(usage_vendor_raw)
     r_vn = _vendor_normalized(receipt_store_raw)
 
@@ -805,12 +973,10 @@ def match_best(
     )
 
     # 해당 영수증의 gate 실패 사유 추출
-    best_receipt_store = (
-        best_fallback.get("receipt", {}).get("store", {}).get("name", "")
-    )
+    best_receipt_store = _extract_receipt_vendor(best_fallback.get("receipt") or {})
     failed_reasons: list[str] = []
     for r, gates in gate_failed_pairs:
-        if r.get("store", {}).get("name", "") == best_receipt_store:
+        if _extract_receipt_vendor(r) == best_receipt_store:
             failed_reasons = gates
             break
     if not failed_reasons and gate_failed_pairs:
