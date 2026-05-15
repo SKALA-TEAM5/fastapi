@@ -294,7 +294,8 @@ def parse_header_page(page) -> dict:
                         summaries.append({
                             "항목코드": code,
                             "항목명": name,
-                            "금회금액": amounts[-2] if len(amounts) >= 2 else None,
+                            "전회금액": amounts[-3] if len(amounts) >= 3 else 0,
+                            "금회금액": amounts[-2],
                             "누계금액": amounts[-1],
                         })
                     break
