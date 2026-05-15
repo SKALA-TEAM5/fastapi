@@ -247,6 +247,19 @@ def build_remark(extra_data: dict) -> str | None:
     return " | ".join(parts) if parts else None
 
 
+def recalc_total(unit_price: float | None, quantity: float | None, parsed_amount: int | None) -> int | None:
+    """
+    단가 × 수량으로 계(total_amount)를 재계산한다.
+
+    문서에 기재된 계(합계)가 잘못 작성된 경우를 대비해,
+    단가와 수량이 모두 존재하면 계산값을 우선 사용한다.
+    둘 중 하나라도 없으면 파싱된 원본 금액을 그대로 반환한다.
+    """
+    if unit_price and quantity:
+        return round(unit_price * quantity)
+    return parsed_amount
+
+
 # ══════════════════════════════════════════════════════════
 # 2. 서식 감지
 # ══════════════════════════════════════════════════════════
@@ -373,18 +386,21 @@ def parse_category_page(page, category_code: str, page_no: int) -> list:
                 if col_idx is not None and col_idx < len(row_c) and row_c[col_idx]:
                     extra_data[field] = row_c[col_idx]
 
+            unit_price = parse_number(extra_data.get("unit_price"))
+            quantity   = parse_number(extra_data.get("qty"))
+
             item = {
-                "line_id":      str(uuid.uuid4()),
+                "line_id":       str(uuid.uuid4()),
                 "category_code": category_code,
-                "used_on":      parse_date(row_c[date_col]) if date_col is not None else None,
-                "item_name":    row_c[desc_col] if desc_col is not None and row_c[desc_col] else None,
-                "unit":         extra_data.get("unit"),
-                "quantity":     parse_number(extra_data.get("qty")),
-                "unit_price":   parse_number(extra_data.get("unit_price")),
-                "total_amount": amount,
-                "remark":       build_remark(extra_data),
-                "page_no":      page_no,
-                "line_no":      line_no,
+                "used_on":       parse_date(row_c[date_col]) if date_col is not None else None,
+                "item_name":     row_c[desc_col] if desc_col is not None and row_c[desc_col] else None,
+                "unit":          extra_data.get("unit"),
+                "quantity":      quantity,
+                "unit_price":    unit_price,
+                "total_amount":  recalc_total(unit_price, quantity, amount),
+                "remark":        build_remark(extra_data),
+                "page_no":       page_no,
+                "line_no":       line_no,
             }
 
             items.append(item)
@@ -449,7 +465,9 @@ def parse_simple_format(pdf) -> tuple[dict, list]:
                     if col_map.get("category") is not None
                     else None
                 )
-                cat_code = _infer_category_code(category_raw or "")
+                cat_code   = _infer_category_code(category_raw or "")
+                unit_price = parse_number(row_c[col_map["unit_price"]]) if col_map.get("unit_price") is not None else None
+                quantity   = parse_number(row_c[col_map["qty"]]) if col_map.get("qty") is not None else None
 
                 items.append({
                     "line_id":       str(uuid.uuid4()),
@@ -457,9 +475,9 @@ def parse_simple_format(pdf) -> tuple[dict, list]:
                     "used_on":       parse_date(row_c[col_map["date"]]) if col_map.get("date") is not None else None,
                     "item_name":     row_c[col_map["description"]] if col_map.get("description") is not None else None,
                     "unit":          row_c[col_map["unit"]] if col_map.get("unit") is not None else None,
-                    "quantity":      parse_number(row_c[col_map["qty"]]) if col_map.get("qty") is not None else None,
-                    "unit_price":    parse_number(row_c[col_map["unit_price"]]) if col_map.get("unit_price") is not None else None,
-                    "total_amount":  amount,
+                    "quantity":      quantity,
+                    "unit_price":    unit_price,
+                    "total_amount":  recalc_total(unit_price, quantity, amount),
                     "remark":        row_c[col_map["note"]] if col_map.get("note") is not None else None,
                     "page_no":       page_num,
                     "line_no":       line_no,
