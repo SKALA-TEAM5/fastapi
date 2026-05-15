@@ -6,7 +6,7 @@
   1. src/ocr/parse_usage_statement  : 사용내역서 PDF 파싱
   2. src/ocr/clova_ocr_receipt      : 영수증 이미지 배치 OCR
   2b. src/ocr/parse_tax_invoice     : 세금계산서 파싱 (PDF or 이미지 자동 분기)
-  3. src/services/matching_service  : 2-way 매칭 (임계값 0.85 / 0.75)
+  3. src/services/matching_service_monthly : 2-way 매칭 — 월 단위 날짜 비교 (임계값 0.85 / 0.75)
 
 파이프라인 흐름:
   입력: 사용내역서 PDF + 영수증 이미지 폴더
@@ -73,7 +73,7 @@ from src.ocr.parse_tax_invoice import (
     print_summary as print_tax_invoice_summary,
     ALL_EXTS as TAX_INVOICE_EXTS,
 )
-from src.services.matching_service import (
+from src.services.matching_service_monthly import (
     match_all_usage_to_receipts,
     save_match_result,
     print_batch_summary,
@@ -465,7 +465,7 @@ def main():
     )
 
     if args.verbose:
-        from src.services.matching_service import print_match_result
+        from src.services.matching_service_monthly import print_match_result
         for r in batch["results"]:
             print_match_result(r)
 
