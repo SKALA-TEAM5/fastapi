@@ -246,12 +246,14 @@ def run_link_pipeline(
             file_map = get_files_by_ids(conn, all_ids)
 
             # ── usage_statement items 조회 (매칭용) ───────────────────────
+            # v_usage_statement_context 뷰 사용 (직접 테이블 조회 대신)
             with conn.cursor() as _cur:
                 _cur.execute(
                     """
-                    SELECT id, category_code, used_on, item_name, total_amount
-                    FROM usage_statement_items
+                    SELECT item_id, category_code, used_on, item_name, total_amount
+                    FROM v_usage_statement_context
                     WHERE usage_statement_id = %s
+                      AND item_id IS NOT NULL
                     """,
                     (usage_statement_id,),
                 )
