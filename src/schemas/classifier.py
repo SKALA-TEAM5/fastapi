@@ -12,7 +12,7 @@
 # --------------------------------------------------------------------------
 from typing import Any, Literal
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import AliasChoices, BaseModel, ConfigDict, Field
 
 CATEGORIES: dict[str, str] = {
     "CAT_01": "안전관리자 등의 인건비 및 각종 업무 수당 등",
@@ -45,15 +45,141 @@ class DocumentClassification(BaseModel):
     review_reason: str = Field(default="", description="사람 검토 필요 사유")
 
 
+class UnifiedUsageStatementRow(_KoreanAliasModel):
+    """
+    사용내역서 OCR 결과와 classifier 결과를 함께 담을 수 있는 공통 DTO.
+
+    - 입력은 OCR 영문 키(`category_code`, `total_amount`, `line_no` 등)와
+      classifier 한글 alias(`기존카테고리코드`, `금액`, `행ID` 등)를 모두 허용한다.
+    - 출력은 기존 classifier 응답과의 호환을 위해 한글 alias 기준으로 직렬화한다.
+    """
+
+    row_id: int | None = Field(
+        default=None,
+        alias="행ID",
+        validation_alias=AliasChoices("행ID", "row_id", "line_no"),
+    )
+    usage_statement_id: int | str | None = Field(
+        default=None,
+        alias="사용내역서ID",
+        validation_alias=AliasChoices("사용내역서ID", "usage_statement_id"),
+    )
+    source_line_id: str | None = Field(
+        default=None,
+        alias="라인ID",
+        validation_alias=AliasChoices("라인ID", "source_line_id", "line_id"),
+    )
+    given_category_code: str | None = Field(
+        default=None,
+        alias="기존카테고리코드",
+        validation_alias=AliasChoices("기존카테고리코드", "given_category_code", "category_code"),
+    )
+    used_on: str | None = Field(
+        default=None,
+        alias="사용일자",
+        validation_alias=AliasChoices("사용일자", "used_on"),
+    )
+    item_name: str | None = Field(
+        default=None,
+        alias="항목명",
+        validation_alias=AliasChoices("항목명", "item_name"),
+    )
+    unit: str | None = Field(
+        default=None,
+        alias="단위",
+        validation_alias=AliasChoices("단위", "unit"),
+    )
+    quantity: float | None = Field(
+        default=None,
+        alias="수량",
+        validation_alias=AliasChoices("수량", "quantity"),
+    )
+    unit_price: float | None = Field(
+        default=None,
+        alias="단가",
+        validation_alias=AliasChoices("단가", "unit_price"),
+    )
+    total_amount: float | None = Field(
+        default=None,
+        alias="금액",
+        validation_alias=AliasChoices("금액", "total_amount", "amount"),
+    )
+    remark: str | None = Field(
+        default=None,
+        alias="비고",
+        validation_alias=AliasChoices("비고", "remark"),
+    )
+    page_no: int | None = Field(
+        default=None,
+        alias="페이지번호",
+        validation_alias=AliasChoices("페이지번호", "page_no"),
+    )
+    source_line_no: int | None = Field(
+        default=None,
+        alias="원본행번호",
+        validation_alias=AliasChoices("원본행번호", "source_line_no", "line_no"),
+    )
+    final_category_code: str | None = Field(
+        default=None,
+        alias="최종카테고리코드",
+        validation_alias=AliasChoices("최종카테고리코드", "final_category_code"),
+    )
+    decision_status: Literal["유지", "카테고리변경"] | None = Field(
+        default=None,
+        alias="판정상태",
+        validation_alias=AliasChoices("판정상태", "decision_status"),
+    )
+    needs_human_review: bool | None = Field(
+        default=None,
+        alias="검토필요여부",
+        validation_alias=AliasChoices("검토필요여부", "needs_human_review"),
+    )
+    reason: str = Field(
+        default="",
+        alias="사유",
+        validation_alias=AliasChoices("사유", "reason"),
+    )
+
+
 class UsageStatementRow(_KoreanAliasModel):
-    row_id: int | None = Field(default=None, alias="행ID")
-    given_category_code: str = Field(alias="기존카테고리코드")
-    used_on: str | None = Field(default=None, alias="사용일자")
-    item_name: str = Field(alias="항목명")
-    unit: str | None = Field(default=None, alias="단위")
-    quantity: float | None = Field(default=None, alias="수량")
-    unit_price: float | None = Field(default=None, alias="단가")
-    total_amount: float = Field(alias="금액")
+    row_id: int | None = Field(
+        default=None,
+        alias="행ID",
+        validation_alias=AliasChoices("행ID", "row_id", "line_no"),
+    )
+    given_category_code: str = Field(
+        alias="기존카테고리코드",
+        validation_alias=AliasChoices("기존카테고리코드", "given_category_code", "category_code"),
+    )
+    used_on: str | None = Field(
+        default=None,
+        alias="사용일자",
+        validation_alias=AliasChoices("사용일자", "used_on"),
+    )
+    item_name: str = Field(
+        alias="항목명",
+        validation_alias=AliasChoices("항목명", "item_name"),
+    )
+    unit: str | None = Field(
+        default=None,
+        alias="단위",
+        validation_alias=AliasChoices("단위", "unit"),
+    )
+    quantity: float | None = Field(
+        default=None,
+        alias="수량",
+        validation_alias=AliasChoices("수량", "quantity"),
+    )
+    unit_price: float | None = Field(
+        default=None,
+        alias="단가",
+        validation_alias=AliasChoices("단가", "unit_price"),
+    )
+    total_amount: float = Field(
+        default=0,
+        alias="금액",
+        validation_alias=AliasChoices("금액", "total_amount", "amount"),
+    )
 
 
 class UsageStatementReviewRequest(_KoreanAliasModel):
@@ -100,7 +226,7 @@ class RowReviewResult(_KoreanAliasModel):
     item_name: str = Field(alias="항목명")
     given_category_code: str = Field(alias="기존카테고리코드")
     final_category_code: str = Field(alias="최종카테고리코드")
-    decision_status: Literal["유지", "카테고리변경", "검토필요"] = Field(alias="판정상태")
+    decision_status: Literal["유지", "카테고리변경"] = Field(alias="판정상태")
     needs_human_review: bool = Field(alias="검토필요여부")
     reason: str = Field(default="", alias="사유")
 
@@ -111,19 +237,85 @@ class UsageStatementReviewResponse(_KoreanAliasModel):
 
 
 class ClassifiedUsageStatementRow(_KoreanAliasModel):
-    row_id: int | None = Field(default=None, alias="행ID")
-    usage_statement_id: int | str | None = Field(default=None, alias="사용내역서ID")
-    given_category_code: str = Field(alias="기존카테고리코드")
-    used_on: str | None = Field(default=None, alias="사용일자")
-    item_name: str = Field(alias="항목명")
-    unit: str | None = Field(default=None, alias="단위")
-    quantity: float | None = Field(default=None, alias="수량")
-    unit_price: float | None = Field(default=None, alias="단가")
-    total_amount: float = Field(alias="금액")
-    final_category_code: str = Field(alias="최종카테고리코드")
-    decision_status: Literal["유지", "카테고리변경", "검토필요"] = Field(alias="판정상태")
-    needs_human_review: bool = Field(alias="검토필요여부")
-    reason: str = Field(default="", alias="사유")
+    row_id: int | None = Field(
+        default=None,
+        alias="행ID",
+        validation_alias=AliasChoices("행ID", "row_id", "line_no"),
+    )
+    usage_statement_id: int | str | None = Field(
+        default=None,
+        alias="사용내역서ID",
+        validation_alias=AliasChoices("사용내역서ID", "usage_statement_id"),
+    )
+    source_line_id: str | None = Field(
+        default=None,
+        alias="라인ID",
+        validation_alias=AliasChoices("라인ID", "source_line_id", "line_id"),
+    )
+    given_category_code: str = Field(
+        alias="기존카테고리코드",
+        validation_alias=AliasChoices("기존카테고리코드", "given_category_code", "category_code"),
+    )
+    used_on: str | None = Field(
+        default=None,
+        alias="사용일자",
+        validation_alias=AliasChoices("사용일자", "used_on"),
+    )
+    item_name: str = Field(
+        alias="항목명",
+        validation_alias=AliasChoices("항목명", "item_name"),
+    )
+    unit: str | None = Field(
+        default=None,
+        alias="단위",
+        validation_alias=AliasChoices("단위", "unit"),
+    )
+    quantity: float | None = Field(
+        default=None,
+        alias="수량",
+        validation_alias=AliasChoices("수량", "quantity"),
+    )
+    unit_price: float | None = Field(
+        default=None,
+        alias="단가",
+        validation_alias=AliasChoices("단가", "unit_price"),
+    )
+    total_amount: float = Field(
+        alias="금액",
+        validation_alias=AliasChoices("금액", "total_amount", "amount"),
+    )
+    remark: str | None = Field(
+        default=None,
+        alias="비고",
+        validation_alias=AliasChoices("비고", "remark"),
+    )
+    page_no: int | None = Field(
+        default=None,
+        alias="페이지번호",
+        validation_alias=AliasChoices("페이지번호", "page_no"),
+    )
+    source_line_no: int | None = Field(
+        default=None,
+        alias="원본행번호",
+        validation_alias=AliasChoices("원본행번호", "source_line_no", "line_no"),
+    )
+    final_category_code: str = Field(
+        alias="최종카테고리코드",
+        validation_alias=AliasChoices("최종카테고리코드", "final_category_code"),
+    )
+    decision_status: Literal["유지", "카테고리변경"] = Field(
+        alias="판정상태",
+        validation_alias=AliasChoices("판정상태", "decision_status"),
+    )
+    needs_human_review: bool = Field(
+        alias="검토필요여부",
+        validation_alias=AliasChoices("검토필요여부", "needs_human_review"),
+    )
+    reason: str = Field(
+        default="",
+        alias="사유",
+        validation_alias=AliasChoices("사유", "reason"),
+    )
 
 
 class UsageStatementItemsResponse(_KoreanAliasModel):
