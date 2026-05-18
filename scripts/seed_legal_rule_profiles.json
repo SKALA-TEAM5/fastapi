@@ -47,6 +47,61 @@
       "disallow_terms": []
     }
   },
-  "classifier_profiles": {},
+  "classifier_profiles": {
+    "CAT_01": {
+      "strong_terms": ["안전관리자", "보건관리자", "안전보건관리책임자", "관리감독자", "안전관리비", "안전담당자"],
+      "medium_terms": ["관리자", "감리", "안전비"],
+      "negative_terms": [],
+      "pair_terms": []
+    },
+    "CAT_02": {
+      "strong_terms": ["안전시설", "방호장치", "추락방지", "낙하방지", "안전망", "방호울타리", "안전발판", "안전펜스"],
+      "medium_terms": ["시설비", "설치비", "장치비"],
+      "negative_terms": [],
+      "pair_terms": []
+    },
+    "CAT_03": {
+      "strong_terms": ["안전화", "방진마스크", "방독마스크", "귀마개", "귀덮개", "안전모", "안전대", "보안경", "안전장갑", "방열복", "보호복", "보호구"],
+      "medium_terms": ["헬멧", "장갑", "고글"],
+      "negative_terms": [],
+      "pair_terms": []
+    },
+    "CAT_04": {
+      "strong_terms": ["측정기", "진단비", "검사비", "소음측정기", "분진측정기", "가스측정기", "안전진단", "보건진단", "정밀진단", "검사장비", "모니터링"],
+      "medium_terms": ["진단", "검사", "측정"],
+      "negative_terms": [],
+      "pair_terms": []
+    },
+    "CAT_05": {
+      "strong_terms": ["교육비", "교재비", "강사비", "안전교육", "보건교육", "강의료", "훈련비"],
+      "medium_terms": ["교육", "강의", "훈련"],
+      "negative_terms": [],
+      "pair_terms": []
+    },
+    "CAT_06": {
+      "strong_terms": ["건강검진", "보건관리", "방역", "질병예방", "근로자 건강", "건강장해", "냉난방", "냉난방기", "폭염", "한랭", "산소캔"],
+      "medium_terms": ["건강", "보건", "냉방", "난방"],
+      "negative_terms": [],
+      "pair_terms": []
+    },
+    "CAT_07": {
+      "strong_terms": ["기술지도", "재해예방기술지도", "기술지도비", "안전점검"],
+      "medium_terms": ["지도", "기술자문"],
+      "negative_terms": [],
+      "pair_terms": []
+    },
+    "CAT_08": {
+      "strong_terms": ["본사", "본사 안전", "안전전담", "전담부서"],
+      "medium_terms": ["본사 배치"],
+      "negative_terms": [],
+      "pair_terms": []
+    },
+    "CAT_09": {
+      "strong_terms": ["위험성평가", "노사협의체", "산업안전보건위원회", "유해위험요인"],
+      "medium_terms": [],
+      "negative_terms": [],
+      "pair_terms": []
+    }
+  },
   "generic_item_policies": {}
 }

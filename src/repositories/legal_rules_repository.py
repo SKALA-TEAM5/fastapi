@@ -100,7 +100,13 @@ class ValidatorRuleMatch:
     referenced_laws: list[str]
     limit_pct: float | None = None
     source_id: str = ""
-    match_source: str = "rdb"  # "rdb" | "corpus_fallback"
+    # [9] 책임 분리 — 판정 근거 출처를 명확하게 구분
+    # "law_rule"       : 법령 원문 기반 rule (allowed/disallowed/limit/category)
+    # "qa_rule"        : Q&A/해설서 기반 rule (qa_allowed/qa_disallowed/qa_limit)
+    # "corpus_fallback": heuristic/rule_like — 법령 코퍼스에서 추출한 보조 단서
+    # "profile_rule"   : seed_legal_rule_profiles.json에서 직접 조회한 규칙
+    # "llm_fallback"   : LLM이 법령 맥락을 읽고 판단한 결과
+    match_source: str = "law_rule"
 
 
 class LegalRulesRepository:
@@ -143,9 +149,18 @@ class LegalRulesRepository:
             metadata = dict(r.get("metadata") or {})
             r["metadata"] = metadata
             # V2 매핑 이전 원본 rule_type 복원 (스코어링 로직 유지)
+            # original_rule_type이 있으면 그것을 우선 사용
+            # 없으면 source_kind로 qa/heuristic 계열 추정
             original_rule_type = metadata.get("original_rule_type")
             if original_rule_type:
                 r["rule_type"] = original_rule_type
+            else:
+                source_kind = metadata.get("source_kind", "")
+                current_rt = r.get("rule_type", "")
+                if source_kind == "qa" and current_rt in {"allowed", "disallowed", "limit"}:
+                    r["rule_type"] = f"qa_{current_rt}"
+                elif source_kind == "heuristic" and current_rt in {"allowed", "disallowed", "limit"}:
+                    r["rule_type"] = f"rule_like_{current_rt}"
             if r.get("limit_pct") is not None:
                 r["limit_pct"] = float(r["limit_pct"])
             rules.append(r)
@@ -477,11 +492,52 @@ class LegalRulesRepository:
         item_text_norm = _normalize_text(item_text)
         query_tokens = _validator_tokens(item_text)
         context_tokens = _validator_tokens(retrieved_context)
-        matches: list[ValidatorRuleMatch] = []
+
+        # 1차(authoritative), 2차(secondary), 보조(fallback), 전역정책(global) 분리
+        primary_matches: list[ValidatorRuleMatch] = []
+        secondary_matches: list[ValidatorRuleMatch] = []
+        fallback_matches: list[ValidatorRuleMatch] = []
+        global_matches: list[ValidatorRuleMatch] = []
 
         for rule in self.rules:
+            rule_type = rule.get("rule_type", "")
+
+            # note_only 규칙(예: rule_text="-")은 판정에 사용하지 않음
+            if (rule.get("metadata") or {}).get("note_only"):
+                continue
+
+            # 전역 정책(category_code 없는 authoritative disallowed)은 카테고리 매칭 없이 별도 처리
+            if _is_global_policy(rule):
+                normalized_allowed = False
+                score = _score_validator_rule(
+                    rule=rule,
+                    category_code=None,
+                    item_tokens=query_tokens,
+                    context_tokens=context_tokens,
+                    item_text=item_text_norm,
+                    normalized_allowed=normalized_allowed,
+                )
+                if score > 0:
+                    # 전역 정책은 점수를 0.5배로 약하게 반영 (카테고리 판정보다 후순위)
+                    global_matches.append(
+                        ValidatorRuleMatch(
+                            category_code=category_code or "",
+                            category_name=category_name,
+                            rule_type=rule_type,
+                            allowed=normalized_allowed,
+                            score=score * 0.5,
+                            evidence=_clean_evidence(rule.get("rule_text") or rule.get("keyword") or ""),
+                            referenced_laws=_rule_laws(rule, category_code),
+                            limit_pct=rule.get("limit_pct"),
+                            source_id=rule.get("source_id", ""),
+                            match_source="law_rule",
+                        )
+                    )
+                continue
+
             if not _is_rule_in_category(rule, category_code=category_code, category_name=category_name):
                 continue
+
             normalized_allowed = _normalized_validator_allowed(
                 rule=rule,
                 item_text=item_text_norm,
@@ -497,36 +553,75 @@ class LegalRulesRepository:
             if score <= 0:
                 continue
 
-            matches.append(
-                ValidatorRuleMatch(
-                    category_code=category_code or rule.get("category_code") or "",
-                    category_name=category_name,
-                    rule_type=rule.get("rule_type", ""),
-                    allowed=normalized_allowed,
-                    score=score,
-                    evidence=_clean_evidence(rule.get("rule_text") or rule.get("keyword") or ""),
-                    referenced_laws=_rule_laws(rule, category_code),
-                    limit_pct=rule.get("limit_pct"),
-                    source_id=rule.get("source_id", ""),
-                )
+            # source_kind 메타데이터로 match_source 결정
+            metadata = rule.get("metadata") or {}
+            source_kind = metadata.get("source_kind", "")
+            if rule_type in _AUTHORITATIVE_RULE_TYPES:
+                match_src = "qa_rule" if source_kind == "qa" else "law_rule"
+            elif rule_type in _SECONDARY_RULE_TYPES:
+                match_src = "qa_rule"
+            else:
+                match_src = "corpus_fallback"
+
+            vmatch = ValidatorRuleMatch(
+                category_code=category_code or rule.get("category_code") or "",
+                category_name=category_name,
+                rule_type=rule_type,
+                allowed=normalized_allowed,
+                score=score,
+                evidence=_clean_evidence(rule.get("rule_text") or rule.get("keyword") or ""),
+                referenced_laws=_rule_laws(rule, category_code),
+                limit_pct=rule.get("limit_pct"),
+                source_id=rule.get("source_id", ""),
+                match_source=match_src,
             )
 
-        matches.sort(key=lambda item: item.score, reverse=True)
-        return matches[:limit]
+            tier = _rule_tier(rule_type)
+            if tier == 1:
+                primary_matches.append(vmatch)
+            elif tier == 2:
+                secondary_matches.append(vmatch)
+            else:
+                fallback_matches.append(vmatch)
+
+        # 계층별 정렬
+        primary_matches.sort(key=lambda m: m.score, reverse=True)
+        secondary_matches.sort(key=lambda m: m.score, reverse=True)
+        fallback_matches.sort(key=lambda m: m.score, reverse=True)
+        global_matches.sort(key=lambda m: m.score, reverse=True)
+
+        # 1차 결과가 충분하면 2차·보조는 제한, 부족하면 순차 보완
+        result: list[ValidatorRuleMatch] = []
+        result.extend(primary_matches[:limit])
+
+        # 1차 결과가 3개 미만이면 2차도 포함
+        if len(result) < 3:
+            remaining = limit - len(result)
+            result.extend(secondary_matches[:remaining])
+
+        # 아직 부족하고 1차가 0개면 fallback도 포함 (단 최대 2개)
+        if len(result) < 2 and not primary_matches:
+            result.extend(fallback_matches[:2])
+
+        # 전역 정책은 항목과 실제로 겹치는 경우에만 최대 2개 추가
+        result.extend(global_matches[:2])
+
+        result.sort(key=lambda m: m.score, reverse=True)
+        return result[:limit]
 
 
 _CLASSIFIER_RULE_TYPES = {"category", "allowed", "qa_allowed", "limit", "qa_limit"}
-_VALIDATOR_RULE_TYPES = {
-    "category",
-    "allowed",
-    "disallowed",
-    "qa_allowed",
-    "qa_disallowed",
-    "limit",
-    "qa_limit",
-    "rule_like_allowed",
-    "rule_like_disallowed",
-}
+
+# --------------------------------------------------------------------------
+# 판정 소스 계층 정의
+# 1차(authoritative): 법령 원문에서 직접 추출한 명확한 허용/금지/한도/카테고리 규칙
+# 2차(secondary): Q&A 기반 규칙 — 보조 증거로만 사용
+# 보조(fallback): 텍스트 유사도로 추출한 규칙 — 1·2차 증거가 부족할 때만 참조
+# --------------------------------------------------------------------------
+_AUTHORITATIVE_RULE_TYPES = {"allowed", "disallowed", "limit", "category"}
+_SECONDARY_RULE_TYPES = {"qa_allowed", "qa_disallowed", "qa_limit"}
+_FALLBACK_RULE_TYPES = {"rule_like_allowed", "rule_like_disallowed", "rule_like_limit"}
+_VALIDATOR_RULE_TYPES = _AUTHORITATIVE_RULE_TYPES | _SECONDARY_RULE_TYPES | _FALLBACK_RULE_TYPES
 _LIMIT_HINTS = ("초과", "%", "분의", "이내")
 _PRIMARY_LAW_BY_CATEGORY = {
     "CAT_01": "제7조제1항제1호",
@@ -599,6 +694,15 @@ def _score_profile(
 
     if category_code == "CAT_03" and "안전인증" in query_text and "스티커" not in query_text:
         score += 2.0
+    # 보호구 핵심 품목이 직접 언급되면 강하게 보강 (CAT_06 QA룰 토큰 충돌 방지)
+    _CAT03_EQUIPMENT = {
+        "안전화", "방진마스크", "방독마스크", "귀마개", "귀덮개",
+        "안전모", "안전대", "보안경", "안전장갑", "방열복", "보호복",
+    }
+    if category_code == "CAT_03" and (_CAT03_EQUIPMENT & query_tokens):
+        hit = sorted(_CAT03_EQUIPMENT & query_tokens)
+        score += 3.0
+        evidence.append(f"보호구 품목 직접 일치: {', '.join(hit)}")
     if category_code == "CAT_06" and "kf94" in query_text:
         score += 6.0
         evidence.append("질의에 'KF94'가 포함되어 건강장해예방비 신호가 강함")
@@ -675,33 +779,91 @@ def _profile_hits(item_text: str, terms: list[str]) -> set[str]:
 
 
 def _validator_rule_type_weight(rule_type: str) -> float:
+    # 1차(authoritative): 법령 원문 기반 — 최고 가중치
+    # 2차(secondary): Q&A 기반 — 중간 가중치
+    # 보조(fallback): 텍스트 유사 추출 — 낮은 가중치
     return {
+        # 1차
         "disallowed": 3.0,
-        "qa_disallowed": 2.8,
-        "allowed": 2.2,
+        "allowed": 2.5,
+        "limit": 2.0,
         "category": 2.0,
-        "qa_allowed": 1.9,
-        "limit": 1.6,
-        "qa_limit": 1.5,
-        "rule_like_allowed": 1.2,
-        "rule_like_disallowed": 1.2,
-    }.get(rule_type, 0.8)
+        # 2차
+        "qa_disallowed": 2.2,
+        "qa_allowed": 1.8,
+        "qa_limit": 1.6,
+        # 보조
+        "rule_like_disallowed": 0.9,
+        "rule_like_allowed": 0.8,
+        "rule_like_limit": 0.8,
+    }.get(rule_type, 0.5)
 
 
-def _is_rule_in_category(rule: dict, *, category_code: str | None, category_name: str) -> bool:
-    if rule.get("rule_type") not in _VALIDATOR_RULE_TYPES:
+def _rule_tier(rule_type: str) -> int:
+    """규칙의 판정 계층 반환 (1=authoritative, 2=secondary, 3=fallback, 0=unknown)."""
+    if rule_type in _AUTHORITATIVE_RULE_TYPES:
+        return 1
+    if rule_type in _SECONDARY_RULE_TYPES:
+        return 2
+    if rule_type in _FALLBACK_RULE_TYPES:
+        return 3
+    return 0
+
+
+def _is_global_policy(rule: dict) -> bool:
+    """category_code가 없는 법령 기반 disallowed 규칙 — 전역 정책으로 취급."""
+    return (
+        rule.get("rule_type") in {"disallowed", "qa_disallowed"}
+        and not rule.get("category_code")
+    )
+
+
+def _is_rule_in_category(
+    rule: dict,
+    *,
+    category_code: str | None,
+    category_name: str,
+) -> bool:
+    """
+    규칙이 주어진 카테고리에 속하는지 판단.
+
+    우선순위:
+    1. category_code 직접 매칭 (가장 신뢰도 높음)
+    2. category_name 완전 포함 (텍스트 매칭)
+    3. 토큰 교집합 — 단, fallback 타입(rule_like_*)은 category_code가 없으면 제외
+    """
+    rule_type = rule.get("rule_type", "")
+    if rule_type not in _VALIDATOR_RULE_TYPES:
         return False
-    if category_code and rule.get("category_code") == category_code:
+
+    rule_category_code = rule.get("category_code")
+
+    # ① category_code 직접 매칭 — 가장 신뢰도 높음
+    if category_code and rule_category_code == category_code:
         return True
+
+    # ② fallback 타입은 category_code가 없으면 텍스트 매칭도 하지 않음
+    #    (텍스트 겹침만으로 카테고리 귀속 금지)
+    if rule_type in _FALLBACK_RULE_TYPES and not rule_category_code:
+        return False
+
+    # ③ category_code가 있는데 다른 카테고리라면 제외 (다른 카테고리 규칙이 텍스트로 흘러들어오는 것 방지)
+    if rule_category_code and rule_category_code != category_code:
+        return False
+
+    # ④ category_code 없는 규칙에 대해서만 텍스트 매칭 허용 (2차 이하 타입만)
     text = " ".join(
         str(rule.get(key, "") or "")
         for key in ("category_name", "keyword", "item_pattern", "rule_text")
     )
     if category_name and category_name in text:
         return True
+
+    # ⑤ 토큰 교집합 — 2자 이상 의미 있는 토큰만 허용
     category_keywords = _validator_tokens(category_name)
     rule_tokens = _validator_tokens(text)
-    return bool(category_keywords & rule_tokens)
+    meaningful_overlap = {t for t in (category_keywords & rule_tokens) if len(t) >= 3}
+    return bool(meaningful_overlap)
 
 
 def _primary_laws(category_code: str | None) -> list[str]:
@@ -765,6 +927,14 @@ def _score_validator_rule(
         score += 0.5
     if "가능" in rule_text or "허용" in rule_text:
         score += 0.3
+
+    # coded rule 보너스 / uncoded rule 페널티
+    rule_category_code = rule.get("category_code")
+    if rule_category_code and rule_category_code == category_code:
+        score *= 1.2  # category_code 직접 매칭 +20%
+    elif not rule_category_code:
+        score *= 0.7  # category_code 없는 규칙 -30%
+
     return score
 
 
