@@ -7,6 +7,7 @@
 
 import os
 from pathlib import Path
+
 from dotenv import load_dotenv
 
 # 프로젝트 루트의 .env 로드
@@ -62,7 +63,7 @@ QDRANT_API_KEY: str = os.getenv("QDRANT_API_KEY", "")  # Cloud 사용 시에만 
 # AWS S3
 # ══════════════════════════════════════════════
 
-AWS_ACCESS_KEY_ID: str     = os.getenv("AWS_ACCESS_KEY_ID", "")
+AWS_ACCESS_KEY_ID: str = os.getenv("AWS_ACCESS_KEY_ID", "")
 AWS_SECRET_ACCESS_KEY: str = os.getenv("AWS_SECRET_ACCESS_KEY", "")
-AWS_REGION: str            = os.getenv("AWS_REGION", "ap-northeast-2")
-S3_BUCKET: str             = os.getenv("S3_BUCKET", "")          # 필수 — 버킷 이름 확정 후 .env에 설정
+AWS_REGION: str = os.getenv("AWS_REGION", "ap-northeast-2")
+S3_BUCKET: str = os.getenv("S3_BUCKET", "")  # 필수 — 버킷 이름 확정 후 .env에 설정
