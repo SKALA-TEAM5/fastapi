@@ -81,9 +81,10 @@ CATEGORY_COLUMNS = {
     },
     "CAT_03": {
         "date":        ["사용일", "사용일자"],
-        "description": ["구 분", "구분"],
+        "description": ["품 목", "품목"],
         "amount":      ["금액", "소요 비용", "소요비용"],
         "extra": {
+            "unit":       ["단위"],
             "unit_price": ["단가"],
             "qty":        ["수량"],
         }
@@ -139,10 +140,11 @@ CATEGORY_COLUMNS = {
     # CAT_09: 위험성평가 등에 따른 소요비용 (공식 서식 10페이지)
     "CAT_09": {
         "date":        ["사용일", "사용일자"],
-        "description": ["품목명"],
+        "description": ["사 용 내 역", "사용내역", "품목명"],
         "amount":      ["금액", "소요 비용", "소요비용"],
         "extra": {
             "decision_date": ["결정일"],
+            "unit":          ["단위"],
             "unit_price":    ["단가"],
             "qty":           ["수량"],
         }
@@ -247,6 +249,27 @@ def build_remark(extra_data: dict) -> str | None:
     return " | ".join(parts) if parts else None
 
 
+def recalc_total(unit_price: float | None, quantity: float | None, parsed_amount: int | None) -> int | None:
+    """
+    사용내역서 항목의 total_amount를 결정한다.
+
+    [우선순위]
+      ① parsed_amount (문서 기재 금액) — 부가세 포함 여부를 문서가 직접 기술한 경우
+      ② unit_price × quantity — parsed_amount가 없을 때만 계산값으로 보완
+
+    [변경 이력 v2]
+      구버전: 단가×수량을 항상 우선 → 부가세 포함 금액이 기재된 문서에서 세액을
+              무시하고 공급가액만 남는 문제 발생.
+      신버전: 문서 기재 금액(parsed_amount)을 신뢰. 단가×수량은 폴백으로만 사용.
+              (두 값이 크게 다르면 10% VAT 포함 금액일 가능성 높음)
+    """
+    if parsed_amount is not None:
+        return parsed_amount
+    if unit_price and quantity:
+        return round(unit_price * quantity)
+    return None
+
+
 # ══════════════════════════════════════════════════════════
 # 2. 서식 감지
 # ══════════════════════════════════════════════════════════
@@ -293,22 +316,42 @@ def parse_header_page(page) -> dict:
 
     summaries = []
     tables = page.extract_tables()
+
+    # 행 번호(1~9) → 카테고리 코드 직접 매핑
+    NUMBER_TO_CATEGORY = {str(i): f"CAT_0{i}" for i in range(1, 10)}
+
     for table in tables:
-        for row in table:
-            row_text = " ".join(clean(c) for c in row if c)
-            for code, name in CATEGORY_NAME_MAP.items():
-                short = name.split("·")[0].split(" ")[0].replace("등", "").strip()
-                if short in row_text:
-                    amounts = [parse_amount(c) for c in row if parse_amount(c)]
-                    if len(amounts) >= 2:
-                        summaries.append({
-                            "항목코드": code,
-                            "항목명": name,
-                            "전회금액": amounts[-3] if len(amounts) >= 3 else 0,
-                            "금회금액": amounts[-2],
-                            "누계금액": amounts[-1],
-                        })
-                    break
+        if not table or not table[0]:
+            continue
+
+        # "항 목" 헤더를 가진 카테고리 요약 테이블만 처리
+        header_text = "".join(clean(c) for c in table[0] if c).replace(" ", "")
+        if "항목" not in header_text:
+            continue
+
+        for row in table[1:]:
+            if not row or is_skip_row(row):
+                continue
+
+            # 첫 번째 셀의 번호(예: "1.", "2.") → 카테고리 코드
+            first_cell = clean(row[0]) if row[0] else ""
+            m = re.match(r"^(\d+)[.\s]", first_cell.strip())
+            if not m:
+                continue
+
+            cat_code = NUMBER_TO_CATEGORY.get(m.group(1))
+            if not cat_code:
+                continue
+
+            amounts = [parse_amount(c) for c in row if parse_amount(c)]
+            if len(amounts) >= 2:
+                summaries.append({
+                    "항목코드": cat_code,
+                    "항목명": CATEGORY_NAME_MAP.get(cat_code, ""),
+                    "전회금액": amounts[-3] if len(amounts) >= 3 else 0,
+                    "금회금액": amounts[-2],
+                    "누계금액": amounts[-1],
+                })
 
     header["category_summaries"] = summaries
     return header
@@ -373,18 +416,21 @@ def parse_category_page(page, category_code: str, page_no: int) -> list:
                 if col_idx is not None and col_idx < len(row_c) and row_c[col_idx]:
                     extra_data[field] = row_c[col_idx]
 
+            unit_price = parse_number(extra_data.get("unit_price"))
+            quantity   = parse_number(extra_data.get("qty"))
+
             item = {
-                "line_id":      str(uuid.uuid4()),
+                "line_id":       str(uuid.uuid4()),
                 "category_code": category_code,
-                "used_on":      parse_date(row_c[date_col]) if date_col is not None else None,
-                "item_name":    row_c[desc_col] if desc_col is not None and row_c[desc_col] else None,
-                "unit":         extra_data.get("unit"),
-                "quantity":     parse_number(extra_data.get("qty")),
-                "unit_price":   parse_number(extra_data.get("unit_price")),
-                "total_amount": amount,
-                "remark":       build_remark(extra_data),
-                "page_no":      page_no,
-                "line_no":      line_no,
+                "used_on":       parse_date(row_c[date_col]) if date_col is not None else None,
+                "item_name":     row_c[desc_col] if desc_col is not None and row_c[desc_col] else None,
+                "unit":          extra_data.get("unit"),
+                "quantity":      quantity,
+                "unit_price":    unit_price,
+                "total_amount":  recalc_total(unit_price, quantity, amount),
+                "remark":        build_remark(extra_data),
+                "page_no":       page_no,
+                "line_no":       line_no,
             }
 
             items.append(item)
@@ -449,7 +495,9 @@ def parse_simple_format(pdf) -> tuple[dict, list]:
                     if col_map.get("category") is not None
                     else None
                 )
-                cat_code = _infer_category_code(category_raw or "")
+                cat_code   = _infer_category_code(category_raw or "")
+                unit_price = parse_number(row_c[col_map["unit_price"]]) if col_map.get("unit_price") is not None else None
+                quantity   = parse_number(row_c[col_map["qty"]]) if col_map.get("qty") is not None else None
 
                 items.append({
                     "line_id":       str(uuid.uuid4()),
@@ -457,9 +505,9 @@ def parse_simple_format(pdf) -> tuple[dict, list]:
                     "used_on":       parse_date(row_c[col_map["date"]]) if col_map.get("date") is not None else None,
                     "item_name":     row_c[col_map["description"]] if col_map.get("description") is not None else None,
                     "unit":          row_c[col_map["unit"]] if col_map.get("unit") is not None else None,
-                    "quantity":      parse_number(row_c[col_map["qty"]]) if col_map.get("qty") is not None else None,
-                    "unit_price":    parse_number(row_c[col_map["unit_price"]]) if col_map.get("unit_price") is not None else None,
-                    "total_amount":  amount,
+                    "quantity":      quantity,
+                    "unit_price":    unit_price,
+                    "total_amount":  recalc_total(unit_price, quantity, amount),
                     "remark":        row_c[col_map["note"]] if col_map.get("note") is not None else None,
                     "page_no":       page_num,
                     "line_no":       line_no,

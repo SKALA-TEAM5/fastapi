@@ -31,10 +31,8 @@ import re
 import logging
 from typing import Optional
 
-from services.matching_service_monthly import (
-    _date_gate_cycle,
-    _get_settlement_cycle,
-    _which_cycle,
+from src.services.matching_service_monthly import (
+    _date_gate_monthly,
     _extract_receipt_date,
     _extract_receipt_vendor,
     _normalize_vendor,
@@ -114,23 +112,12 @@ def verify_one_receipt(
 
         failed: list[str] = []
 
-        # ── Gate 1: 날짜 (정산 사이클 기반) ─────────────────────
-        # 세금계산서 검증에서는 영수증 날짜를 기준 사이클 ref_date로 사용.
-        # 세금계산서 발행일(목요일)은 결제일(수요일) 다음날이므로
-        # 같은 사이클 내에 포함되어 자연스럽게 통과.
+        # ── Gate 1: 날짜 (연월 및 월 경계 기준) ──────────────────
         if receipt_date and ti_date:
-            if not _date_gate_cycle(receipt_date, ti_date):
-                from services.matching_service_monthly import _parse_date_safe
-                d_receipt = _parse_date_safe(receipt_date)
-                if d_receipt:
-                    cs, ce = _which_cycle(d_receipt)   # _get_settlement_cycle → _which_cycle
-                    cycle_str = f"{cs.strftime('%Y-%m-%d')} ~ {ce.strftime('%Y-%m-%d')}"
-                else:
-                    cycle_str = "계산 불가"
+            if not _date_gate_monthly(receipt_date, ti_date):
                 failed.append(
-                    f"날짜 정산 사이클 불일치 "
-                    f"(영수증: {receipt_date} / 세금계산서: {ti_date}, "
-                    f"허용 사이클: {cycle_str})"
+                    f"날짜 불일치 (같은 연월 또는 월 경계 ±2일 이내 아님) "
+                    f"(영수증: {receipt_date} / 세금계산서: {ti_date})"
                 )
 
         # ── Gate 2: 금액 ────────────────────────────────────────

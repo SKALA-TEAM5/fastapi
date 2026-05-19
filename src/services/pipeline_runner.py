@@ -39,6 +39,7 @@ from src.repositories.db import get_connection
 from src.repositories.ocr_pipeline_repository import (
     get_file_by_id,
     get_files_by_ids,
+    get_already_linked_file_ids,
     insert_evidence_file_link,
     insert_usage_statement,
     insert_usage_statement_items,
@@ -46,7 +47,6 @@ from src.repositories.ocr_pipeline_repository import (
     insert_agent_log,
     update_agent_log_status,
     update_file_status,
-    _to_category_code,
     _from_category_code,
 )
 from src.services.matching_service_monthly import (
@@ -245,6 +245,19 @@ def run_link_pipeline(
             all_ids = receipt_file_ids + tax_invoice_file_ids
             file_map = get_files_by_ids(conn, all_ids)
 
+            # ── 중복 방지: 이미 linked된 영수증 파일 제외 ────────────────
+            # 상시 업로드 환경에서 동일 영수증이 다른 usage_statement 항목에
+            # 중복 연결되는 것을 방지한다.
+            already_linked = get_already_linked_file_ids(conn, receipt_file_ids)
+            if already_linked:
+                import logging as _logging
+                _logging.getLogger(__name__).warning(
+                    "중복 연결 의심 파일 %d건 제외: %s",
+                    len(already_linked),
+                    sorted(already_linked),
+                )
+            receipt_file_ids = [fid for fid in receipt_file_ids if fid not in already_linked]
+
             # ── usage_statement items 조회 (매칭용) ───────────────────────
             # v_usage_statement_context 뷰 사용 (직접 테이블 조회 대신)
             with conn.cursor() as _cur:
@@ -329,10 +342,9 @@ def run_link_pipeline(
                 if status == "matched" and receipt_id and receipt_id in receipt_file_id_map:
                     file_id_for_receipt = receipt_file_id_map[receipt_id]
                     # line_id는 이미 DB id(str)
-                    item_db_id    = int(line_id) if line_id and str(line_id).isdigit() else None
-                    item_category = _to_category_code(match_result.get("항목코드"))
+                    item_db_id = int(line_id) if line_id and str(line_id).isdigit() else None
 
-                    if item_db_id and item_category:
+                    if item_db_id:
                         receipt_file_info = file_map.get(file_id_for_receipt, {})
                         evidence_type = receipt_file_info.get("uploaded_evidence_type_code", "receipt")
 
@@ -340,7 +352,6 @@ def run_link_pipeline(
                             conn,
                             usage_statement_item_id=item_db_id,
                             file_id=file_id_for_receipt,
-                            category_code=item_category,
                             evidence_type_code=evidence_type,
                         )
 

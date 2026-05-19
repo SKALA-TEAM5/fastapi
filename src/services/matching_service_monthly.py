@@ -1,20 +1,20 @@
 """
 2-way 매칭 엔진 — 월 단위 날짜 비교 버전
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-산업안전관리비 AI 검증 시스템  —  matching_service_monthly.py  v1
+산업안전관리비 AI 검증 시스템  —  matching_service_monthly.py  v2
 
 [기존 matching_service.py 와의 차이점]
   ① 날짜 Gate 로직 교체
     · 구버전: |사용일자 − 영수증일자| ≤ 1일 (엄격한 일 단위 비교)
-    · 이 버전: 사용내역서가 월별 문서이므로 '같은 연월'이면 통과
-              월 경계(±2일) 도 허용 (예: 12/31 ↔ 01/01)
+    · 이 버전: 사용내역서가 상시 업로드 가능하므로 used_on 기준 '같은 연월'이면 통과
+              월 경계(±GATE_DATE_BOUNDARY_DAYS일) 도 허용 (예: 12/31 ↔ 01/01)
 
   ② 영수증 날짜 필드 이중 지원
     · 구버전 CLOVA 포맷 : receipt["payment"]["date"]
     · 신버전 통합 포맷   : receipt["date"]  (ReceiptOCRResponse)
     두 포맷 모두 자동 인식
 
-  ③ date_score 재조정
+  ③ date_score 기준
     · 같은 연월          → 1.0  (월 단위 완전 일치)
     · 월 경계 ±2일 이내  → 0.85 (인접 월, 경계 허용)
     · 그 외              → 0.0  (다른 월)
@@ -24,7 +24,7 @@
 
 [매칭 전략 — Hard Gate + 점수 보조]
   1단계 Hard Gate (3가지 조건, 모두 통과해야 후보 인정)
-    · 날짜 Gate  : 같은 연월 (또는 월 경계 ±2일)
+    · 날짜 Gate  : used_on 기준 같은 연월 (또는 월 경계 ±GATE_DATE_BOUNDARY_DAYS일)
     · 금액 Gate  : |사용금액 − 영수증금액| / max ≤ 1%
     · 업체명 Gate: 정규화 후 완전일치 (미기재 시 면제)
 
@@ -40,7 +40,6 @@ import uuid
 import logging
 import argparse
 from pathlib import Path
-import calendar
 from datetime import datetime, timedelta
 from difflib import SequenceMatcher
 from typing import Optional
@@ -58,18 +57,11 @@ THRESHOLD_REVIEW:  float = 0.75
 MATCH_THRESHOLD:   float = THRESHOLD_REVIEW
 
 # ── Hard Gate 허용 오차 ─────────────────────────────────────────────
-# 날짜: 정산 사이클 범위 내 (전달 마지막 목요일 다음날 ~ 이번달 마지막 수요일)
+# 날짜: used_on 기준 같은 연월, 또는 월 경계 ±GATE_DATE_BOUNDARY_DAYS일 이내
 # 금액: ±1%
 # 업체명: 정규화 후 완전일치
-#
-# [정산 사이클 시나리오]
-#   납품 후에만 거래명세표·세금계산서 발행 (전제)
-#   마지막 주 수요일: 결제 (영수증/거래명세표 날짜 기준)
-#   마지막 주 목요일: 세금계산서 발행
-#   마지막 주 금요일: 사용내역서 작성·업로드
-#   해당 주에 수·목·금이 없으면 전주에 실행
-#   → 한 달 정산 범위: 전달 마지막 목요일 다음날 ~ 이번달 마지막 수요일
-GATE_AMOUNT_PCT: float = 0.01  # 금액 허용 오차 (1%)
+GATE_DATE_BOUNDARY_DAYS: int   = 2     # 월 경계 허용 일수 (12/31 ↔ 01/01 등)
+GATE_AMOUNT_PCT:         float = 0.01  # 금액 허용 오차 (1%)
 
 # ── 품목명 합산 플래그 ───────────────────────────────────────────────
 # MVP: 영수증·거래명세표 구분 없이 동일 적용 (True)
@@ -184,7 +176,7 @@ def text_similarity(a: str, b: str) -> float:
 
 
 # ══════════════════════════════════════════════════════════════
-# 2. 날짜 유틸리티 — 월 단위 비교 (핵심 변경점)
+# 2. 날짜 유틸리티 — 월 단위 비교
 # ══════════════════════════════════════════════════════════════
 
 def _parse_date_safe(date_str: Optional[str]) -> Optional[datetime]:
@@ -202,96 +194,34 @@ def _same_year_month(d1: datetime, d2: datetime) -> bool:
     return d1.year == d2.year and d1.month == d2.month
 
 
-# ── 정산 사이클 계산 ─────────────────────────────────────────────────
-
-def _last_weekday_of_month(year: int, month: int, weekday: int) -> datetime:
+def _near_month_boundary(
+    d1: datetime,
+    d2: datetime,
+    boundary_days: int = GATE_DATE_BOUNDARY_DAYS,
+) -> bool:
     """
-    해당 연월의 마지막 특정 요일 반환.
+    두 날짜가 서로 다른 월이지만 월 경계 ±boundary_days일 이내인지 확인.
 
-    Args:
-        weekday: 0=월, 1=화, 2=수, 3=목, 4=금, 5=토, 6=일
-
-    '마지막 주에 해당 요일이 없으면 전주에 실행' 조건은
-    달의 마지막 날부터 역방향으로 탐색하므로 자동 충족.
+    예) d1=12-31, d2=01-01 → 다른 월, 1일 차이 → True
+        d1=01-15, d2=02-15 → 다른 월, 31일 차이 → False
     """
-    last_day = calendar.monthrange(year, month)[1]
-    last_date = datetime(year, month, last_day)
-    days_back = (last_date.weekday() - weekday) % 7
-    return last_date - timedelta(days=days_back)
+    if _same_year_month(d1, d2):
+        return False
+    return abs((d1 - d2).days) <= boundary_days
 
 
-def _get_settlement_cycle(ref_date: datetime) -> tuple[datetime, datetime]:
+def _date_gate_monthly(usage_date: Optional[str], doc_date: Optional[str]) -> bool:
     """
-    ref_date 달 기준 정산 사이클의 시작·종료일 반환.
+    월 단위 날짜 Gate.
 
-    정산 사이클 정의:
-      cycle_end   = ref_date 달의 마지막 수요일 (결제일)
-      cycle_start = 전달 마지막 목요일 + 1일
-
-    예) ref_date = 2026-04-15
-      4월 마지막 수요일 → 4/29  (cycle_end)
-      3월 마지막 목요일 → 3/26
-      cycle_start       → 3/27
-
-    Returns:
-        (cycle_start, cycle_end) — 양 끝 포함 구간
-    """
-    last_wed = _last_weekday_of_month(ref_date.year, ref_date.month, weekday=2)
-
-    first_of_month  = ref_date.replace(day=1)
-    prev_month_last = first_of_month - timedelta(days=1)
-    last_thu_prev   = _last_weekday_of_month(
-        prev_month_last.year, prev_month_last.month, weekday=3
-    )
-
-    cycle_start = last_thu_prev + timedelta(days=1)
-    cycle_end   = last_wed
-    return cycle_start, cycle_end
-
-
-def _which_cycle(date: datetime) -> tuple[datetime, datetime]:
-    """
-    특정 날짜가 실제로 귀속되는 정산 사이클 반환.
-
-    _get_settlement_cycle(ref_date)는 ref_date의 달(月) 기준 사이클을 반환하는데,
-    정산 사이클 시작일은 전달 마지막 목요일+1이므로 달의 첫날부터 그 날짜 사이에 있는
-    날짜들은 해당 달 사이클이 아니라 다음달 사이클에 속한다.
-
-    예) 2026-03-27
-      · 3월 사이클: 2026-02-27 ~ 2026-03-25  → 03-27 범위 밖
-      · 4월 사이클: 2026-03-27 ~ 2026-04-29  → 03-27 범위 안 ✅
-
-    탐색 순서: 현재달 사이클 → 다음달 사이클 (최대 2단계)
-    """
-    cs, ce = _get_settlement_cycle(date)
-    if cs <= date <= ce:
-        return cs, ce
-    # 현재달 사이클 밖 → 다음달 사이클에 귀속
-    next_month_first = (date.replace(day=1) + timedelta(days=32)).replace(day=1)
-    return _get_settlement_cycle(next_month_first)
-
-
-def _date_gate_cycle(usage_date: Optional[str], doc_date: Optional[str]) -> bool:
-    """
-    정산 사이클 기반 날짜 Gate (구 _date_gate_monthly 대체).
+    사용내역서는 상시 업로드 가능하므로 고정 정산 사이클 대신
+    used_on 기준 '같은 연월' 비교를 사용한다.
 
     통과 조건:
       ① 날짜 중 하나라도 없거나 파싱 실패 → 통과 (면제)
-      ② usage_date가 속한 정산 사이클 내에 doc_date가 포함 → 통과
-      ③ 그 외                                                → 실패
-
-    [설계 변경 이력]
-      구버전: _get_settlement_cycle(usage_date) 달 기준 사이클 계산
-        → 문제: used_on=2026-03-27은 4월 사이클(03-27~04-29) 시작점인데
-               3월 달 기준으로 계산하면 3월 사이클(02-27~03-25)이 나와 Gate 실패
-
-      현버전: _which_cycle(usage_date) 로 날짜가 실제 귀속되는 사이클을 먼저 확인
-        → 03-27 → 3월 사이클 밖 → 4월 사이클(03-27~04-29) 귀속 → 정상 통과
-
-    [전제]
-      - 납품 후에만 거래명세표·세금계산서 발행
-      - 결제: 마지막 수요일 / 세금계산서: 목요일 / 사용내역서: 금요일
-      - 해당 주에 수·목·금 없으면 전주 실행
+      ② 같은 연월                         → 통과
+      ③ 월 경계 ±GATE_DATE_BOUNDARY_DAYS일 이내 → 통과 (예: 12/31 ↔ 01/01)
+      ④ 그 외                             → 실패
 
     Returns:
         True  — Gate 통과
@@ -306,8 +236,10 @@ def _date_gate_cycle(usage_date: Optional[str], doc_date: Optional[str]) -> bool
     if d_usage is None or d_doc is None:
         return True
 
-    cycle_start, cycle_end = _which_cycle(d_usage)
-    return cycle_start <= d_doc <= cycle_end
+    if _same_year_month(d_usage, d_doc):
+        return True
+
+    return _near_month_boundary(d_usage, d_doc)
 
 
 def date_score(date1: Optional[str], date2: Optional[str]) -> Optional[float]:
@@ -609,22 +541,16 @@ def _check_hard_gates(
     """
     failed: list[str] = []
 
-    # ── Gate 1: 날짜 (정산 사이클 기반) ─────────────────────────
+    # ── Gate 1: 날짜 (월 단위, used_on 기준) ────────────────────
     usage_date   = usage_item.get("date")
     receipt_date = _extract_receipt_date(receipt)
 
     if usage_date and receipt_date:
-        if not _date_gate_cycle(usage_date, receipt_date):
-            d_usage = _parse_date_safe(usage_date)
-            if d_usage:
-                cs, ce = _which_cycle(d_usage)   # _get_settlement_cycle → _which_cycle
-                cycle_str = f"{cs.strftime('%Y-%m-%d')} ~ {ce.strftime('%Y-%m-%d')}"
-            else:
-                cycle_str = "계산 불가"
+        if not _date_gate_monthly(usage_date, receipt_date):
             failed.append(
-                f"날짜 정산 사이클 불일치 "
+                f"날짜 월 불일치 "
                 f"(내역서: {usage_date} / 영수증: {receipt_date}, "
-                f"허용 사이클: {cycle_str})"
+                f"허용: 같은 연월 또는 ±{GATE_DATE_BOUNDARY_DAYS}일)"
             )
 
     # ── Gate 2: 금액 ─────────────────────────────────────────
@@ -676,18 +602,150 @@ def _check_hard_gates(
 # 3-c. 영수증 품목 수준 금액 매칭 헬퍼
 # ══════════════════════════════════════════════════════════════
 
+VAT_RATE: float = 0.10  # 부가가치세율 10%
+
 def _get_item_name(item: dict) -> str:
     """영수증 품목명 추출 — 신·구 포맷 공통 ('name' 또는 'item_name')"""
     return (item.get("name") or item.get("item_name") or "").strip()
 
 
+def _get_item_vat_total(item: dict, doc_type: Optional[str] = None) -> Optional[int]:
+    """
+    영수증 품목 1건의 부가세 포함 실지출금액을 반환한다.
+
+    [우선순위]
+      ① 세금계산서(tax_invoice) : supply_amount + tax_amount (명시된 세액 사용)
+      ② 거래명세서(delivery_statement): amount + tax_amount (있으면 사용, 없으면 × 1.1)
+      ③ 일반 영수증: amount (이미 부가세 포함 금액으로 간주)
+
+    [배경]
+      거래명세서 items.amount = 공급가액(부가세 미포함).
+      사용내역서 total_amount = 부가세 포함 실지출금액.
+      두 금액이 일치하려면 영수증 품목 금액에 부가세를 더해야 한다.
+    """
+    supply = (
+        item.get("supply_amount")   # 세금계산서 포맷
+        or item.get("amount")       # 거래명세서 포맷
+    )
+    if supply is None:
+        return None
+
+    supply = int(supply)
+
+    # 명시된 세액 우선 사용
+    tax = item.get("tax_amount")
+    if tax is not None:
+        return supply + int(tax)
+
+    # 세금계산서 / 거래명세서 → VAT_RATE 적용
+    if doc_type in ("tax_invoice", "delivery_statement"):
+        return round(supply * (1 + VAT_RATE))
+
+    # 일반 영수증: amount 자체가 부가세 포함
+    return supply
+
+
+def _verify_item_integrity(item: dict, doc_type: Optional[str] = None) -> Optional[str]:
+    """
+    품목별 단가 × 수량 = 공급가액 정합성을 검증한다.
+    불일치 시 경고 문자열 반환, 정상이면 None.
+
+    [검증 대상]
+      거래명세서: unit_price × count ≈ amount (공급가액)
+      세금계산서: unit_price × quantity ≈ supply_amount
+    """
+    if doc_type == "delivery_statement":
+        up  = item.get("unit_price")
+        cnt = item.get("count")
+        amt = item.get("amount")
+    elif doc_type == "tax_invoice":
+        up  = item.get("unit_price")
+        cnt = item.get("quantity")
+        amt = item.get("supply_amount")
+    else:
+        return None
+
+    if up is None or cnt is None or amt is None:
+        return None
+
+    calc = round(float(up) * float(cnt))
+    diff = abs(calc - int(amt))
+    if diff > max(1, int(amt) * 0.01):   # 1원 또는 1% 이내면 허용
+        return (
+            f"단가×수량 불일치: {up:,}×{cnt}={calc:,} ≠ 공급가액 {int(amt):,} "
+            f"(차이 {diff:,})"
+        )
+    return None
+
+
+def _expand_to_item_receipts(receipt: dict) -> list[dict]:
+    """
+    다품목 영수증(거래명세서·세금계산서)을 품목별 가상 영수증으로 분리한다.
+
+    [적용 조건]
+      doc_type이 delivery_statement 또는 tax_invoice이고
+      items 배열에 2개 이상 품목이 있을 때만 분리.
+
+    [가상 영수증 구조]
+      - 날짜·업체명 등 헤더 필드는 부모 영수증 그대로 상속
+      - total_amount = 품목별 부가세 포함 금액 (_get_item_vat_total)
+      - items = [해당 품목만]
+      - _expanded: True (감사 추적용)
+      - _parent_source: 원본 source_file
+      - _integrity_warning: 단가×수량 불일치 시 경고 문자열
+
+    [단품 영수증 또는 미지원 doc_type]
+      단일 원소 리스트로 반환 (그대로 사용).
+    """
+    doc_type = receipt.get("doc_type")
+    items    = receipt.get("items", [])
+
+    # 단품이거나 미지원 유형이면 확장 안 함
+    if doc_type not in ("delivery_statement", "tax_invoice") or len(items) <= 1:
+        return [receipt]
+
+    expanded: list[dict] = []
+    for item in items:
+        # 품목별 실지출금액 계산
+        vat_total = _get_item_vat_total(item, doc_type)
+        if vat_total is None:
+            continue
+
+        # 정합성 검증
+        integrity_warn = _verify_item_integrity(item, doc_type)
+
+        # 부모 영수증 복사 후 품목·금액 교체
+        sub = {k: v for k, v in receipt.items() if k != "items"}
+        sub.update({
+            "items":                [item],
+            "total_amount":         vat_total,
+            "_expanded":            True,
+            "_parent_source":       receipt.get("source_file", ""),
+            "_item_name":           _get_item_name(item),
+            "_item_supply_amount":  item.get("supply_amount") or item.get("amount"),
+            "_item_tax_amount":     item.get("tax_amount"),
+            "_integrity_warning":   integrity_warn,
+        })
+        if integrity_warn:
+            logger.warning("품목 정합성 경고 [%s / %s]: %s",
+                           receipt.get("source_file"), _get_item_name(item), integrity_warn)
+        expanded.append(sub)
+
+    return expanded if expanded else [receipt]
+
+
 def _find_best_receipt_item_amount(
     usage_desc: str,
     receipt_items: list,
+    doc_type: Optional[str] = None,
     sim_threshold: float = 0.25,
 ) -> tuple[float, Optional[int]]:
     """
-    사용내역 설명과 가장 유사한 영수증 품목을 찾아 그 금액을 반환.
+    사용내역 설명과 가장 유사한 영수증 품목을 찾아 부가세 포함 금액을 반환.
+
+    [변경 이력]
+      v2: item.amount 대신 _get_item_vat_total(item, doc_type) 사용
+          → 공급가액만 있는 거래명세서 품목에 VAT 자동 추가
     """
     if not usage_desc or not receipt_items:
         return 0.0, None
@@ -702,7 +760,7 @@ def _find_best_receipt_item_amount(
         sim = text_similarity(usage_desc, name)
         if sim > best_sim:
             best_sim    = sim
-            best_amount = item.get("amount")
+            best_amount = _get_item_vat_total(item, doc_type)
 
     if best_sim >= sim_threshold and best_amount is not None:
         return best_sim, best_amount
@@ -733,7 +791,9 @@ def compute_component_scores(
     receipt_items = receipt.get("items", [])
 
     best_item_sim, best_item_amount = _find_best_receipt_item_amount(
-        usage_item.get("name") or usage_item.get("description", ""), receipt_items
+        usage_item.get("name") or usage_item.get("description", ""),
+        receipt_items,
+        doc_type=receipt.get("doc_type"),
     )
 
     score_vs_item  = amount_score(usage_amount, best_item_amount) if best_item_amount is not None else None
@@ -1031,7 +1091,7 @@ def match_all_usage_to_receipts(
           "generated_at":   str
         }
     """
-    from services.tax_invoice_verifier import verify_receipts_against_tax_invoices
+    from src.services.tax_invoice_verifier import verify_receipts_against_tax_invoices
 
     batch_id = str(uuid.uuid4())[:8]
 
@@ -1042,6 +1102,21 @@ def match_all_usage_to_receipts(
         r for r in receipts
         if r.get("doc_type") not in ("tax_invoice", "wage_statement")
     ]
+
+    # ── Step 1-B: 다품목 영수증 → 품목별 가상 영수증으로 분리 ──────
+    # 거래명세서·세금계산서에 2개 이상 품목이 있으면 품목별로 분리한다.
+    # 각 가상 영수증의 total_amount = 해당 품목 공급가액 + 세액 (부가세 포함 실지출).
+    # 사용내역서는 부가세 포함 금액으로 기재되므로 비교 기준을 일치시키기 위함.
+    expanded_evidence: list[dict] = []
+    for doc in evidence_docs:
+        sub_receipts = _expand_to_item_receipts(doc)
+        if len(sub_receipts) > 1:
+            logger.info(
+                "다품목 영수증 분리 [%s]: %d품목 → %d건",
+                doc.get("source_file"), len(doc.get("items", [])), len(sub_receipts),
+            )
+        expanded_evidence.extend(sub_receipts)
+    evidence_docs = expanded_evidence
 
     # ── Step 1-A: 세금계산서 사전 검증 (영수증·거래명세표만) ──
     verified_docs = verify_receipts_against_tax_invoices(evidence_docs, tax_invoices)
@@ -1131,7 +1206,7 @@ def match_all_usage_to_receipts(
             "match_rate_pct":  round(matched / total * 100, 1) if total else 0.0,
             "review_rate_pct": round(review  / total * 100, 1) if total else 0.0,
         },
-        "generated_at": datetime.now().isoformat(timespec="seconds"),
+        "created_at": datetime.now().isoformat(timespec="seconds"),
     }
 
 
@@ -1166,8 +1241,9 @@ def print_match_result(result: dict):
     rcpt  = result.get("receipt", {})
     rcpt_date   = _extract_receipt_date(rcpt) or "-"
     rcpt_vendor = _extract_receipt_vendor(rcpt) or "-"
+    usage_desc = usage.get('description') or '-'
     print(f"  [사용내역서]  {usage.get('date', '-')}  "
-          f"{usage.get('description', '-')[:25]}  "
+          f"{usage_desc[:25]}  "
           f"{(usage.get('amount') or 0):,}원")
     print(f"  [영수증]      {rcpt_date}  {rcpt_vendor[:20]}  "
           f"{(rcpt.get('total_amount') or 0):,}원  "
@@ -1193,7 +1269,7 @@ def print_batch_summary(batch_result: dict):
     print(f"\n{sep}")
     print(f"  배치 매칭 완료  (batch_id: {batch_result.get('batch_id')})")
     print(f"  사용내역서:    {batch_result.get('source_usage')}")
-    print(f"  날짜 전략:     정산 사이클 기반 (전달 마지막 목요일+1 ~ 이번달 마지막 수요일)")
+    print(f"  날짜 전략:     월 단위 기준 (같은 연월 + 경계 ±{GATE_DATE_BOUNDARY_DAYS}일)")
     print(f"  임계값:        matched≥{th.get('matched', THRESHOLD_MATCHED)}"
           f"  /  review≥{th.get('review', THRESHOLD_REVIEW)}")
     print(f"{sep}")
