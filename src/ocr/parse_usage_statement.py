@@ -81,9 +81,10 @@ CATEGORY_COLUMNS = {
     },
     "CAT_03": {
         "date":        ["사용일", "사용일자"],
-        "description": ["구 분", "구분"],
+        "description": ["품 목", "품목"],
         "amount":      ["금액", "소요 비용", "소요비용"],
         "extra": {
+            "unit":       ["단위"],
             "unit_price": ["단가"],
             "qty":        ["수량"],
         }
@@ -139,10 +140,11 @@ CATEGORY_COLUMNS = {
     # CAT_09: 위험성평가 등에 따른 소요비용 (공식 서식 10페이지)
     "CAT_09": {
         "date":        ["사용일", "사용일자"],
-        "description": ["품목명"],
+        "description": ["사 용 내 역", "사용내역", "품목명"],
         "amount":      ["금액", "소요 비용", "소요비용"],
         "extra": {
             "decision_date": ["결정일"],
+            "unit":          ["단위"],
             "unit_price":    ["단가"],
             "qty":           ["수량"],
         }
@@ -249,15 +251,23 @@ def build_remark(extra_data: dict) -> str | None:
 
 def recalc_total(unit_price: float | None, quantity: float | None, parsed_amount: int | None) -> int | None:
     """
-    단가 × 수량으로 계(total_amount)를 재계산한다.
+    사용내역서 항목의 total_amount를 결정한다.
 
-    문서에 기재된 계(합계)가 잘못 작성된 경우를 대비해,
-    단가와 수량이 모두 존재하면 계산값을 우선 사용한다.
-    둘 중 하나라도 없으면 파싱된 원본 금액을 그대로 반환한다.
+    [우선순위]
+      ① parsed_amount (문서 기재 금액) — 부가세 포함 여부를 문서가 직접 기술한 경우
+      ② unit_price × quantity — parsed_amount가 없을 때만 계산값으로 보완
+
+    [변경 이력 v2]
+      구버전: 단가×수량을 항상 우선 → 부가세 포함 금액이 기재된 문서에서 세액을
+              무시하고 공급가액만 남는 문제 발생.
+      신버전: 문서 기재 금액(parsed_amount)을 신뢰. 단가×수량은 폴백으로만 사용.
+              (두 값이 크게 다르면 10% VAT 포함 금액일 가능성 높음)
     """
+    if parsed_amount is not None:
+        return parsed_amount
     if unit_price and quantity:
         return round(unit_price * quantity)
-    return parsed_amount
+    return None
 
 
 # ══════════════════════════════════════════════════════════
@@ -306,22 +316,42 @@ def parse_header_page(page) -> dict:
 
     summaries = []
     tables = page.extract_tables()
+
+    # 행 번호(1~9) → 카테고리 코드 직접 매핑
+    NUMBER_TO_CATEGORY = {str(i): f"CAT_0{i}" for i in range(1, 10)}
+
     for table in tables:
-        for row in table:
-            row_text = " ".join(clean(c) for c in row if c)
-            for code, name in CATEGORY_NAME_MAP.items():
-                short = name.split("·")[0].split(" ")[0].replace("등", "").strip()
-                if short in row_text:
-                    amounts = [parse_amount(c) for c in row if parse_amount(c)]
-                    if len(amounts) >= 2:
-                        summaries.append({
-                            "항목코드": code,
-                            "항목명": name,
-                            "전회금액": amounts[-3] if len(amounts) >= 3 else 0,
-                            "금회금액": amounts[-2],
-                            "누계금액": amounts[-1],
-                        })
-                    break
+        if not table or not table[0]:
+            continue
+
+        # "항 목" 헤더를 가진 카테고리 요약 테이블만 처리
+        header_text = "".join(clean(c) for c in table[0] if c).replace(" ", "")
+        if "항목" not in header_text:
+            continue
+
+        for row in table[1:]:
+            if not row or is_skip_row(row):
+                continue
+
+            # 첫 번째 셀의 번호(예: "1.", "2.") → 카테고리 코드
+            first_cell = clean(row[0]) if row[0] else ""
+            m = re.match(r"^(\d+)[.\s]", first_cell.strip())
+            if not m:
+                continue
+
+            cat_code = NUMBER_TO_CATEGORY.get(m.group(1))
+            if not cat_code:
+                continue
+
+            amounts = [parse_amount(c) for c in row if parse_amount(c)]
+            if len(amounts) >= 2:
+                summaries.append({
+                    "항목코드": cat_code,
+                    "항목명": CATEGORY_NAME_MAP.get(cat_code, ""),
+                    "전회금액": amounts[-3] if len(amounts) >= 3 else 0,
+                    "금회금액": amounts[-2],
+                    "누계금액": amounts[-1],
+                })
 
     header["category_summaries"] = summaries
     return header

@@ -106,6 +106,34 @@ def get_file_by_id(conn: PgConnection, file_id: int) -> dict[str, Any]:
     return dict(row)
 
 
+def get_already_linked_file_ids(
+    conn: PgConnection,
+    file_ids: list[int],
+) -> set[int]:
+    """
+    주어진 file_id 목록 중 evidence_file_links에 이미 연결된 file_id를 반환한다.
+
+    상시 업로드 환경에서 동일 영수증이 다른 usage_statement 항목에
+    중복 연결되는 것을 방지하기 위해 /link/run 시작 시 호출한다.
+
+    Returns:
+        이미 linked된 file_id 집합 (후보 목록에서 제외 대상)
+    """
+    if not file_ids:
+        return set()
+
+    sql = """
+        SELECT DISTINCT file_id
+        FROM evidence_file_links
+        WHERE file_id = ANY(%(ids)s)
+    """
+    with conn.cursor() as cur:
+        cur.execute(sql, {"ids": file_ids})
+        rows = cur.fetchall()
+
+    return {row[0] for row in rows}
+
+
 def get_files_by_ids(
     conn: PgConnection, file_ids: list[int]
 ) -> dict[int, dict[str, Any]]:
@@ -321,26 +349,28 @@ def insert_evidence_file_link(
     conn: PgConnection,
     usage_statement_item_id: int,
     file_id: int,
-    category_code: str,
     evidence_type_code: str,
 ) -> None:
     """
     매칭된 항목-파일 연결을 evidence_file_links에 INSERT한다.
     이미 존재하는 경우 무시한다.
+
+    [V7 변경] category_code 컬럼 제거됨.
+    category는 usage_statement_items JOIN으로 항상 정확히 얻을 수 있으므로
+    evidence_file_links에서 중복 보관하지 않는다.
     """
     sql = """
         INSERT INTO evidence_file_links
-            (usage_statement_item_id, file_id, category_code, evidence_type_code)
+            (usage_statement_item_id, file_id, evidence_type_code)
         VALUES
-            (%(item_id)s, %(file_id)s, %(category_code)s, %(evidence_type_code)s)
+            (%(item_id)s, %(file_id)s, %(evidence_type_code)s)
         ON CONFLICT (usage_statement_item_id, file_id) DO NOTHING
     """
     with conn.cursor() as cur:
         cur.execute(sql, {
-            "item_id":             usage_statement_item_id,
-            "file_id":             file_id,
-            "category_code":       category_code,
-            "evidence_type_code":  evidence_type_code,
+            "item_id":            usage_statement_item_id,
+            "file_id":            file_id,
+            "evidence_type_code": evidence_type_code,
         })
 
 
@@ -348,11 +378,14 @@ def insert_agent_log(
     conn: PgConnection,
     project_id: int,
     usage_statement_id: int | None = None,
-    usage_statement_item_id: int | None = None,
     details: dict | None = None,
 ) -> int:
     """
     파이프라인 시작 시 agent_logs에 running 상태로 INSERT한다.
+
+    V1 agent_logs 컬럼: project_id, usage_statement_id, agent_type_code,
+                        status_code, details, model_name
+    (usage_statement_item_id / validation_type_code / severity_code 는 없음)
 
     Returns:
         생성된 agent_logs.id (완료/실패 시 update_agent_log_status에 전달)
@@ -361,20 +394,19 @@ def insert_agent_log(
 
     sql = """
         INSERT INTO agent_logs
-            (project_id, usage_statement_id, usage_statement_item_id,
-             validation_type_code, status_code, agent_type_code,
-             severity_code, details, model_name)
+            (project_id, usage_statement_id,
+             status_code, agent_type_code,
+             details, model_name)
         VALUES
-            (%(project_id)s, %(usage_statement_id)s, %(item_id)s,
-             'link', 'running', 'link',
-             'info', %(details)s::jsonb, 'clova_ocr_v2')
+            (%(project_id)s, %(usage_statement_id)s,
+             'running', 'link',
+             %(details)s::jsonb, 'clova_ocr_v2')
         RETURNING id
     """
     with conn.cursor() as cur:
         cur.execute(sql, {
             "project_id":         project_id,
             "usage_statement_id": usage_statement_id,
-            "item_id":            usage_statement_item_id,
             "details":            _json.dumps(details or {}, ensure_ascii=False),
         })
         row = cur.fetchone()
