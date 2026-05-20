@@ -74,15 +74,20 @@ class CategoryRuleBundle:
     items: list[ItemRuleBundle] = field(default_factory=list)
 
 
+_AUTHORITATIVE_SOURCES = {"law_rule", "qa_rule"}  # [9] DB 기반 근거
+
+
 def _has_rdb_match(matches: list[ValidatorRuleMatch], category_code: str) -> bool:
     """
-    같은 카테고리 내에서 신뢰할 수 있는 RDB 규칙이 있는지 확인.
+    같은 카테고리 내에서 신뢰할 수 있는 DB 규칙이 있는지 확인.
     카테고리 코드가 정확히 일치하는 규칙만 인정 — 카테고리 경계 침범 방지.
     (예: CAT_02 규칙이 CAT_03 항목에 토큰 겹침으로 잘못 매칭되는 케이스 차단)
-    RDB 있음 → RDB가 주 판단 / RDB 없음 → LLM이 법령 맥락 읽고 판단
+    DB 규칙 있음 → DB가 주 판단 / DB 규칙 없음 → LLM이 법령 맥락 읽고 판단
+
+    [9] match_source "rdb" → "law_rule" | "qa_rule" 으로 세분화됨.
     """
     return any(
-        m.match_source == "rdb"
+        m.match_source in _AUTHORITATIVE_SOURCES
         and m.score >= _RDB_MATCH_SCORE_THRESHOLD
         and m.category_code == category_code
         for m in matches

@@ -16,6 +16,7 @@ import os
 import re
 import time
 from pathlib import Path
+from threading import Lock
 from typing import Any
 
 from langchain_core.documents import Document
@@ -32,6 +33,9 @@ DEFAULT_COLLECTION = "legal_documents"
 _embeddings_cache: dict[str, HuggingFaceEmbeddings] = {}
 _vectorstore_cache: dict[tuple, Any] = {}
 _collection_docs_cache: dict[tuple[str, str], list[Document]] = {}
+_embeddings_lock = Lock()
+_vectorstore_lock = Lock()
+_collection_docs_lock = Lock()
 
 
 class LocalJSONCache:
@@ -86,7 +90,9 @@ def _sanitize_name(name: str) -> str:
 
 def _get_embeddings(model_name: str = DEFAULT_EMBED_MODEL) -> HuggingFaceEmbeddings:
     if model_name not in _embeddings_cache:
-        _embeddings_cache[model_name] = HuggingFaceEmbeddings(model_name=model_name)
+        with _embeddings_lock:
+            if model_name not in _embeddings_cache:
+                _embeddings_cache[model_name] = HuggingFaceEmbeddings(model_name=model_name)
     return _embeddings_cache[model_name]
 
 
@@ -170,12 +176,14 @@ def load_vectorstore(
     url = _get_qdrant_url(qdrant_url)
     key = (collection, url, embed_model)
     if key not in _vectorstore_cache:
-        embeddings = _get_embeddings(embed_model)
-        _vectorstore_cache[key] = QdrantVectorStore(
-            client=_get_qdrant_client(url),
-            collection_name=collection,
-            embedding=embeddings,
-        )
+        with _vectorstore_lock:
+            if key not in _vectorstore_cache:
+                embeddings = _get_embeddings(embed_model)
+                _vectorstore_cache[key] = QdrantVectorStore(
+                    client=_get_qdrant_client(url),
+                    collection_name=collection,
+                    embedding=embeddings,
+                )
     return _vectorstore_cache[key]
 
 
@@ -190,26 +198,29 @@ def load_collection_documents(
     cache_key = (collection, url)
     docs = _collection_docs_cache.get(cache_key)
     if docs is None:
-        client = _get_qdrant_client(url)
-        offset = None
-        docs = []
-        while True:
-            points, next_offset = client.scroll(
-                collection_name=collection,
-                with_payload=True,
-                with_vectors=False,
-                limit=256,
-                offset=offset,
-            )
-            for point in points:
-                payload = point.payload or {}
-                metadata = dict(payload.get("metadata") or {})
-                page_content = payload.get("page_content") or ""
-                docs.append(Document(page_content=page_content, metadata=metadata))
-            if next_offset is None:
-                break
-            offset = next_offset
-        _collection_docs_cache[cache_key] = docs
+        with _collection_docs_lock:
+            docs = _collection_docs_cache.get(cache_key)
+            if docs is None:
+                client = _get_qdrant_client(url)
+                offset = None
+                docs = []
+                while True:
+                    points, next_offset = client.scroll(
+                        collection_name=collection,
+                        with_payload=True,
+                        with_vectors=False,
+                        limit=256,
+                        offset=offset,
+                    )
+                    for point in points:
+                        payload = point.payload or {}
+                        metadata = dict(payload.get("metadata") or {})
+                        page_content = payload.get("page_content") or ""
+                        docs.append(Document(page_content=page_content, metadata=metadata))
+                    if next_offset is None:
+                        break
+                    offset = next_offset
+                _collection_docs_cache[cache_key] = docs
     if source_exclude:
         return [doc for doc in docs if doc.metadata.get("source") != source_exclude]
     return docs

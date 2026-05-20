@@ -10,6 +10,7 @@
 # 4. rewrite_query()   : LLM 기반 검색 쿼리 재작성
 # --------------------------------------------------------------------------
 import logging
+from threading import Lock
 from typing import NamedTuple
 
 from kiwipiepy import Kiwi
@@ -43,6 +44,7 @@ class _RetrieverCache(NamedTuple):
 
 _retriever_cache: _RetrieverCache | None = None
 _rerank_model: HuggingFaceCrossEncoder | None = None
+_rerank_model_lock = Lock()
 
 
 def rewrite_query(state: AgenticRAGState) -> AgenticRAGState:
@@ -111,14 +113,16 @@ def retrieve(state: AgenticRAGState, retriever: BaseRetriever) -> AgenticRAGStat
 def _get_rerank_model() -> HuggingFaceCrossEncoder:
     global _rerank_model
     if _rerank_model is None:
-        import torch
+        with _rerank_model_lock:
+            if _rerank_model is None:
+                import torch
 
-        device = "mps" if torch.backends.mps.is_available() else "cpu"
-        log.info(f"ReRanker 로드 중 ({device}): {_RERANK_MODEL}")
-        _rerank_model = HuggingFaceCrossEncoder(
-            model_name=_RERANK_MODEL,
-            model_kwargs={"device": device},
-        )
+                device = "mps" if torch.backends.mps.is_available() else "cpu"
+                log.info(f"ReRanker 로드 중 ({device}): {_RERANK_MODEL}")
+                _rerank_model = HuggingFaceCrossEncoder(
+                    model_name=_RERANK_MODEL,
+                    model_kwargs={"device": device},
+                )
     return _rerank_model
 
 

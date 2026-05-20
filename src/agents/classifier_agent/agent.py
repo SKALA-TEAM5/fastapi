@@ -10,6 +10,7 @@
 # --------------------------------------------------------------------------
 import logging
 import re
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from typing import Any
 
@@ -22,12 +23,24 @@ except ImportError:  # pragma: no cover
             return func
         return decorator
 
-from src.core.rag import MAX_RETRY, build_retriever, rerank, retrieve, rewrite_query
+from pydantic import BaseModel, Field
+
+from src.core.rag import (
+    MAX_RETRY,
+    _get_rerank_model,
+    build_retriever,
+    rerank,
+    retrieve,
+    rewrite_query,
+)
 from src.core.storage import DEFAULT_COLLECTION, load_vectorstore
+import src.core.llm_config as llm_config
 from src.repositories import LegalRulesRepository
+from src.prompts import CLASSIFIER_CATEGORY_PROMPT
 from src.schemas.classifier import (
     CATEGORIES,
     UNCLASSIFIED,
+    ClassifiedUsageStatementRow,
     DocumentClassification,
     RowReviewResult,
     UsageStatementReviewRequest,
@@ -41,8 +54,18 @@ log = logging.getLogger(__name__)
 
 _rules_repo = LegalRulesRepository()
 _HUMAN_REVIEW_MIN_CONFIDENCE = 0.7
-# RDB 점수가 이 값 이상이면 법령 규칙을 최우선으로 신뢰
-_RDB_DOMINANT_SCORE = 9.0
+
+# ── RDB 신뢰 임계값 (Validator 구조와 동일한 철학) ─────────────────────────
+# RDB 단독 확정: top score가 이 값 이상 + margin이 _RDB_CLEAR_MARGIN 이상이면
+# Qdrant를 조회하지 않고 바로 카테고리 확정한다.
+_RDB_CLEAR_SCORE = 5.0
+_RDB_CLEAR_MARGIN = 2.0
+# RDB가 약한 신호라도 후보로 인정하는 최소 점수
+_RDB_MIN_SCORE = 2.0
+# predicted == given일 때 LLM 검증을 생략할 최소 점수
+# (이 값 미만이면 RDB 근거가 약하다고 보고 LLM에게 재확인)
+_LLM_VERIFY_SKIP_SCORE = 8.0
+
 # 인용 투표 비율이 이 값 이상이어야 신호로 인정
 _VOTE_RATIO_MIN = 0.6
 _RECLASSIFY_MARGIN_MIN = 4.0
@@ -81,6 +104,87 @@ class _ClassificationSignals:
 class _ClassificationOutcome:
     classification: DocumentClassification
     signals: _ClassificationSignals
+
+
+class _ClassifierLLMOutput(BaseModel):
+    """LLM 카테고리 분류 결과."""
+    category_code: str = Field(description="CAT_01~CAT_09 중 하나")
+    reasoning: str = Field(default="", description="분류 근거 한 문장")
+
+
+_RULE_CONTEXT_CACHE: str | None = None
+
+def _build_rdb_rule_context() -> str:
+    """카테고리별 RDB 규칙(허용·QA 예시)을 LLM 컨텍스트 문자열로 조립한다. 캐시 사용."""
+    global _RULE_CONTEXT_CACHE
+    if _RULE_CONTEXT_CACHE is not None:
+        return _RULE_CONTEXT_CACHE
+
+    _INFORMATIVE_TYPES = {"allowed", "category", "qa_allowed", "rule_like_allowed"}
+    lines: list[str] = []
+    for cat_code, cat_name in CATEGORIES.items():
+        examples: list[str] = []
+        for rule in _rules_repo.rules:
+            if rule.get("category_code") != cat_code:
+                continue
+            if rule.get("rule_type") not in _INFORMATIVE_TYPES:
+                continue
+            kw = (rule.get("item_key") or rule.get("keyword") or "").strip()
+            if kw and kw not in examples:
+                examples.append(kw)
+            if len(examples) >= 5:
+                break
+        if examples:
+            lines.append(f"[{cat_code} {cat_name}]\n  예시: {' / '.join(examples)}")
+
+    _RULE_CONTEXT_CACHE = "\n".join(lines)
+    return _RULE_CONTEXT_CACHE
+
+
+def _llm_classify_item(
+    *,
+    item_name: str,
+    given_code: str,
+    basic_info: dict,
+    candidates: list,
+) -> str | None:
+    """LLM으로 항목 카테고리를 분류한다. RDB 규칙을 컨텍스트로 사용. 실패 시 None 반환."""
+    try:
+        llm = llm_config.get()
+    except RuntimeError:
+        return None
+
+    # RDB 법령 규칙을 컨텍스트로 사용 (Qdrant 청크 대신)
+    rdb_context = _build_rdb_rule_context()
+
+    # RDB 후보 점수 (참고용)
+    candidate_lines = "\n".join(
+        f"- {c.category_code} {c.category_name}: {c.score:.1f}점"
+        for c in (candidates or [])[:5]
+    ) or "(없음)"
+
+    given_name = CATEGORIES.get(given_code, given_code)
+    basic_str = ", ".join(f"{k}: {v}" for k, v in (basic_info or {}).items()) or "없음"
+
+    try:
+        result: _ClassifierLLMOutput = (
+            CLASSIFIER_CATEGORY_PROMPT
+            | llm.with_structured_output(_ClassifierLLMOutput)
+        ).invoke(
+            {
+                "item_name": item_name,
+                "given_code": given_code,
+                "given_name": given_name,
+                "basic_info": basic_str,
+                "context": rdb_context,
+                "candidates": candidate_lines,
+            }
+        )
+        code = (result.category_code or "").strip().upper()
+        return code if code in CATEGORIES else None
+    except Exception:
+        log.debug("LLM classifier failed for item=%s", item_name, exc_info=True)
+        return None
 
 
 def _get_generic_item_policy(item_name: str, category_id: str | None = None) -> dict | None:
@@ -133,71 +237,73 @@ def _retrieve_docs(question: str, collection: str) -> list[Document]:
     return state["retrieved_docs"]
 
 
+def _base_query(items: dict[str, float], basic_info: dict[str, Any]) -> str:
+    representative = ", ".join(list(items.keys())[:3])
+    basic_info_query = " ".join(f"{k} {v}" for k, v in basic_info.items())
+    return f"{representative} {basic_info_query}".strip()
+
+
+def _qdrant_query(base_query: str, candidates: list) -> str:
+    """RDB 후보를 힌트로 삼아 Qdrant 검색 쿼리를 풍부하게 만든다."""
+    hint_parts: list[str] = []
+    law_hints: list[str] = []
+    keyword_hints: list[str] = []
+    if candidates:
+        category_hints = _rules_repo.find_category_hints(
+            category_codes=[c.category_code for c in candidates],
+            limit_per_category=3,
+        )
+        for c in candidates:
+            hint_parts.extend([c.category_code, c.category_name])
+            hints = category_hints.get(c.category_code, {})
+            law_hints.extend(hints.get("cited_laws", []))
+            keyword_hints.extend(hints.get("keywords", []))
+
+    parts = [
+        f"산업안전보건관리비 항목 '{base_query}'의 분류 기준",
+        f"우선 검토 카테고리 {', '.join(dict.fromkeys(p.strip() for p in hint_parts if p.strip()))}" if hint_parts else "",
+        f"관련 조항 {', '.join(dict.fromkeys(p.strip() for p in law_hints if p.strip()))}" if law_hints else "",
+        f"관련 키워드 {', '.join(dict.fromkeys(p.strip() for p in keyword_hints if p.strip()))}" if keyword_hints else "",
+    ]
+    return " | ".join(p for p in parts if p).strip()
+
+
 def _build_classification_signals(
     *,
     items: dict[str, float],
     basic_info: dict[str, Any],
     collection: str,
 ) -> _ClassificationSignals:
+    """하위 호환용 — _classify_document_with_signals 내부에서 직접 제어하므로 얇은 래퍼."""
     item_names = list(items.keys())
     total_amount = sum(items.values())
-    representative = ", ".join(item_names[:3])
-    basic_info_query = " ".join(f"{k} {v}" for k, v in basic_info.items())
-    base_query = f"{representative} {basic_info_query}".strip()
-    initial_candidates = _rules_repo.find_category_candidates(
-        query_text=base_query,
-        retrieved_context="",
-        limit=3,
-    )
+    query = _base_query(items, basic_info)
 
-    hint_parts: list[str] = []
-    law_hints: list[str] = []
-    keyword_hints: list[str] = []
-    if initial_candidates:
-        category_hints = _rules_repo.find_category_hints(
-            category_codes=[candidate.category_code for candidate in initial_candidates],
-            limit_per_category=3,
-        )
-        for candidate in initial_candidates:
-            hint_parts.append(candidate.category_code)
-            hint_parts.append(candidate.category_name)
-            hints = category_hints.get(candidate.category_code, {})
-            law_hints.extend(hints.get("cited_laws", []))
-            keyword_hints.extend(hints.get("keywords", []))
-
-    category_hint = ", ".join(
-        dict.fromkeys(part.strip() for part in hint_parts if part and part.strip())
-    )
-    law_hint = ", ".join(
-        dict.fromkeys(part.strip() for part in law_hints if part and part.strip())
-    )
-    keyword_hint = ", ".join(
-        dict.fromkeys(part.strip() for part in keyword_hints if part and part.strip())
-    )
-
-    query_parts = [
-        f"산업안전보건관리비 항목 '{representative}'의 분류 기준",
-        f"기본정보 {basic_info_query}" if basic_info_query else "",
-        f"우선 검토 카테고리 {category_hint}" if category_hint else "",
-        f"관련 조항 {law_hint}" if law_hint else "",
-        f"관련 키워드 {keyword_hint}" if keyword_hint else "",
-    ]
-    query = " | ".join(part for part in query_parts if part).strip()
-
-    docs = _retrieve_docs(question=query, collection=collection)
-    context = "\n\n---\n\n".join(
-        f"[출처: {d.metadata.get('source', '알 수 없음')}]\n{d.page_content}"
-        for d in docs
-    ) if docs else ""
+    # RDB 우선 조회
     candidates = _rules_repo.find_category_candidates(
-        query_text=base_query,
-        retrieved_context=context,
-        limit=5,
+        query_text=query, retrieved_context="", limit=5,
     )
-    vote_scores = _vote_category_from_chunks(docs)
+    # Qdrant는 RDB가 불확실할 때만 조회
+    rdb_top = candidates[0].score if candidates else 0.0
+    rdb_margin = (candidates[0].score - candidates[1].score) if len(candidates) > 1 else rdb_top
+    if rdb_top >= _RDB_CLEAR_SCORE and rdb_margin >= _RDB_CLEAR_MARGIN:
+        docs: list[Document] = []
+        vote_scores: dict[str, float] = {}
+    else:
+        docs = _retrieve_docs(question=_qdrant_query(query, candidates), collection=collection)
+        vote_scores = _vote_category_from_chunks(docs)
+        if docs:
+            context = "\n\n---\n\n".join(
+                f"[출처: {d.metadata.get('source', '알 수 없음')}]\n{d.page_content}"
+                for d in docs
+            )
+            candidates = _rules_repo.find_category_candidates(
+                query_text=query, retrieved_context=context, limit=5,
+            )
+
     return _ClassificationSignals(
         docs=docs,
-        candidates=candidates or initial_candidates,
+        candidates=candidates,
         vote_scores=vote_scores,
         item_names=item_names,
         total_amount=total_amount,
@@ -369,49 +475,52 @@ def _classify_document_with_signals(
     collection: str,
     signals: _ClassificationSignals | None = None,
 ) -> _ClassificationOutcome:
-    signals = signals or _build_classification_signals(
-        items=items,
-        basic_info=basic_info,
-        collection=collection,
-    )
-    item_names = signals.item_names
+    """
+    Validator와 동일한 철학의 우선순위 구조.
+
+    1순위: RDB 단독 확정 — score >= _RDB_CLEAR_SCORE & margin >= _RDB_CLEAR_MARGIN
+           → Qdrant 조회 없이 즉시 확정 (빠르고 신뢰도 높음)
+    2순위: RDB + Qdrant citation vote 조합
+           → 두 신호가 같은 카테고리 → confidence 상승
+           → citation vote 단독으로 명확 → vote 결과 사용
+    3순위: RDB 약한 신호 단독
+           → Qdrant에서 citation vote 없을 때 RDB 후보 사용
+    4순위: 청크 헤더 힌트 → UNCLASSIFIED
+    """
+    item_names = list(items.keys())
     representative = ", ".join(item_names[:3])
-    total_amount = signals.total_amount
-    docs = signals.docs
+    total_amount = sum(items.values())
+    query = _base_query(items, basic_info)
 
-    if not docs:
-        return _ClassificationOutcome(
-            classification=DocumentClassification(
-                category_id=UNCLASSIFIED,
-                category_name=UNCLASSIFIED,
-                confidence=0.0,
-                total_amount=total_amount,
-                items=items,
-                needs_human_review=True,
-                review_reason="관련 법령 문맥을 검색하지 못했습니다.",
-            ),
-            signals=signals,
+    # ── 1. RDB 먼저 (Qdrant 없이) ──────────────────────────────────────────
+    if signals is None:
+        candidates = _rules_repo.find_category_candidates(
+            query_text=query, retrieved_context="", limit=5,
         )
+    else:
+        candidates = signals.candidates
 
-    candidates = signals.candidates
-    vote_scores = signals.vote_scores
+    rdb_top = candidates[0].score if candidates else 0.0
+    rdb_second = candidates[1].score if len(candidates) > 1 else 0.0
+    rdb_margin = rdb_top - rdb_second
 
-    # RDB 최상위 후보 점수가 매우 높으면 법령 규칙을 우선 신뢰
-    rdb_top_score = candidates[0].score if candidates else 0.0
-    if rdb_top_score >= _RDB_DOMINANT_SCORE:
-        top_candidate = candidates[0]
-        category_id = top_candidate.category_code
+    # ── 2. RDB 단독 확정 조건 충족 시 Qdrant 스킵 ─────────────────────────
+    if candidates and rdb_top >= _RDB_CLEAR_SCORE and rdb_margin >= _RDB_CLEAR_MARGIN:
+        category_id = candidates[0].category_code
         confidence = _confidence_from_candidates(candidates)
-        needs_human_review, review_reason = _human_review_from_rdb(
-            candidates=candidates, docs=docs, confidence=confidence,
-        )
-        needs_human_review, review_reason = _apply_generic_review_policy(
+        needs_review = confidence < _HUMAN_REVIEW_MIN_CONFIDENCE
+        review_reason = f"결정 신뢰도 확인 필요. confidence={confidence:.2f}" if needs_review else ""
+        needs_review, review_reason = _apply_generic_review_policy(
             item_names=item_names,
             category_id=category_id,
-            needs_human_review=needs_human_review,
+            needs_human_review=needs_review,
             review_reason=review_reason,
         )
-        log.debug("rdb-dominant: item=%s cat=%s score=%.1f", representative, category_id, rdb_top_score)
+        log.debug("rdb-clear: item=%s cat=%s score=%.1f margin=%.1f", representative, category_id, rdb_top, rdb_margin)
+        final_signals = signals or _ClassificationSignals(
+            docs=[], candidates=candidates, vote_scores={},
+            item_names=item_names, total_amount=total_amount,
+        )
         return _ClassificationOutcome(
             classification=DocumentClassification(
                 category_id=category_id,
@@ -419,72 +528,110 @@ def _classify_document_with_signals(
                 confidence=confidence,
                 total_amount=total_amount,
                 items=items,
-                needs_human_review=needs_human_review,
+                needs_human_review=needs_review,
                 review_reason=review_reason,
             ),
-            signals=signals,
+            signals=final_signals,
         )
 
-    # 인용 투표 신호가 명확하면 청크 기반 결과 사용
+    # ── 3. RDB 불확실 → Qdrant 조회 ───────────────────────────────────────
+    if signals is not None:
+        docs = signals.docs
+        vote_scores = signals.vote_scores
+    else:
+        docs = _retrieve_docs(
+            question=_qdrant_query(query, candidates), collection=collection,
+        )
+        vote_scores = _vote_category_from_chunks(docs)
+        if docs:
+            context = "\n\n---\n\n".join(
+                f"[출처: {d.metadata.get('source', '알 수 없음')}]\n{d.page_content}"
+                for d in docs
+            )
+            candidates = _rules_repo.find_category_candidates(
+                query_text=query, retrieved_context=context, limit=5,
+            )
+            rdb_top = candidates[0].score if candidates else 0.0
+            rdb_second = candidates[1].score if len(candidates) > 1 else 0.0
+            rdb_margin = rdb_top - rdb_second
+
+    final_signals = _ClassificationSignals(
+        docs=docs, candidates=candidates, vote_scores=vote_scores,
+        item_names=item_names, total_amount=total_amount,
+    )
+
+    # ── 4. citation vote 신호 확인 ─────────────────────────────────────────
+    top_vote_cat: str | None = None
+    vote_ratio = 0.0
     if vote_scores:
-        top_cat = max(vote_scores, key=lambda k: vote_scores[k])
+        top_vote_cat = max(vote_scores, key=lambda k: vote_scores[k])
         vote_total = sum(vote_scores.values())
-        vote_ratio = vote_scores[top_cat] / vote_total
-        if vote_ratio >= _VOTE_RATIO_MIN:
-            confidence = _confidence_from_votes(vote_scores)
-            needs_human_review, review_reason = _review_from_votes(vote_scores, top_cat, confidence)
-            needs_human_review, review_reason = _apply_generic_review_policy(
-                item_names=item_names,
-                category_id=top_cat,
-                needs_human_review=needs_human_review,
-                review_reason=review_reason,
-            )
-            log.debug(
-                "citation-vote: item=%s top=%s ratio=%.2f confidence=%.2f",
-                representative, top_cat, vote_ratio, confidence,
-            )
-            return _ClassificationOutcome(
-                classification=DocumentClassification(
-                    category_id=top_cat,
-                    category_name=CATEGORIES.get(top_cat, UNCLASSIFIED),
-                    confidence=confidence,
-                    total_amount=total_amount,
-                    items=items,
-                    needs_human_review=needs_human_review,
-                    review_reason=review_reason,
-                ),
-                signals=signals,
-            )
+        vote_ratio = vote_scores[top_vote_cat] / vote_total
 
-    # RDB 폴백 (인용 투표 신호 약함)
-    if candidates:
-        top_candidate = candidates[0]
-        category_id = top_candidate.category_code
-        confidence = _confidence_from_candidates(candidates)
-        needs_human_review, review_reason = _human_review_from_rdb(
-            candidates=candidates, docs=docs, confidence=confidence,
+    vote_is_clear = bool(top_vote_cat and vote_ratio >= _VOTE_RATIO_MIN)
+    rdb_is_present = bool(candidates and rdb_top >= _RDB_MIN_SCORE)
+
+    # ── 5. RDB + vote 일치 → 가장 높은 신뢰도 ────────────────────────────
+    if vote_is_clear and rdb_is_present and candidates[0].category_code == top_vote_cat:
+        category_id = top_vote_cat
+        confidence = min(_confidence_from_candidates(candidates) + 0.1, 0.95)
+        needs_review, review_reason = False, ""
+        needs_review, review_reason = _apply_generic_review_policy(
+            item_names=item_names, category_id=category_id,
+            needs_human_review=needs_review, review_reason=review_reason,
         )
-        needs_human_review, review_reason = _apply_generic_review_policy(
-            item_names=item_names,
-            category_id=category_id,
-            needs_human_review=needs_human_review,
-            review_reason=review_reason,
-        )
-        log.debug("rdb-fallback: item=%s cat=%s score=%.1f", representative, category_id, rdb_top_score)
+        log.debug("rdb+vote-agree: item=%s cat=%s", representative, category_id)
         return _ClassificationOutcome(
             classification=DocumentClassification(
                 category_id=category_id,
                 category_name=CATEGORIES.get(category_id, UNCLASSIFIED),
-                confidence=confidence,
-                total_amount=total_amount,
-                items=items,
-                needs_human_review=needs_human_review,
-                review_reason=review_reason,
+                confidence=confidence, total_amount=total_amount, items=items,
+                needs_human_review=needs_review, review_reason=review_reason,
             ),
-            signals=signals,
+            signals=final_signals,
         )
 
-    # 헤더 힌트 폴백: 청크 섹션 제목에서 카테고리 추론
+    # ── 6. vote 단독으로 명확 ─────────────────────────────────────────────
+    if vote_is_clear:
+        confidence = _confidence_from_votes(vote_scores)
+        needs_review, review_reason = _review_from_votes(vote_scores, top_vote_cat, confidence)
+        needs_review, review_reason = _apply_generic_review_policy(
+            item_names=item_names, category_id=top_vote_cat,
+            needs_human_review=needs_review, review_reason=review_reason,
+        )
+        log.debug("citation-vote: item=%s top=%s ratio=%.2f", representative, top_vote_cat, vote_ratio)
+        return _ClassificationOutcome(
+            classification=DocumentClassification(
+                category_id=top_vote_cat,
+                category_name=CATEGORIES.get(top_vote_cat, UNCLASSIFIED),
+                confidence=confidence, total_amount=total_amount, items=items,
+                needs_human_review=needs_review, review_reason=review_reason,
+            ),
+            signals=final_signals,
+        )
+
+    # ── 7. RDB 단독 (vote 없음, 약한 신호라도 사용) ───────────────────────
+    if rdb_is_present:
+        category_id = candidates[0].category_code
+        confidence = _confidence_from_candidates(candidates)
+        needs_review = confidence < _HUMAN_REVIEW_MIN_CONFIDENCE or rdb_top < _RDB_CLEAR_SCORE
+        review_reason = f"RDB 규칙 점수가 낮습니다. score={rdb_top:.1f}" if needs_review else ""
+        needs_review, review_reason = _apply_generic_review_policy(
+            item_names=item_names, category_id=category_id,
+            needs_human_review=needs_review, review_reason=review_reason,
+        )
+        log.debug("rdb-only: item=%s cat=%s score=%.1f", representative, category_id, rdb_top)
+        return _ClassificationOutcome(
+            classification=DocumentClassification(
+                category_id=category_id,
+                category_name=CATEGORIES.get(category_id, UNCLASSIFIED),
+                confidence=confidence, total_amount=total_amount, items=items,
+                needs_human_review=needs_review, review_reason=review_reason,
+            ),
+            signals=final_signals,
+        )
+
+    # ── 8. 청크 헤더 힌트 (최후 폴백) ────────────────────────────────────
     hint_cat = _hint_from_chunk_headers(docs)
     if hint_cat:
         log.debug("header-hint: item=%s cat=%s", representative, hint_cat)
@@ -492,26 +639,21 @@ def _classify_document_with_signals(
             classification=DocumentClassification(
                 category_id=hint_cat,
                 category_name=CATEGORIES.get(hint_cat, UNCLASSIFIED),
-                confidence=0.72,
-                total_amount=total_amount,
-                items=items,
-                needs_human_review=False,
-                review_reason="",
+                confidence=0.55, total_amount=total_amount, items=items,
+                needs_human_review=True, review_reason="청크 헤더 키워드 기반 분류. 확인 권장.",
             ),
-            signals=signals,
+            signals=final_signals,
         )
 
     return _ClassificationOutcome(
         classification=DocumentClassification(
             category_id=UNCLASSIFIED,
             category_name=UNCLASSIFIED,
-            confidence=0.0,
-            total_amount=total_amount,
-            items=items,
+            confidence=0.0, total_amount=total_amount, items=items,
             needs_human_review=True,
-            review_reason="RDB 및 청크 인용 투표 모두 카테고리 후보를 찾지 못했습니다.",
+            review_reason="RDB 규칙과 법령 청크 인용 모두 카테고리 후보를 찾지 못했습니다.",
         ),
-        signals=signals,
+        signals=final_signals,
     )
 
 
@@ -519,41 +661,106 @@ def _item_status(
     predicted: DocumentClassification,
     given_code: str | None,
     candidates: list | None = None,
+    *,
+    item_name: str = "",
+    basic_info: dict | None = None,
 ) -> tuple[str, str, str]:
+    """항목 판정 상태를 결정한다. 반환값: (판정상태, 최종카테고리코드, 사유)
+    판정상태는 반드시 '유지' 또는 '카테고리변경' 중 하나. '검토필요' 없음.
+    애매한 경우 LLM이 최종 결정한다.
+    """
     candidates = candidates or []
-    score_by_category = {candidate.category_code: candidate.score for candidate in candidates}
+    score_by_category = {c.category_code: c.score for c in candidates}
     predicted_score = score_by_category.get(predicted.category_id, 0.0)
     given_score = score_by_category.get(given_code or "", 0.0)
     top_score = candidates[0].score if candidates else 0.0
 
-    if predicted.category_id == UNCLASSIFIED:
-        return "검토필요", given_code or UNCLASSIFIED, "입력 항목만으로 카테고리 확정이 어려워 한번 더 확인해달라."
+    def _fallback_to_llm(reason_tag: str) -> tuple[str, str, str]:
+        """LLM에게 최종 분류를 위임한다. LLM 불가 시 '유지'로 안전하게 처리."""
+        llm_code = _llm_classify_item(
+            item_name=item_name,
+            given_code=given_code or UNCLASSIFIED,
+            basic_info=basic_info or {},
+            candidates=candidates,
+        )
+        if llm_code and llm_code != given_code:
+            cat_name = CATEGORIES.get(llm_code, llm_code)
+            return "카테고리변경", llm_code, f"{cat_name} 카테고리로 변경이 필요함."
+        return "유지", given_code or (predicted.category_id if predicted.category_id != UNCLASSIFIED else ""), ""
 
-    # 분류 Agent는 적정/부적정을 판단하지 않으므로, 현재 카테고리에 분류 근거가 남아 있고
-    # 대체 카테고리 우위가 강하지 않다면 기존 카테고리를 우선 유지한다.
+    # ── 1. 분류 불가 → LLM 위임
+    if predicted.category_id == UNCLASSIFIED:
+        return _fallback_to_llm("unclassified")
+
+    # ── 2. 예측 카테고리가 기존과 다를 때
     if given_code and predicted.category_id != given_code:
+        # 후보 없고 확신도 낮음 → 유지
         if not candidates and predicted.confidence < 0.8:
             return "유지", given_code, ""
+
+        # 기존 카테고리 점수가 있고 예측 점수가 없음 → 유지
         if given_score > 0 and predicted_score <= 0:
             if given_score >= top_score:
                 return "유지", given_code, ""
-            return "검토필요", given_code, "입력 항목만으로 카테고리 확정이 어려워 한번 더 확인해달라."
+            # 기존이 top도 아니고 예측 점수도 없는 경우 → LLM 위임
+            return _fallback_to_llm("given_not_top_no_predicted_score")
 
         margin = predicted_score - given_score
+        # 마진이 충분히 크지 않은 경우 → LLM 위임
         if given_score > 0 and margin < _RECLASSIFY_MARGIN_MIN:
             if predicted.needs_human_review or margin < 1.5:
-                return "검토필요", given_code, "입력 항목만으로 카테고리 확정이 어려워 한번 더 확인해달라."
+                return _fallback_to_llm("low_margin")
             return "유지", given_code, ""
-        if predicted.confidence < _RECLASSIFY_CONFIDENCE_MIN:
-            return "검토필요", given_code, f"재분류 신뢰도가 충분히 높지 않습니다. confidence={predicted.confidence:.2f}"
 
+        # 신뢰도 미달 → LLM 위임
+        if predicted.confidence < _RECLASSIFY_CONFIDENCE_MIN:
+            return _fallback_to_llm(f"low_confidence:{predicted.confidence:.2f}")
+
+    # ── 3. 예측 == 기존이지만 RDB 근거가 충분히 강하지 않으면 LLM 검증
+    # _LLM_VERIFY_SKIP_SCORE 미만: profile/rule 점수가 약해 틀린 카테고리를 유지할 위험
     if predicted.category_id == given_code:
+        top_score = candidates[0].score if candidates else 0.0
+        if top_score < _LLM_VERIFY_SKIP_SCORE or predicted.confidence < _HUMAN_REVIEW_MIN_CONFIDENCE:
+            return _fallback_to_llm("predicted_equals_given_weak_rdb")
         return "유지", predicted.category_id, ""
 
+    # ── 4. 사람 검토 필요 신호 → LLM 위임
     if predicted.needs_human_review:
-        return "검토필요", given_code or predicted.category_id, "입력 항목만으로 카테고리 확정이 어려워 한번 더 확인해달라."
+        return _fallback_to_llm("needs_human_review")
 
+    # ── 5. 확실한 재분류
     return "카테고리변경", predicted.category_id, f"{predicted.category_name} 카테고리로 변경이 필요함."
+
+
+def _review_single_usage_statement_row(
+    *,
+    row: UsageStatementRow,
+    basic_info: dict[str, Any],
+    collection: str,
+) -> RowReviewResult:
+    outcome = _classify_document_with_signals(
+        items={row.item_name: row.total_amount},
+        basic_info=basic_info,
+        collection=collection,
+    )
+    predicted = outcome.classification
+    signals = outcome.signals
+    decision_status, final_category_code, reason = _item_status(
+        predicted=predicted,
+        given_code=row.given_category_code,
+        candidates=signals.candidates,
+        item_name=row.item_name,
+        basic_info=basic_info,
+    )
+    return RowReviewResult(
+        row_id=row.row_id,
+        item_name=row.item_name,
+        given_category_code=row.given_category_code,
+        final_category_code=final_category_code,
+        decision_status=decision_status,
+        needs_human_review=False,
+        reason=reason if decision_status != "유지" else "",
+    )
 
 
 @traceable(name="classifier.review_usage_statement")
@@ -576,37 +783,80 @@ def review_usage_statement(
         basic_info=basic_info,
     )
 
-    results: list[RowReviewResult] = []
-    for row in request.rows:
-        outcome = _classify_document_with_signals(
-            items={row.item_name: row.total_amount},
-            basic_info=request.basic_info,
-            collection=collection,
-        )
-        predicted = outcome.classification
-        signals = outcome.signals
-        decision_status, final_category_code, reason = _item_status(
-            predicted=predicted,
-            given_code=row.given_category_code,
-            candidates=signals.candidates,
-        )
-        if decision_status == "검토필요" and not reason:
-            reason = "한번 더 확인해달라."
-        results.append(
-            RowReviewResult(
-                row_id=row.row_id,
-                item_name=row.item_name,
-                given_category_code=row.given_category_code,
-                final_category_code=final_category_code,
-                decision_status=decision_status,
-                needs_human_review=decision_status == "검토필요",
-                reason=reason if decision_status != "유지" else "",
+    if not request.rows:
+        results: list[RowReviewResult] = []
+    else:
+        # 병렬 구간 진입 전에 reranker를 한 번만 초기화해
+        # 스레드 간 중복 모델 로딩과 종료 시 리소스 경고를 줄인다.
+        _get_rerank_model()
+        max_workers = min(8, len(request.rows))
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            results = list(
+                executor.map(
+                    lambda row: _review_single_usage_statement_row(
+                        row=row,
+                        basic_info=request.basic_info,
+                        collection=collection,
+                    ),
+                    request.rows,
+                )
             )
-        )
 
     return UsageStatementReviewResponse(
         usage_statement_id=request.usage_statement_id,
         results=results,
+    )
+
+
+def review_usage_statement_items(
+    payload: dict[str, Any] | None = None,
+    *,
+    usage_statement_id: int | str | None = None,
+    rows: list[dict[str, Any]] | list[UsageStatementRow] | None = None,
+    basic_info: dict[str, Any] | None = None,
+    collection: str = DEFAULT_COLLECTION,
+) -> UsageStatementItemsResponse:
+    """
+    OCR/사용내역서 입력 행과 classifier 판정 결과를 하나의 DTO로 병합해 반환한다.
+    """
+    request = _coerce_usage_statement_input(
+        payload=payload,
+        usage_statement_id=usage_statement_id,
+        rows=rows,
+        basic_info=basic_info,
+    )
+    reviewed = review_usage_statement(
+        payload=request.model_dump(by_alias=True),
+        collection=collection,
+    )
+    review_map = {result.row_id: result for result in reviewed.results}
+
+    merged_rows: list[ClassifiedUsageStatementRow] = []
+    for row in request.rows:
+        review = review_map.get(row.row_id)
+        if review is None:
+            continue
+        merged_rows.append(
+            ClassifiedUsageStatementRow(
+                usage_statement_id=request.usage_statement_id,
+                row_id=row.row_id,
+                given_category_code=row.given_category_code,
+                used_on=row.used_on,
+                item_name=row.item_name,
+                unit=row.unit,
+                quantity=row.quantity,
+                unit_price=row.unit_price,
+                total_amount=row.total_amount,
+                final_category_code=review.final_category_code,
+                decision_status=review.decision_status,
+                needs_human_review=review.needs_human_review,
+                reason=review.reason,
+            )
+        )
+
+    return UsageStatementItemsResponse(
+        usage_statement_id=request.usage_statement_id,
+        rows=merged_rows,
     )
 
 

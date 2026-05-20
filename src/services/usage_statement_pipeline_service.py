@@ -1,8 +1,8 @@
 """
-OCR 파이프라인 실행 서비스 (API 호출용)
+사용내역서 파이프라인 서비스 (API 호출용)
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-CLI 기반의 pipeline_service.py와 달리 API 엔드포인트에서 직접 호출 가능한
-함수 형태로 파이프라인을 제공한다.
+사용내역서 OCR 파싱, classifier 반영, 증빙 링크 후속 처리를
+API에서 직접 호출 가능한 함수 형태로 제공한다.
 
 제공 함수:
   - parse_usage_statement  : 사용내역서 PDF 파싱 → DB 저장 (/ocr/parse 용)
@@ -35,11 +35,10 @@ from src.ocr.clova_ocr_receipt import (
 )
 from src.ocr.parse_tax_invoice import parse_tax_invoice, ALL_EXTS as TAX_INVOICE_EXTS
 from src.ocr.parse_usage_statement import parse_pdf as parse_usage_pdf
+from src.agents.classifier_agent.agent import review_usage_statement
 from src.repositories.db import get_connection
-from src.repositories.ocr_pipeline_repository import (
-    get_file_by_id,
+from src.repositories.usage_statement_pipeline_repository import (
     get_files_by_ids,
-    get_already_linked_file_ids,
     insert_evidence_file_link,
     insert_usage_statement,
     insert_usage_statement_items,
@@ -76,6 +75,105 @@ def _cleanup(*paths: str) -> None:
         Path(p).unlink(missing_ok=True)
 
 
+def _build_classifier_basic_info(parsed_usage: dict[str, Any]) -> dict[str, Any]:
+    """사용내역서 header를 classifier 기본정보로 정리한다."""
+    header = parsed_usage.get("header") or {}
+    return {
+        key: value
+        for key, value in header.items()
+        if key != "category_summaries" and value not in (None, "", [])
+    }
+
+
+def _classify_usage_statement(
+    *,
+    usage_file_id: int,
+    parsed_usage: dict[str, Any],
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    """
+    OCR 파싱된 사용내역서를 classifier에 태워 카테고리를 보정하고,
+    agent_logs.details에 저장할 classifier JSON도 함께 만든다.
+    """
+    line_items = parsed_usage.get("line_items") or []
+    if not line_items:
+        classifier_details = {
+            "results": [],
+        }
+        return parsed_usage, classifier_details
+
+    indexed_items: list[tuple[int, dict[str, Any]]] = [
+        (index, item) for index, item in enumerate(line_items, start=1)
+    ]
+    classifier_rows = [
+        {
+            "row_id": row_id,
+            "given_category_code": item.get("category_code"),
+            "item_name": item.get("item_name"),
+        }
+        for row_id, item in indexed_items
+    ]
+    review_response = review_usage_statement(
+        usage_statement_id=usage_file_id,
+        rows=classifier_rows,
+        basic_info={},
+    )
+    review_map = {result.row_id: result for result in review_response.results}
+
+    changed_count = 0
+    kept_count = 0
+    updated_items: list[dict[str, Any]] = []
+    classifier_results: list[dict[str, Any]] = []
+
+    for row_id, item in indexed_items:
+        original_category = item.get("category_code")
+        review = review_map.get(row_id)
+        updated_item = dict(item)
+
+        if review is None:
+            kept_count += 1
+            classifier_results.append(
+                {
+                    "row_id": row_id,
+                    "item_name": item.get("item_name"),
+                    "original_category_code": original_category,
+                    "final_category_code": original_category,
+                    "status": "appropriate",
+                    "reason": "classifier result was missing, so the OCR category was kept.",
+                }
+            )
+            updated_items.append(updated_item)
+            continue
+
+        updated_category = review.final_category_code or original_category
+        status = "appropriate" if review.decision_status == "유지" else "inappropriate"
+        if updated_category != original_category:
+            changed_count += 1
+        else:
+            kept_count += 1
+
+        updated_item["category_code"] = updated_category
+
+        classifier_results.append(
+            {
+                "row_id": row_id,
+                "item_name": review.item_name,
+                "original_category_code": original_category,
+                "final_category_code": updated_category,
+                "status": status,
+                "reason": review.reason,
+            }
+        )
+        updated_items.append(updated_item)
+
+    classified_usage = dict(parsed_usage)
+    classified_usage["line_items"] = updated_items
+
+    classifier_details = {
+        "results": classifier_results,
+    }
+    return classified_usage, classifier_details
+
+
 # ─────────────────────────────────────────────────────────────
 # 엔드포인트 1: 사용내역서 파싱 (/ocr/parse)
 # ─────────────────────────────────────────────────────────────
@@ -102,16 +200,11 @@ def parse_usage_statement(usage_file_id: int) -> dict[str, Any]:
     """
     start = time.time()
     tmp_paths: list[str] = []
-
-    # ── 로그 시작 (별도 커넥션으로 즉시 커밋) ─────────────────────────
-    with get_connection() as log_conn:
-        usage_file_init = get_file_by_id(log_conn, usage_file_id)
-        project_id: int = usage_file_init["project_id"]
-        log_id: int = insert_agent_log(
-            log_conn,
-            project_id=project_id,
-            details={"usage_file_id": usage_file_id},
-        )
+    classifier_log_id: int | None = None
+    usage_statement_id: int | None = None
+    parsed_usage: dict[str, Any] | None = None
+    classifier_details: dict[str, Any] | None = None
+    line_items: list[dict[str, Any]] = []
 
     try:
         with get_connection() as conn:
@@ -121,6 +214,7 @@ def parse_usage_statement(usage_file_id: int) -> dict[str, Any]:
             usage_file = file_map.get(usage_file_id)
             if not usage_file:
                 raise ValueError(f"사용내역서 파일을 찾을 수 없습니다 (file_id={usage_file_id})")
+            project_id = usage_file["project_id"]
 
             # ── S3 fetch + 파싱 ────────────────────────────────────────────
             usage_suffix = Path(usage_file["original_filename"]).suffix.lower()
@@ -134,6 +228,21 @@ def parse_usage_statement(usage_file_id: int) -> dict[str, Any]:
 
             if parsed_usage.get("parse_status") == "FAILED":
                 raise RuntimeError("사용내역서 파싱 실패 (FAILED)")
+
+            with get_connection() as classifier_log_conn:
+                classifier_log_id = insert_agent_log(
+                    classifier_log_conn,
+                    project_id=project_id,
+                    usage_statement_id=None,
+                    details={"source_file_id": usage_file_id},
+                    agent_type_code="classi",
+                    model_name="classifier_agent",
+                )
+
+            parsed_usage, classifier_details = _classify_usage_statement(
+                usage_file_id=usage_file_id,
+                parsed_usage=parsed_usage,
+            )
 
             # ── DB 저장 ────────────────────────────────────────────────────
             usage_statement_id = insert_usage_statement(
@@ -150,31 +259,35 @@ def parse_usage_statement(usage_file_id: int) -> dict[str, Any]:
             insert_usage_statement_items(conn, usage_statement_id, line_items)
 
             # ── 로그 completed ─────────────────────────────────────────────
-            update_agent_log_status(
-                conn,
-                log_id=log_id,
-                status_code="completed",
-                details={
-                    "parse_status": parsed_usage.get("parse_status"),
-                    "item_count":   len(line_items),
-                    "usage_file_id": usage_file_id,
-                },
-            )
+            if classifier_log_id is not None:
+                update_agent_log_status(
+                    conn,
+                    log_id=classifier_log_id,
+                    status_code="completed",
+                    details=classifier_details or {},
+                )
 
     except Exception:
         with get_connection() as err_conn:
-            update_agent_log_status(err_conn, log_id=log_id, status_code="failed")
+            if classifier_log_id is not None:
+                update_agent_log_status(err_conn, log_id=classifier_log_id, status_code="failed")
         raise
 
     finally:
         _cleanup(*tmp_paths)
 
     elapsed = round(time.time() - start, 2)
+    classifier_changed_count = sum(
+        1
+        for result in ((classifier_details or {}).get("results") or [])
+        if result.get("original_category_code") != result.get("final_category_code")
+    )
 
     return {
         "usage_statement_id": usage_statement_id,
-        "parse_status":       parsed_usage.get("parse_status", "SUCCESS"),
+        "parse_status":       (parsed_usage or {}).get("parse_status", "SUCCESS"),
         "item_count":         len(line_items),
+        "classifier_changed_count": classifier_changed_count,
         "elapsed_sec":        elapsed,
     }
 
@@ -244,19 +357,6 @@ def run_link_pipeline(
             # ── DB에서 파일 정보 일괄 조회 ────────────────────────────────
             all_ids = receipt_file_ids + tax_invoice_file_ids
             file_map = get_files_by_ids(conn, all_ids)
-
-            # ── 중복 방지: 이미 linked된 영수증 파일 제외 ────────────────
-            # 상시 업로드 환경에서 동일 영수증이 다른 usage_statement 항목에
-            # 중복 연결되는 것을 방지한다.
-            already_linked = get_already_linked_file_ids(conn, receipt_file_ids)
-            if already_linked:
-                import logging as _logging
-                _logging.getLogger(__name__).warning(
-                    "중복 연결 의심 파일 %d건 제외: %s",
-                    len(already_linked),
-                    sorted(already_linked),
-                )
-            receipt_file_ids = [fid for fid in receipt_file_ids if fid not in already_linked]
 
             # ── usage_statement items 조회 (매칭용) ───────────────────────
             # v_usage_statement_context 뷰 사용 (직접 테이블 조회 대신)

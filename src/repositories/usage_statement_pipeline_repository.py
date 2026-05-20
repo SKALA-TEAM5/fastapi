@@ -1,7 +1,7 @@
 """
-OCR 파이프라인 DB 레포지토리
-━━━━━━━━━━━━━━━━━━━━━━━━━━
-파이프라인 실행에 필요한 DB 읽기/쓰기 함수 모음.
+사용내역서 파이프라인 DB 레포지토리
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+사용내역서 파이프라인 실행에 필요한 DB 읽기/쓰기 함수 모음.
 
 읽기:
   - get_file_by_id     : file_id → storage_key, evidence_type 등
@@ -106,34 +106,6 @@ def get_file_by_id(conn: PgConnection, file_id: int) -> dict[str, Any]:
     return dict(row)
 
 
-def get_already_linked_file_ids(
-    conn: PgConnection,
-    file_ids: list[int],
-) -> set[int]:
-    """
-    주어진 file_id 목록 중 evidence_file_links에 이미 연결된 file_id를 반환한다.
-
-    상시 업로드 환경에서 동일 영수증이 다른 usage_statement 항목에
-    중복 연결되는 것을 방지하기 위해 /link/run 시작 시 호출한다.
-
-    Returns:
-        이미 linked된 file_id 집합 (후보 목록에서 제외 대상)
-    """
-    if not file_ids:
-        return set()
-
-    sql = """
-        SELECT DISTINCT file_id
-        FROM evidence_file_links
-        WHERE file_id = ANY(%(ids)s)
-    """
-    with conn.cursor() as cur:
-        cur.execute(sql, {"ids": file_ids})
-        rows = cur.fetchall()
-
-    return {row[0] for row in rows}
-
-
 def get_files_by_ids(
     conn: PgConnection, file_ids: list[int]
 ) -> dict[int, dict[str, Any]]:
@@ -177,7 +149,7 @@ def insert_usage_statement(
                           (line_items가 없으면 오늘 날짜 기준)
     - document_written_date: 파싱 결과에 없으므로 오늘 날짜로 대체
     - cumulative_progress_rate: header.공정률 (없으면 0)
-    - revision_no       : 기본값 1
+    - revision_no       : 같은 project_id/report_month 내 다음 개정번호
 
     Returns:
         생성된 usage_statements.id
@@ -188,7 +160,10 @@ def insert_usage_statement(
     # report_month 추출
     report_month: date
     if line_items:
-        first_date = _safe_date(line_items[0].get("사용일자"))
+        first_item = line_items[0]
+        first_date = _safe_date(
+            first_item.get("사용일자") or first_item.get("used_on")
+        )
         report_month = _first_day_of_month(first_date) if first_date else date.today().replace(day=1)
     else:
         report_month = date.today().replace(day=1)
@@ -198,6 +173,23 @@ def insert_usage_statement(
         progress_rate = float(header.get("공정률") or 0)
     except (ValueError, TypeError):
         progress_rate = 0.0
+
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            SELECT COALESCE(MAX(revision_no), 0) + 1
+            FROM usage_statements
+            WHERE project_id = %(project_id)s
+              AND report_month = %(report_month)s
+            """,
+            {
+                "project_id": project_id,
+                "report_month": report_month,
+            },
+        )
+        revision_row = cur.fetchone()
+
+    revision_no = int(revision_row[0]) if revision_row and revision_row[0] is not None else 1
 
     sql = """
         INSERT INTO usage_statements
@@ -215,7 +207,7 @@ def insert_usage_statement(
             "project_id":               project_id,
             "source_file_id":           source_file_id,
             "report_month":             report_month,
-            "revision_no":              1,
+            "revision_no":              revision_no,
             "document_written_date":    date.today(),
             "cumulative_progress_rate": progress_rate,
         })
@@ -297,23 +289,31 @@ def insert_usage_statement_items(
     with conn.cursor() as cur:
         for item in line_items:
             extra = item.get("추가정보") or {}
-            cat_code = _to_category_code(item.get("항목코드"))
-            used_on = _safe_date(item.get("사용일자"))
+            cat_code = _to_category_code(
+                item.get("항목코드") or item.get("category_code")
+            )
+            used_on = _safe_date(item.get("사용일자") or item.get("used_on"))
 
             if used_on is None or cat_code is None:
                 continue  # 필수 필드 누락 시 스킵
+
+            unit = extra.get("단위") or item.get("unit")
+            quantity = extra.get("수량") if extra.get("수량") is not None else item.get("quantity")
+            unit_price = extra.get("단가") if extra.get("단가") is not None else item.get("unit_price")
+            total_amount = item.get("금액") if item.get("금액") is not None else item.get("total_amount")
+            page_no = item.get("page_no") or 1
 
             cur.execute(sql, {
                 "usage_statement_id": usage_statement_id,
                 "category_code":      cat_code,
                 "used_on":            used_on,
-                "item_name":          str(item.get("사용내역") or "")[:300],
-                "unit":               str(extra.get("단위") or "")[:50] or None,
-                "quantity":           float(extra.get("수량") or 0),
-                "unit_price":         float(extra.get("단가") or 0),
-                "total_amount":       int(item.get("금액") or 0),
-                "remark":             None,
-                "page_no":            int(item.get("page_no") or 1),
+                "item_name":          str(item.get("사용내역") or item.get("item_name") or "")[:300],
+                "unit":               str(unit or "")[:50] or None,
+                "quantity":           float(quantity) if quantity not in (None, "") else 0.0,
+                "unit_price":         float(unit_price) if unit_price not in (None, "") else 0.0,
+                "total_amount":       int(total_amount or 0),
+                "remark":             str(item.get("remark") or "")[:500] or None,
+                "page_no":            int(page_no),
             })
             row = cur.fetchone()
             line_id = item.get("line_id")
@@ -354,10 +354,6 @@ def insert_evidence_file_link(
     """
     매칭된 항목-파일 연결을 evidence_file_links에 INSERT한다.
     이미 존재하는 경우 무시한다.
-
-    [V7 변경] category_code 컬럼 제거됨.
-    category는 usage_statement_items JOIN으로 항상 정확히 얻을 수 있으므로
-    evidence_file_links에서 중복 보관하지 않는다.
     """
     sql = """
         INSERT INTO evidence_file_links
@@ -368,9 +364,9 @@ def insert_evidence_file_link(
     """
     with conn.cursor() as cur:
         cur.execute(sql, {
-            "item_id":            usage_statement_item_id,
-            "file_id":            file_id,
-            "evidence_type_code": evidence_type_code,
+            "item_id":             usage_statement_item_id,
+            "file_id":             file_id,
+            "evidence_type_code":  evidence_type_code,
         })
 
 
@@ -379,13 +375,14 @@ def insert_agent_log(
     project_id: int,
     usage_statement_id: int | None = None,
     details: dict | None = None,
+    *,
+    status_code: str = "running",
+    agent_type_code: str = "link",
+    model_name: str = "clova_ocr_v2",
+    run_id: str | None = None,
 ) -> int:
     """
     파이프라인 시작 시 agent_logs에 running 상태로 INSERT한다.
-
-    V1 agent_logs 컬럼: project_id, usage_statement_id, agent_type_code,
-                        status_code, details, model_name
-    (usage_statement_item_id / validation_type_code / severity_code 는 없음)
 
     Returns:
         생성된 agent_logs.id (완료/실패 시 update_agent_log_status에 전달)
@@ -394,13 +391,11 @@ def insert_agent_log(
 
     sql = """
         INSERT INTO agent_logs
-            (project_id, usage_statement_id,
-             status_code, agent_type_code,
-             details, model_name)
+            (project_id, usage_statement_id, agent_type_code,
+             status_code, details, model_name, run_id)
         VALUES
-            (%(project_id)s, %(usage_statement_id)s,
-             'running', 'link',
-             %(details)s::jsonb, 'clova_ocr_v2')
+            (%(project_id)s, %(usage_statement_id)s, %(agent_type_code)s,
+             %(status_code)s, %(details)s::jsonb, %(model_name)s, %(run_id)s::uuid)
         RETURNING id
     """
     with conn.cursor() as cur:
@@ -408,6 +403,10 @@ def insert_agent_log(
             "project_id":         project_id,
             "usage_statement_id": usage_statement_id,
             "details":            _json.dumps(details or {}, ensure_ascii=False),
+            "status_code":        status_code,
+            "agent_type_code":    agent_type_code,
+            "model_name":         model_name,
+            "run_id":             run_id,
         })
         row = cur.fetchone()
     return row[0]

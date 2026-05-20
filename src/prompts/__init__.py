@@ -1,3 +1,4 @@
+from .classifier_prompt import CLASSIFIER_CATEGORY_PROMPT
 from .shared_prompt import JUDGE_PROMPT, REWRITE_PROMPT
 from .validator_prompt import (
     AUDIT_REASON_SYNTHESIS_PROMPT,
@@ -13,6 +14,7 @@ __all__ = [
     "CATEGORY_REASON_APPROPRIATE_PROMPT",
     "CATEGORY_REASON_IMPROPER_PROMPT",
     "CATEGORY_REASON_REVIEW_PROMPT",
+    "CLASSIFIER_CATEGORY_PROMPT",
     "JUDGE_PROMPT",
     "REWRITE_PROMPT",
 ]
