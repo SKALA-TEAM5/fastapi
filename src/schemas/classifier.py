@@ -72,7 +72,9 @@ class UnifiedUsageStatementRow(_KoreanAliasModel):
     given_category_code: str | None = Field(
         default=None,
         alias="기존카테고리코드",
-        validation_alias=AliasChoices("기존카테고리코드", "given_category_code", "category_code"),
+        validation_alias=AliasChoices(
+            "기존카테고리코드", "given_category_code", "category_code"
+        ),
     )
     used_on: str | None = Field(
         default=None,
@@ -149,7 +151,9 @@ class UsageStatementRow(_KoreanAliasModel):
     )
     given_category_code: str = Field(
         alias="기존카테고리코드",
-        validation_alias=AliasChoices("기존카테고리코드", "given_category_code", "category_code"),
+        validation_alias=AliasChoices(
+            "기존카테고리코드", "given_category_code", "category_code"
+        ),
     )
     used_on: str | None = Field(
         default=None,
@@ -254,7 +258,9 @@ class ClassifiedUsageStatementRow(_KoreanAliasModel):
     )
     given_category_code: str = Field(
         alias="기존카테고리코드",
-        validation_alias=AliasChoices("기존카테고리코드", "given_category_code", "category_code"),
+        validation_alias=AliasChoices(
+            "기존카테고리코드", "given_category_code", "category_code"
+        ),
     )
     used_on: str | None = Field(
         default=None,
