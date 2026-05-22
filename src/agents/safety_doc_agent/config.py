@@ -9,17 +9,13 @@ from dotenv import load_dotenv
 
 @dataclass(slots=True)
 class Settings:
-    """CLI, 벡터 저장소, DB 시뮬레이션에서 함께 쓰는 실행 설정."""
+    """DB 기반 safety-doc-agent 실행 설정."""
 
     openai_api_key: str
     chat_model: str = "gpt-4.1-mini"
-    embedding_model: str = "text-embedding-3-small"
     langsmith_tracing: bool = False
     langsmith_project: str = ""
     langsmith_workspace_id: str = ""
-    qdrant_path: str = ".qdrant"
-    qdrant_url: str = ""
-    qdrant_api_key: str = ""
     db_host: str = "localhost"
     db_port: int = 5432
     db_name: str = "safety"
@@ -78,24 +74,12 @@ def load_settings() -> Settings:
     return Settings(
         openai_api_key=api_key,
         chat_model=os.getenv("OPENAI_CHAT_MODEL", "gpt-4.1-mini").strip(),
-        embedding_model=os.getenv("OPENAI_EMBEDDING_MODEL", "text-embedding-3-small").strip(),
         langsmith_tracing=os.getenv("LANGSMITH_TRACING", "").strip().lower() == "true",
         langsmith_project=os.getenv("LANGSMITH_PROJECT", "").strip(),
         langsmith_workspace_id=os.getenv("LANGSMITH_WORKSPACE_ID", "").strip(),
-        qdrant_path=os.getenv("QDRANT_PATH", ".qdrant").strip(),
-        qdrant_url=os.getenv("QDRANT_URL", "").strip(),
-        qdrant_api_key=os.getenv("QDRANT_API_KEY", "").strip(),
         db_host=os.getenv("POSTGRES_HOST", "localhost").strip(),
         db_port=int(os.getenv("POSTGRES_PORT", "5432").strip()),
         db_name=os.getenv("POSTGRES_DB", "safety").strip(),
         db_user=os.getenv("SERVICE_APP_USER", "safety_service_app").strip(),
         db_password=os.getenv("SERVICE_APP_PASSWORD", "safety_service_app_password").strip(),
     )
-
-
-def project_data_dir() -> Path:
-    """파싱된 가이드 결과를 저장할 로컬 데이터 폴더를 반환한다."""
-
-    data_dir = app_root_dir() / "data"
-    data_dir.mkdir(parents=True, exist_ok=True)
-    return data_dir

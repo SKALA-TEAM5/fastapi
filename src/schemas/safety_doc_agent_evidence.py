@@ -38,6 +38,7 @@ class EvidenceType:
 class EvidenceRequirement:
     """`service.evidence_requirements`의 active requirement 표현."""
 
+    id: int | None
     usage_statement_item_id: int
     evidence_type_code: str
     is_satisfied: bool
@@ -50,7 +51,6 @@ class EvidenceFileLink:
 
     usage_statement_item_id: int
     file_id: int
-    category_code: str
     evidence_type_code: str
 
 

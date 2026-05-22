@@ -80,16 +80,25 @@ class EvidenceRequirementService:
 
         result = self.infer_required_evidences(item_id)
         self.repository.replace_active_requirements(item_id, result.required_evidences)
-        self.repository.append_validation_log(
+        self.repository.append_agent_log(
             project_id=project_id,
             usage_statement_id=usage_statement_id,
             usage_statement_item_id=item_id,
-            validation_type_code="evidence_requirement_generation",
+            status_code="success",
             result_code="success",
+            reason="필수 증빙 요구사항 생성 완료",
             details=asdict(result),
             model_name=self.settings.chat_model,
+            token=_total_tokens(result.usage),
         )
         return result
+
+
+def _total_tokens(usage: dict[str, int] | None) -> int | None:
+    if not usage:
+        return None
+    total = usage.get("total_tokens")
+    return total if isinstance(total, int) else None
 
 def _parse_json_payload(response: object) -> dict:
     """Responses API 응답에서 JSON 객체만 안전하게 추출한다.
