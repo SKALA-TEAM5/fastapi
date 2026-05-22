@@ -15,25 +15,28 @@ DB rows
   -> ReportAgent
   -> ReportDraft JSON
   -> UI edit
+  -> DOCX export
 ```
 
-이 agent는 DB를 직접 조회하지 않습니다. FastAPI 또는 worker가 DB와 다른 agent 결과를 모아 `ReportContext`를 만든 뒤 호출해야 합니다.
+운영 흐름에서는 Spring Backend가 FastAPI의 report agent 엔드포인트를 호출합니다. FastAPI는 기존 DB 테이블에서 `ReportContext`를 조립한 뒤 `ReportAgent`를 실행하고, 결과 `ReportDraft` JSON을 반환합니다. CLI는 로컬 샘플 실행과 디버깅 용도로만 사용합니다.
 
 ## 코드 구성과 책임
 
 이 모듈은 역할별로 파일을 분리합니다. 보고서 판단과 문장 작성, JSON 입출력 책임을 명확히 나누는 것이 원칙입니다.
 
-| 파일                                        | 역할                                                                                                                                                                                               |
-| ------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `schemas.py`                              | 보고서 agent가 주고받는 데이터 구조를 정의합니다.`ReportContext`는 입력, `ReportDraft`는 화면 편집 및 렌더링용 출력입니다. classifier/validator 결과와 법령 citation 구조도 여기서 정의합니다. |
-| `context_builder.py`                      | DB row를 `ReportContext`로 조립하는 경계 예시입니다. 실제 DB 구현은 하지 않고, FastAPI나 worker가 구현해야 할 repository 인터페이스를 정의합니다.                                                |
-| `agent.py`                                | 보고서 초안을 만드는 핵심 파일입니다. 입력 데이터를 표, 이슈, 보완사항 구조로 바꾸고 classifier/validator 결과를 반영합니다. LLM 결과가 있으면 허용된 문장 필드만 병합합니다.                      |
-| `cli.py`                                  | `ReportContext` JSON 파일을 읽어 `ReportDraft` JSON 보고서 파일을 생성하는 로컬 실행 진입점입니다.                                                                                                  |
-| `llm.py`                                  | OpenAI API 호출 어댑터입니다. LLM에게 전체 보고서를 맡기지 않고 결론, 종합 의견, 필요 조치 같은 문장 필드만 JSON 패치로 요청합니다.                                                                |
-| `src/prompts/report_agent_system.md`      | LLM의 기본 역할과 금지사항을 정의합니다. 근거 없는 법령 생성, 금액/판정 변경을 금지합니다.                                                                                                         |
-| `src/prompts/report_agent_draft_template.md` | LLM에게 넘기는 작업 프롬프트입니다. 어떤 JSON 필드만 반환해야 하는지 정의합니다.                                                                                                                |
-| `templates/report_template.json`          | 웹 화면과 DOCX 추출기가 같은 보고서 형식을 재현할 수 있도록 섹션, 표, 반복 행 구조를 정의하는 구조 기반 JSON 템플릿입니다.                                                                        |
-| `examples/report_agent/sample_input.json` | 최소 샘플 `ReportContext`입니다. agent와 JSON 생성 CLI 동작 확인에 사용합니다.                                                                                                                     |
+| 파일                                           | 역할                                                                                                                                                                                               |
+| ---------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `schemas.py`                                 | 보고서 agent가 주고받는 데이터 구조를 정의합니다.`ReportContext`는 입력, `ReportDraft`는 화면 편집 및 렌더링용 출력입니다. classifier/validator 결과와 법령 citation 구조도 여기서 정의합니다. |
+| `context_builder.py`                         | DB row를 `ReportContext`로 조립하는 경계 예시입니다. 실제 DB 구현은 하지 않고, FastAPI나 worker가 구현해야 할 repository 인터페이스를 정의합니다.                                                |
+| `agent.py`                                   | 보고서 초안을 만드는 핵심 파일입니다. 입력 데이터를 표, 이슈, 보완사항 구조로 바꾸고 classifier/validator 결과를 반영합니다. LLM 결과가 있으면 허용된 문장 필드만 병합합니다.                      |
+| `cli.py`                                     | `ReportContext` JSON 파일을 읽어 `ReportDraft` JSON 보고서 파일을 생성하는 로컬 실행 진입점입니다.                                                                                             |
+| `llm.py`                                     | OpenAI API 호출 어댑터입니다. LLM에게 전체 보고서를 맡기지 않고 결론, 종합 의견, 필요 조치 같은 문장 필드만 JSON 패치로 요청합니다.                                                                |
+| `src/api/routers/report_agent.py`            | Spring Backend가 호출하는 `POST /api/v1/agents/report/run` FastAPI 엔드포인트입니다.                                                                                                             |
+| `src/repositories/report_repository.py`      | 기존 Postgres 테이블에서 보고서 입력 row를 읽어 `ReportContext` 조립에 사용할 저장소 구현입니다.                                                                                                 |
+| `src/prompts/report_agent_system.md`         | LLM의 기본 역할과 금지사항을 정의합니다. 근거 없는 법령 생성, 금액/판정 변경을 금지합니다.                                                                                                         |
+| `src/prompts/report_agent_draft_template.md` | LLM에게 넘기는 작업 프롬프트입니다. 어떤 JSON 필드만 반환해야 하는지 정의합니다.                                                                                                                   |
+| `templates/report_template.json`             | 웹 화면과 DOCX 추출기가 같은 보고서 형식을 재현할 수 있도록 섹션, 표, 반복 행 구조를 정의하는 구조 기반 JSON 템플릿입니다.                                                                         |
+| `examples/report_agent/sample_input.json`    | 최소 샘플 `ReportContext`입니다. agent와 JSON 생성 CLI 동작 확인에 사용합니다.                                                                                                                   |
 
 전체 흐름은 다음과 같습니다.
 
@@ -44,15 +47,89 @@ schemas.py
 context_builder.py
   DB row -> ReportContext
 
+repositories/report_repository.py
+  Postgres -> ReportContext input rows
+
 agent.py
   ReportContext -> ReportDraft
 
 llm.py
   ReportDraft의 문장 필드만 보강
 
+api/routers/report_agent.py
+  HTTP request -> ReportDraft JSON response
+
 cli.py
-  ReportContext JSON -> ReportDraft JSON 파일
+  ReportContext JSON -> ReportDraft JSON 파일 (로컬 실행용)
 ```
+
+## API 실행 흐름
+
+보고서 생성은 Spring Backend가 FastAPI를 호출하는 방식으로 실행합니다.
+
+```text
+Frontend
+  POST /projects/{projectId}/agents/report/run
+
+Spring Backend
+  권한 확인
+  runId 생성
+  FastAPI 호출
+
+FastAPI
+  POST /api/v1/agents/report/run
+  DB row -> ReportContext
+  ReportAgent.generate(context)
+  agent_logs 기록
+  ReportDraft JSON 반환
+
+Frontend
+  response.result.reportDraft를 편집 화면에 표시
+  /api/report-docx로 DOCX 추출
+```
+
+FastAPI 엔드포인트:
+
+```http
+POST /api/v1/agents/report/run
+```
+
+요청 예시:
+
+```json
+{
+  "run_id": "11111111-1111-1111-1111-111111111111",
+  "project_id": 1,
+  "usage_statement_id": 2008,
+  "report_written_date": "2026-05-22",
+  "report_period_label": "2026년 05월",
+  "reviewer": {
+    "name": "홍길동",
+    "department": "안전관리팀",
+    "title": "담당자"
+  }
+}
+```
+
+응답 예시:
+
+```json
+{
+  "run_id": "11111111-1111-1111-1111-111111111111",
+  "agent_type": "report",
+  "status": "completed",
+  "log_ids": [123],
+  "result": {
+    "reportDraft": {
+      "layout_version": "safety_cost_report_v1",
+      "report_no": "AR-20260522-1-2008",
+      "report_sections": []
+    }
+  }
+}
+```
+
+`context` 필드를 직접 전달하면 DB 조회 없이 `ReportContext`를 그대로 사용합니다. 이 경로는 테스트와 디버깅용입니다.
 
 ## 입력
 
@@ -68,6 +145,8 @@ cli.py
 - 조치 요청: `action_requests`
 - classifier 결과: `classification_result`
 - 법령 validator 결과: `legal_validation_result`
+
+생성된 report 실행 로그는 기존 `agent_logs`에 `agent_type_code = 'report'`로 기록합니다.
 
 집행 항목별 classifier/validator 결과는 `UsageStatementItemContext`에 붙입니다.
 
@@ -102,7 +181,7 @@ from src.agents.report_agent.agent import ReportAgent
 draft = ReportAgent().generate(context)
 ```
 
-기본 모델은 `gpt-5.2`이며, `OPENAI_REPORT_MODEL` 환경변수로 바꿀 수 있습니다.
+기본 모델은 `gpt-5.2-mini`이며, `OPENAI_REPORT_MODEL` 환경변수로 바꿀 수 있습니다.
 
 LLM이 수정할 수 있는 필드는 문장 필드로 제한됩니다.
 
@@ -153,9 +232,9 @@ LLM은 다음 필드를 바꿀 수 없습니다.
 
 프론트엔드에서는 `ReportDraft`를 편집 대상으로 두는 것이 권장됩니다. 사용자가 수정한 draft도 같은 JSON 구조로 저장합니다.
 
-## JSON 보고서 생성
+## 로컬 JSON 보고서 생성
 
-샘플 입력으로 JSON 보고서를 생성하려면 다음 명령을 사용합니다.
+CLI는 운영 호출 경로가 아니라 샘플 입력으로 agent 동작을 확인하는 로컬 실행 도구입니다. 샘플 입력으로 JSON 보고서를 생성하려면 다음 명령을 사용합니다.
 
 ```bash
 uv run python -m src.agents.report_agent.cli \

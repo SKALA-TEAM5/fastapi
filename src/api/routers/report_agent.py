@@ -1,0 +1,147 @@
+from __future__ import annotations
+
+"""보고서 생성 agent HTTP 라우터.
+
+Spring Backend가 호출하는 `/api/v1/agents/report/run` 엔드포인트를 제공하고,
+기존 DB row를 ReportContext로 조립한 뒤 ReportDraft JSON을 반환합니다.
+"""
+
+from datetime import date
+from typing import Any
+from uuid import UUID
+
+from fastapi import APIRouter, HTTPException, status
+from pydantic import BaseModel, Field
+
+from src.agents.report_agent.agent import ReportAgent
+from src.agents.report_agent.context_builder import build_report_context
+from src.agents.report_agent.llm import ReportLLMError
+from src.agents.report_agent.schemas import ReportContext, ReviewerContext
+from src.repositories.db import get_connection
+from src.repositories.report_repository import PostgresReportRepository, default_report_no
+from src.repositories.usage_statement_pipeline_repository import insert_agent_log, update_agent_log_status
+
+
+router = APIRouter(prefix="/agents/report", tags=["보고서 Agent"])
+
+
+class ReportAgentRunRequest(BaseModel):
+    run_id: UUID
+    project_id: int
+    usage_statement_id: int
+    report_no: str | None = None
+    report_written_date: date | None = None
+    report_period_label: str | None = None
+    reviewer: ReviewerContext | None = None
+    context: ReportContext | None = Field(
+        default=None,
+        description="DB repository 구현 전 또는 테스트에서 직접 전달하는 ReportContext.",
+    )
+
+
+class ReportAgentRunResponse(BaseModel):
+    run_id: UUID
+    agent_type: str = "report"
+    status: str
+    log_ids: list[int] = Field(default_factory=list)
+    result: dict[str, Any] = Field(default_factory=dict)
+
+
+@router.post(
+    "/run",
+    response_model=ReportAgentRunResponse,
+    status_code=status.HTTP_200_OK,
+    summary="보고서 Agent 실행",
+    description="""
+ReportContext를 ReportDraft JSON으로 변환합니다.
+
+현재 단계에서는 `context`를 직접 전달한 요청을 처리합니다.
+`project_id`와 `usage_statement_id`만으로 DB에서 ReportContext를 조립하는 경로는
+다음 단계에서 repository 구현과 함께 연결합니다.
+    """,
+)
+async def run_report_agent(request: ReportAgentRunRequest) -> ReportAgentRunResponse:
+    log_id: int | None = None
+    written_date = request.report_written_date or date.today()
+
+    try:
+        if request.context is None:
+            with get_connection() as conn:
+                repo = PostgresReportRepository(conn)
+                report_no = request.report_no or default_report_no(request.project_id, request.usage_statement_id, written_date)
+                context = build_report_context(
+                    repo,
+                    project_id=request.project_id,
+                    usage_statement_id=request.usage_statement_id,
+                    report_no=report_no,
+                    report_written_date=written_date,
+                    report_period_label=request.report_period_label or _default_period_label(repo.get_usage_statement(request.usage_statement_id)["report_month"]),
+                    reviewer=request.reviewer,
+                )
+                log_id = insert_agent_log(
+                    conn,
+                    project_id=request.project_id,
+                    usage_statement_id=request.usage_statement_id,
+                    details={"report_no": report_no},
+                    agent_type_code="report",
+                    model_name="report_agent",
+                    run_id=str(request.run_id),
+                )
+        else:
+            context = request.context
+
+        draft = ReportAgent().generate(context)
+
+        if log_id is not None:
+            with get_connection() as conn:
+                update_agent_log_status(
+                    conn,
+                    log_id=log_id,
+                    status_code="completed",
+                    details={
+                        "report_no": draft.report_no,
+                        "site_name": draft.site_name,
+                        "needs_human_review": draft.needs_human_review,
+                    },
+                )
+    except ReportLLMError as exc:
+        _mark_failed(log_id, str(exc))
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail=str(exc),
+        ) from exc
+    except KeyError as exc:
+        _mark_failed(log_id, str(exc))
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=str(exc),
+        ) from exc
+    except Exception as exc:
+        _mark_failed(log_id, f"{type(exc).__name__}: {exc}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"보고서 생성 실패: {type(exc).__name__}",
+        ) from exc
+
+    return ReportAgentRunResponse(
+        run_id=request.run_id,
+        status="completed",
+        log_ids=[log_id] if log_id is not None else [],
+        result={"reportDraft": draft.model_dump(mode="json")},
+    )
+
+
+def _default_period_label(report_month: date) -> str:
+    return f"{report_month:%Y년 %m월}"
+
+
+def _mark_failed(log_id: int | None, message: str) -> None:
+    if log_id is None:
+        return
+    with get_connection() as conn:
+        update_agent_log_status(
+            conn,
+            log_id=log_id,
+            status_code="failed",
+            details={"error": message},
+        )

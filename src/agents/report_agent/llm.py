@@ -14,7 +14,7 @@ from pathlib import Path
 from typing import Any
 
 
-DEFAULT_OPENAI_MODEL = "gpt-5.2"
+DEFAULT_OPENAI_MODEL = "gpt-5.2-mini"
 OPENAI_RESPONSES_URL = "https://api.openai.com/v1/responses"
 
 
