@@ -14,8 +14,8 @@ from src.repositories.safety_doc_agent_postgres_queries import (
     DEACTIVATE_ACTIVE_REQUIREMENTS,
     GET_EVIDENCE_REQUIREMENT_ITEM_CONTEXT,
     GET_EVIDENCE_REQUIREMENT_ITEM_CONTEXT_FALLBACK,
+    INSERT_AGENT_LOG,
     INSERT_REQUIREMENT,
-    INSERT_VALIDATION_LOG,
     LIST_ACTIVE_REQUIREMENTS,
     LIST_EVIDENCE_LINKS,
     LIST_EVIDENCE_TYPES,
@@ -100,36 +100,40 @@ class PostgresEvidenceRepository(EvidenceRepository):
             )
             conn.commit()
 
-    def append_validation_log(
+    def append_agent_log(
         self,
         *,
         project_id: int,
         usage_statement_id: int | None,
         usage_statement_item_id: int | None,
-        validation_type_code: str,
+        status_code: str,
         result_code: str,
+        reason: str,
         details: dict,
         model_name: str | None,
+        token: int | None,
     ) -> None:
         with self._connection() as conn, conn.cursor() as cur:
             cur.execute(
-                INSERT_VALIDATION_LOG,
+                INSERT_AGENT_LOG,
                 {
                     "project_id": project_id,
                     "usage_statement_id": usage_statement_id,
                     "usage_statement_item_id": usage_statement_item_id,
-                    "validation_type_code": validation_type_code,
+                    "status_code": status_code,
                     "result_code": result_code,
+                    "reason": reason,
                     "details": json.dumps(details, ensure_ascii=False),
                     "model_name": model_name,
+                    "token": token,
                 },
             )
             conn.commit()
 
     def apply_draft_views(self) -> None:
-        """`db/sql-drafts/ai_evidence_requirement_views.sql`을 현재 DB에 반영한다."""
+        """`db/migrations/V5__views.sql`의 safety-doc-agent 조회 뷰를 현재 DB에 반영한다."""
 
-        sql_path = app_root_dir().parent / "db" / "sql-drafts" / "ai_evidence_requirement_views.sql"
+        sql_path = app_root_dir().parent / "db" / "migrations" / "V5__views.sql"
         sql = sql_path.read_text(encoding="utf-8")
         with self._connection() as conn, conn.cursor() as cur:
             try:

@@ -111,11 +111,12 @@ INSERT INTO service.evidence_requirements
     (usage_statement_item_id, evidence_type_code, is_satisfied, is_active)
 VALUES
     (%(item_id)s, %(evidence_type_code)s, false, true)
-RETURNING usage_statement_item_id, evidence_type_code, is_satisfied, is_active
+RETURNING id, usage_statement_item_id, evidence_type_code, is_satisfied, is_active
 """
 
 LIST_ACTIVE_REQUIREMENTS = """
 SELECT
+    id,
     usage_statement_item_id,
     evidence_type_code,
     is_satisfied,
@@ -130,7 +131,6 @@ LIST_EVIDENCE_LINKS = """
 SELECT
     usage_statement_item_id,
     file_id,
-    category_code,
     evidence_type_code
 FROM service.evidence_file_links
 WHERE usage_statement_item_id = %(item_id)s
@@ -149,26 +149,32 @@ WHERE usage_statement_item_id = %(item_id)s
   AND is_active = true
 """
 
-INSERT_VALIDATION_LOG = """
-INSERT INTO service.validation_logs
+INSERT_AGENT_LOG = """
+INSERT INTO service.agent_logs
     (
         project_id,
         usage_statement_id,
         usage_statement_item_id,
-        validation_type_code,
+        agent_type_code,
+        status_code,
         result_code,
+        reason,
         details,
-        model_name
+        model_name,
+        token
     )
 VALUES
     (
         %(project_id)s,
         %(usage_statement_id)s,
         %(usage_statement_item_id)s,
-        %(validation_type_code)s,
+        'safety-doc',
+        %(status_code)s,
         %(result_code)s,
+        %(reason)s,
         %(details)s::jsonb,
-        %(model_name)s
+        %(model_name)s,
+        %(token)s
     )
 """
 

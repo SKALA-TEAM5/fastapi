@@ -47,15 +47,17 @@ class EvidenceRepository(Protocol):
     ) -> None:
         """제출된 증빙 코드 기준으로 active requirement 만족 여부를 갱신한다."""
 
-    def append_validation_log(
+    def append_agent_log(
         self,
         *,
         project_id: int,
         usage_statement_id: int | None,
         usage_statement_item_id: int | None,
-        validation_type_code: str,
+        status_code: str,
         result_code: str,
+        reason: str,
         details: dict,
         model_name: str | None,
+        token: int | None,
     ) -> None:
-        """`service.validation_logs`에 추적용 로그를 저장한다."""
+        """`service.agent_logs`에 safety-doc agent 실행 로그를 저장한다."""

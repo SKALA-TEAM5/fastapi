@@ -5,19 +5,18 @@
 
 ## 역할
 
-- 가이드 문서를 파싱하고 Qdrant에 인덱싱
 - 사용내역서 상세 항목별 필수 증빙자료 추론
 - Postgres의 증빙 연결 정보와 비교해 충족 여부 계산
-- 결과를 validation log와 requirement 형태로 저장
+- 결과를 `agent_logs`와 `evidence_requirements`에 저장
 
 ## 관련 파일
 
 - CLI: `src/agents/safety_doc_agent/cli.py`
 - 설정: `src/agents/safety_doc_agent/config.py`
-- 벡터 저장소: `src/agents/safety_doc_agent/vector_store.py`
 - 프롬프트: `src/prompts/safety_doc_agent_evidence_requirement_prompt.py`
 - 저장소: `src/repositories/safety_doc_agent_postgres_evidence_repository.py`
 - 스키마: `src/schemas/safety_doc_agent_evidence.py`
+- 참고자료 벡터 도구: `src/tools/safety_doc_reference_vector.py`
 - 서비스:
   `src/services/safety_doc_agent_evidence_requirement_service.py`
   `src/services/safety_doc_agent_evidence_check_service.py`
@@ -28,7 +27,6 @@
 - 패키지 관리: `uv`
 - 외부 서비스:
   - OpenAI API
-  - Qdrant
   - PostgreSQL
 
 설치 예시:
@@ -47,13 +45,9 @@ uv sync
 주요 설정:
 
 - `OPENAI_CHAT_MODEL`
-- `OPENAI_EMBEDDING_MODEL`
 - `LANGSMITH_TRACING`
 - `LANGSMITH_PROJECT`
 - `LANGSMITH_WORKSPACE_ID`
-- `QDRANT_PATH`
-- `QDRANT_URL`
-- `QDRANT_API_KEY`
 - `POSTGRES_HOST`
 - `POSTGRES_PORT`
 - `POSTGRES_DB`
@@ -61,6 +55,13 @@ uv sync
 - `SERVICE_APP_PASSWORD`
 
 기본값은 `src/agents/safety_doc_agent/config.py`에서 확인할 수 있습니다.
+
+참고자료 벡터 도구를 사용할 때만 추가로 사용합니다.
+
+- `OPENAI_EMBEDDING_MODEL`
+- `SAFETY_DOC_QDRANT_PATH`
+- `SAFETY_DOC_QDRANT_URL`
+- `SAFETY_DOC_QDRANT_API_KEY`
 
 ## 명령어
 
@@ -70,35 +71,19 @@ uv sync
 uv run safety-doc-agent --help
 ```
 
-### 1. 가이드 인덱싱
-
-가이드 마크다운을 파싱한 뒤 Qdrant 컬렉션에 적재합니다.
-
-```bash
-uv run safety-doc-agent ingest \
-  --guide '/path/to/safety-guide.md' \
-  --collection local_safety_doc_agent_guide
-```
-
-이 명령은 다음을 수행합니다.
-
-- 가이드 마크다운 파싱
-- `data/parsed_guide.json` 생성
-- Qdrant 컬렉션에 청크 임베딩 저장
-
-### 2. DB 기반 증빙 판단 실행
+### DB 기반 증빙 판단 실행
 
 로컬 Postgres에서 사용내역서 항목과 연결된 증빙 정보를 읽어,
 필수 증빙 추론과 충족 여부 계산을 수행합니다.
 
 ```bash
-uv run safety-doc-agent run-db-flow --item-id 1
+uv run safety-doc-agent check-missing-evidence --item-id 1
 ```
 
 저장 없이 입력과 출력만 확인하려면:
 
 ```bash
-uv run safety-doc-agent run-db-flow --item-id 1 --dry-run
+uv run safety-doc-agent check-missing-evidence --item-id 1 --dry-run
 ```
 
 출력에는 아래 정보가 포함됩니다.
@@ -114,12 +99,48 @@ uv run safety-doc-agent run-db-flow --item-id 1 --dry-run
 
 1. Postgres에서 대상 사용내역서 항목과 증빙 타입 목록을 조회합니다.
 2. 항목 정보를 바탕으로 OpenAI에 필수 증빙자료를 추론 요청합니다.
-3. 추론 결과를 active requirement 형태로 저장합니다.
+3. 추론 결과를 `service.evidence_requirements`의 active requirement 형태로 저장합니다.
 4. 연결된 증빙 파일과 비교해 충족 여부를 계산합니다.
-5. 결과를 validation log와 함께 후속 검토에 활용합니다.
+5. 결과를 `service.agent_logs`에 `agent_type_code = 'safety-doc'`로 기록합니다.
+
+`agent_logs.result_code`는 누락 증빙이 없으면 `success`, 누락 증빙이 있으면 후속 확인이 필요하다는 의미의 `hil`로 저장합니다.
+
+## 오케스트레이션 연동
+
+오케스트레이터에서는 CLI를 subprocess로 호출하지 않고 함수형 진입점을 직접 호출합니다.
+
+```python
+from src.agents.safety_doc_agent.agent import check_missing_evidence
+
+result = check_missing_evidence(item_id=1)
+```
+
+저장 없이 AI 입력/출력만 확인하려면:
+
+```python
+result = check_missing_evidence(item_id=1, dry_run=True)
+```
+
+테스트나 별도 worker에서는 `settings`, `repository`, `openai_client`를 주입해 같은 흐름을 재사용할 수 있습니다.
+
+## 참고자료 벡터 도구
+
+증빙 판단 agent의 DB 실행 경로와 분리된 Qdrant 참고자료 도구입니다.
+가이드나 내부 기준 문서를 벡터DB로 추출해 두고, 프롬프트/룰 개선이나 디버깅 시 검색할 수 있습니다.
+
+```bash
+uv run python -m tools.safety_doc_reference_vector build \
+  --source '/path/to/safety-guide.md' \
+  --collection safety_doc_reference
+```
+
+```bash
+uv run python -m tools.safety_doc_reference_vector search \
+  --collection safety_doc_reference \
+  --query '안전난간 설치 사진과 거래명세서 필요 여부'
+```
 
 ## 참고
 
 - 현재 흐름은 `DB view 기반 입력 + OpenAI 판단 + evidence requirement 저장/검증` 기준입니다.
-- Qdrant는 원격 서버 모드와 로컬 파일 모드를 모두 지원합니다.
-- 실제 배포 전에는 DB 계정 권한과 Qdrant 컬렉션명을 환경별로 분리하는 것을 권장합니다.
+- 실제 배포 전에는 DB 계정 권한을 환경별로 분리하는 것을 권장합니다.
