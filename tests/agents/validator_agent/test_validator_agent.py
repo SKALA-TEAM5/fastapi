@@ -246,10 +246,11 @@ def run_evaluation(
                 for j in cat_result.items:
                     icon = "O" if j.allowed else "X"
                     src_tag = {
-                        "rdb": "[RDB]",
-                        "llm_fallback": "[LLM]",
-                        "corpus_fallback": "[RAG]",
-                        "profile_fallback": "[PRF]",
+                        "law_rule":       "[RDB]",   # DB 법령 원문 직접 매칭
+                        "qa_rule":        "[RDB]",   # DB Q&A 기반 매칭
+                        "corpus_fallback":"[RAG]",   # Qdrant 코퍼스 보조
+                        "llm_fallback":   "[LLM]",   # LLM fallback 판단
+                        "profile_fallback":"[PRF]",  # (구버전) 프로필 fallback
                     }.get(j.judgment_source, "[???]")
                     print(f"    [{icon}]{src_tag} {j.item:20s}  {j.reasoning[:80]}...")
 

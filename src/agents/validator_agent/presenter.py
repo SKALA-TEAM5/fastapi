@@ -7,10 +7,9 @@
 # 1. summarize_audit_response()      : 카테고리별 감사 결과 요약 생성
 # 2. to_validator_response()         : 전체 감사 응답 DTO 변환
 # 3. _build_sources()                : 출처 목록(법령·규정) 구성
-# 4. _synthesize_reason_with_llm()   : LLM을 이용한 감사 사유 텍스트 합성
-# 5. _build_reason()                 : 최종 감사 사유 문자열 조립
-# 6. _classify_reason_code()         : reason_code 분류 로직
-# 7. _derive_reasoning_summary_for_law() : 법령별 출처 요지 추출
+# 4. _build_reason()                 : 항목별 구조화 사유 텍스트 조립 (LLM 없음)
+# 5. _item_reason_snippet()          : reasoning 첫 문장 추출 (대괄호 제거)
+# 6. _derive_reasoning_summary_for_law() : 법령별 출처 요지 추출
 # --------------------------------------------------------------------------
 from __future__ import annotations
 
@@ -37,8 +36,8 @@ from src.schemas.validator import (
 
 _PROGRESS_RULE_LAW = "별표 3 공사진척에 따른 산업안전보건관리비 사용기준"
 _REGULATION_NAME = "「건설업 산업안전보건관리비 계상 및 사용기준」"
-_SCHEDULE_2_REF = f"{_REGULATION_NAME} [별표 2]"
-_SCHEDULE_3_REF = f"{_REGULATION_NAME} [별표 3]"
+_SCHEDULE_2_REF = f"{_REGULATION_NAME} 별표 2"
+_SCHEDULE_3_REF = f"{_REGULATION_NAME} 별표 3"
 _DUPLICATE_REVIEW_KEYWORDS = ("중복", "이중", "이중계상", "타 비용", "환경관리비", "공사비", "기포함", "동일 목적")
 
 # ── Reason-code templates ─────────────────────────────────────────────────────
@@ -175,13 +174,13 @@ def _build_sources(*, category_name: str, category_code: str, result, base_amoun
             if limit_pct_str not in summary:
                 summary = f"{category_name}의 집행액은 산업안전보건관리비 총액의 {limit_pct_str} 이내로 제한됩니다."
         if summary:
-            sources.append(AuditSourceSummary(law=law, summary=summary))
+            sources.append(AuditSourceSummary(law=_qualify_law_for_display(law), summary=summary))
             seen_law_keys.add(law_key)
 
     if not sources and ordered_laws:
         sources.append(
             AuditSourceSummary(
-                law=ordered_laws[0],
+                law=_qualify_law_for_display(ordered_laws[0]),
                 summary=f"{category_name} 판정의 근거 조항입니다.",
             )
         )
@@ -306,94 +305,106 @@ def _synthesize_reason_with_llm(
     return text
 
 
-def _build_reason(*, category_name: str, category_code: str, result, base_amount: float, sources: list[AuditSourceSummary]) -> str:
-    # ── 1차: 전문 감사 의견 합성 (AUDIT_REASON_SYNTHESIS_PROMPT) ──────────────
-    synthesis = _synthesize_reason_with_llm(
+def _item_reason_snippet(reasoning: str) -> str:
+    """
+    reasoning에서 의미 있는 첫 문장을 최대 100자로 반환한다.
+    - DB raw 포맷 prefix 제거 ('사 역 가.', '1)' 등)
+    - 대괄호 내용 제거
+    - 마침표 기준 첫 문장, 없으면 100자 자름
+    """
+    text = " ".join((reasoning or "").split()).strip()
+    if not text:
+        return ""
+    text = _clean_db_raw_text(text)
+    if not text:
+        return ""
+    # 대괄호 제거 (예: [LEGAL_CITE:...], [허용] 등)
+    text = re.sub(r"\[[^\]]*\]", "", text).strip()
+    if not text:
+        return ""
+    # 첫 문장 (마침표/느낌표/물음표 기준)
+    m = re.search(r"[.!?]", text)
+    if m and m.start() <= 100:
+        return text[: m.start()].strip()
+    return text[:100].rstrip(" ,.")
+
+
+def _build_reason(
+    *,
+    category_name: str,
+    category_code: str,
+    result,
+    base_amount: float,
+    sources: list[AuditSourceSummary],
+) -> str:
+    """
+    LLM으로 전문 감사 의견 사유를 생성한다.
+    LLM 실패 시 구조화된 텍스트를 폴백으로 반환한다.
+    """
+    # ── LLM 합성 우선 시도 ──────────────────────────────────────────────────
+    llm_reason = _synthesize_reason_with_llm(
         category_name=category_name,
         result=result,
         base_amount=base_amount,
         sources=sources,
-    )
-    if synthesis:
-        return _normalize_reason_output(synthesis)
-
-    # ── 폴백: 기존 경로 (reason_code 기반 LLM → 템플릿) ─────────────────────
-    disallowed_items = [item.item for item in result.items if not item.allowed]
-    allowed_items = [item.item for item in result.items if item.allowed]
-    exception_texts = _collect_exception_summaries(result, allowed=None)
-
-    reason_code = _classify_reason_code(
-        result=result,
-        disallowed_items=disallowed_items,
-        allowed_items=allowed_items,
-        exception_texts=exception_texts,
-    )
-    primary_law = sources[0].law if sources else ""
-    law_ref = _format_law_reference(primary_law)
-    law_basis = _compose_reason_law_basis(
-        reason_code=reason_code,
-        sources=sources,
-        primary_law=primary_law,
-        law_ref=law_ref,
-        category_name=category_name,
-        result=result,
-    )
-    if reason_code == "improper_mixed_items":
-        return _normalize_reason_output(_build_emergency_reason_fallback(
-            reason_code=reason_code,
-            result=result,
-            category_name=category_name,
-            law_basis=law_basis,
-            disallowed_items=disallowed_items,
-            allowed_items=allowed_items,
-        ))
-    llm_reason = _generate_reason_with_llm(
-        reason_code=reason_code,
-        result=result,
-        base_amount=base_amount,
-        category_name=category_name,
-        law_basis=law_basis,
-        sources=sources,
-        disallowed_items=disallowed_items,
-        allowed_items=allowed_items,
     )
     if llm_reason:
-        return _normalize_reason_output(llm_reason)
+        return llm_reason
 
-    return _normalize_reason_output(_build_emergency_reason_fallback(
-        reason_code=reason_code,
-        result=result,
-        category_name=category_name,
-        law_basis=law_basis,
-        disallowed_items=disallowed_items,
-        allowed_items=allowed_items,
-    ))
+    # ── 폴백: 구조화 텍스트 직접 생성 ──────────────────────────────────────
+    lines: list[str] = []
+    for item in result.items:
+        verdict  = "집행 가능" if item.allowed else "집행 불가"
+        # RDB 직접 매칭(law_rule / qa_rule)은 reasoning이 raw 법령 텍스트 —
+        # snippet으로 잘라내면 단어 중간 절단 or 의미없는 조각이 되므로 스킵.
+        # LLM이 생성한 자연어 reasoning(llm_fallback 등)만 snippet으로 표시한다.
+        is_rdb_source = getattr(item, "judgment_source", "") in ("law_rule", "qa_rule")
+        snippet  = "" if is_rdb_source else _item_reason_snippet(item.reasoning)
+        law_raw  = item.referenced_laws[0] if item.referenced_laws else ""
+        law      = _qualify_law_for_display(law_raw) if law_raw else ""
+
+        if snippet and law:
+            lines.append(f"{item.item} ({item.amount:,.0f}원): {verdict} — {snippet} ({law})")
+        elif snippet:
+            lines.append(f"{item.item} ({item.amount:,.0f}원): {verdict} — {snippet}")
+        elif law:
+            lines.append(f"{item.item} ({item.amount:,.0f}원): {verdict} ({law})")
+        else:
+            lines.append(f"{item.item} ({item.amount:,.0f}원): {verdict}")
+
+    body = "\n".join(lines)
+
+    # ── 카테고리 수준 수치 부가 ────────────────────────────────────────────────
+    notes: list[str] = []
+    if result.exceeded and result.limit is not None:
+        exceeded_amount = max(0.0, result.total - result.limit)
+        notes.append(f"한도 {result.limit:,.0f}원 초과 {exceeded_amount:,.0f}원")
+    if result.usage_shortfall_amount and result.usage_shortfall_amount > 0:
+        req = getattr(result, "required_used_amount", None)
+        if req is not None:
+            notes.append(
+                f"공정률 {result.progress_rate:.1f}% 기준 최소 {req:,.0f}원 대비 "
+                f"{result.usage_shortfall_amount:,.0f}원 부족"
+            )
+        else:
+            notes.append(f"공정률 기준 {result.usage_shortfall_amount:,.0f}원 부족")
+
+    if notes:
+        body = body + "\n" + " | ".join(notes)
+
+    # bare 조항에 법령명 prefix 추가
+    return _qualify_law_refs_in_reason(body)
 
 
 def _classify_reason_code(*, result, disallowed_items: list[str], allowed_items: list[str], exception_texts: list[str]) -> str:
-    rejection = (result.rejection_reason or "").strip()
     if result.status == "부적절" and result.exceeded and result.limit is not None:
         return "improper_limit_exceeded"
+    if result.status == "부적절" and result.required_usage_rate is not None and result.usage_shortfall_amount is not None:
+        return "improper_progress_shortfall"
     if result.status == "부적절" and disallowed_items:
         return "improper_mixed_items" if allowed_items else "improper_scope_exclusion"
-    if result.status == "검토필요" and result.required_usage_rate is not None and result.usage_shortfall_amount is not None:
-        return "review_progress_shortfall"
-    if result.status == "검토필요" and any(keyword in rejection for keyword in _DUPLICATE_REVIEW_KEYWORDS):
-        return "review_duplicate_cost_risk"
-    if result.status == "검토필요" and (
-        exception_texts
-        or "충돌" in rejection
-        or "예외 조건" in rejection
-    ):
-        return "review_exception_or_conflict"
-    if result.status == "검토필요" and (
-        "직접적인 허용 근거가 충분히 확인되지 않은 항목" in rejection
-        or "직접 근거 미확인" in rejection
-        or "허용 근거가 충분히 확인되지" in rejection
-    ):
-        return "review_insufficient_basis"
-    if result.status == "검토필요":
-        return "review_insufficient_basis"
+    if result.status == "부적절":
+        return "improper_scope_exclusion"
     if result.status == "적절" and result.required_usage_rate is not None:
         return "appropriate_progress_compliant"
     return "appropriate_compliant"
@@ -447,7 +458,7 @@ def _compose_reason_law_basis(
             return manual_limit_basis
         if limit_basis:
             return limit_basis
-    if reason_code in ("review_progress_shortfall", "appropriate_progress_compliant"):
+    if reason_code in ("improper_progress_shortfall", "appropriate_progress_compliant"):
         progress_basis = _compose_selected_law_basis(
             sources=sources,
             preferred_laws=(_SCHEDULE_3_REF, "별표 3"),
@@ -659,9 +670,9 @@ def _format_law_label(law: str) -> str:
     if cleaned.startswith(_REGULATION_NAME):
         cleaned = cleaned[len(_REGULATION_NAME):].strip()
     if cleaned in {_PROGRESS_RULE_LAW, _SCHEDULE_3_REF} or cleaned.startswith("별표 3"):
-        return "[별표 3]"
+        return "별표 3"
     if cleaned.startswith("별표 2"):
-        return "[별표 2]"
+        return "별표 2"
     return cleaned
 
 
@@ -811,6 +822,52 @@ def _law_key(law: str) -> str:
     return cleaned
 
 
+def _qualify_law_for_display(law: str) -> str:
+    """
+    출처(조항) 표시용 법령명 완전 표기.
+
+    - 이미 법령명이 포함된 경우: 그대로 반환
+    - 별표 2 / 별표 3: 고시명 + 별표 번호로 반환
+    - bare 제X조 (고시 조항): 고시명 prefix 추가
+      * 제1조~제15조 → 「건설업 산안비 계상 및 사용기준」 조항
+      * 제29조 이상 큰 번호 → 산업안전보건법 조항일 가능성이 높으므로 그대로
+    - ','로 묶인 복수 조항: 각각 처리
+    """
+    import re
+
+    cleaned = (law or "").strip()
+    if not cleaned:
+        return cleaned
+
+    # 여러 조항이 콤마로 묶인 경우
+    if re.search(r",\s*제\d+조", cleaned):
+        parts = [p.strip() for p in re.split(r",\s*", cleaned)]
+        return ", ".join(_qualify_law_for_display(p) for p in parts if p)
+
+    # 이미 법령명 포함
+    if cleaned.startswith("「") or cleaned.startswith(_REGULATION_NAME):
+        return cleaned
+    if any(kw in cleaned for kw in ("산업안전보건법", "건설기술진흥법", "건설업 산업안전")):
+        return cleaned
+
+    # 별표
+    if cleaned in {_PROGRESS_RULE_LAW, _SCHEDULE_3_REF} or cleaned.startswith("별표 3"):
+        return _SCHEDULE_3_REF
+    if cleaned.startswith("별표 2"):
+        return _SCHEDULE_2_REF
+
+    # bare 조항 → 고시 조항 번호(제1조~제15조)는 고시명 prefix 추가
+    m = re.match(r"제(\d+)조", cleaned)
+    if m:
+        article_num = int(m.group(1))
+        if article_num <= 15:
+            return f"{_REGULATION_NAME} {cleaned}"
+        # 제16조 이상은 다른 법령 조항일 수 있으므로 그대로
+        return cleaned
+
+    return cleaned
+
+
 def _collect_exception_summaries(result, *, allowed: bool | None) -> list[str]:
     seen: list[str] = []
     for item in result.items:
@@ -871,6 +928,31 @@ def _normalize_law_refs(law: str) -> list[str]:
     cleaned = " ".join((law or "").split()).strip()
     if not cleaned:
         return []
+
+    _ws = re.compile(r"\s+")
+
+    # ── 1순위: 「법령명」 제X조 → 법령명 포함 그대로 보존 ─────────────────────
+    bracket_pat = re.compile(r"「([^」]+)」\s*(제\d+조(?:제\d+항(?:제\d+호)?)?)")
+    bracket_hits = [
+        f"「{m.group(1).strip()}」 {_ws.sub('', m.group(2))}"
+        for m in bracket_pat.finditer(cleaned)
+    ]
+    if bracket_hits:
+        return bracket_hits
+
+    # ── 2순위: 법령명(한글) + 제X조 → 법령명 포함 그대로 보존 ─────────────────
+    #   예: "산업안전보건법 시행령 제74조", "건설기술진흥법 제62조의3"
+    named_pat = re.compile(
+        r"([가-힣ㆍ·\s]+(?:법|령|규칙|지침)(?:\s+시행령|\s+시행규칙)?)"
+        r"\s+(제\d+조(?:의\d+)?(?:제\d+항(?:제\d+호)?)?)"
+    )
+    named_hits = [
+        f"{m.group(1).strip()} {_ws.sub('', m.group(2))}"
+        for m in named_pat.finditer(cleaned)
+    ]
+    if named_hits:
+        return named_hits
+
     refs = _extract_law_mentions(cleaned)
     if refs:
         return refs
@@ -1380,6 +1462,7 @@ def _normalize_reason_output(text: str) -> str:
     cleaned = cleaned.replace("바랍니다..", "바랍니다.")
     cleaned = _dedupe_reason_sentences(cleaned)
     cleaned = _trim_redundant_review_closer(cleaned)
+    cleaned = _qualify_law_refs_in_reason(cleaned)
     return cleaned.strip()
 
 
@@ -1434,6 +1517,49 @@ def _is_redundant_reason_sentence(current: str, existing: str) -> bool:
     overlap = len(current_tokens & existing_tokens)
     ratio = overlap / min(len(current_tokens), len(existing_tokens))
     return ratio >= 0.8
+
+
+def _qualify_law_refs_in_reason(text: str) -> str:
+    """
+    사유(reason) 텍스트 내 bare 고시 조항(제1조~제15조)에 고시명 prefix를 추가한다.
+
+    이미 법령명이 붙어 있는 패턴(「…」 제X조 / 한글법령명 제X조)은 건드리지 않는다.
+    산업안전보건법(제29조~), 건설기술진흥법(제62조~) 등 큰 번호 조항도 건드리지 않는다.
+
+    예:
+      "제7조제1항제2호에 따라" → "「건설업 산업안전보건관리비 계상 및 사용기준」 제7조제1항제2호에 따라"
+      "산업안전보건법 시행령 제74조" → 그대로 (이미 법령명 포함)
+    """
+    if not text:
+        return text
+
+    # ── 이미 법령명이 있는 패턴 위치 마킹 (이 범위 내 bare 조항은 건드리지 않는다) ──
+    _qualified_pat = re.compile(
+        r"(?:「[^」]+」|[가-힣ㆍ·]+(?:법|령|규칙|기준|지침)(?:\s+시행령|\s+시행규칙)?)"
+        r"\s*제\d+조(?:의\d+)?(?:제\d+항(?:제\d+호)?)?"
+    )
+    covered: list[tuple[int, int]] = [
+        (m.start(), m.end()) for m in _qualified_pat.finditer(text)
+    ]
+
+    def _is_covered(start: int) -> bool:
+        return any(s <= start < e for s, e in covered)
+
+    # ── bare 조항 치환 ──────────────────────────────────────────────────────────
+    _bare_pat = re.compile(r"제(\d+)조(?:의\d+)?(?:제\d+항(?:제\d+호)?)?")
+    result: list[str] = []
+    prev = 0
+    for m in _bare_pat.finditer(text):
+        if _is_covered(m.start()):
+            continue  # 이미 법령명 포함 — 건드리지 않음
+        article_num = int(m.group(1))
+        if article_num > 15:
+            continue  # 고시 조항이 아닌 것으로 간주 (산안보건법 등)
+        result.append(text[prev:m.start()])
+        result.append(f"{_REGULATION_NAME} {m.group(0)}")
+        prev = m.end()
+    result.append(text[prev:])
+    return "".join(result)
 
 
 def _trim_redundant_review_closer(text: str) -> str:

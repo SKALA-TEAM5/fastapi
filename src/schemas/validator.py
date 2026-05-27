@@ -18,7 +18,7 @@ from pydantic import BaseModel, ConfigDict, Field
 
 # ── Audit engine models ──────────────────────────────────────────────
 
-CategoryStatus = Literal["적절", "부적절", "검토필요"]
+CategoryStatus = Literal["적절", "부적절"]
 
 
 class _ItemJudgeLLMOutput(BaseModel):
@@ -55,11 +55,11 @@ class ItemJudgment(BaseModel):
     needs_human_review: bool = Field(default=False)
     review_reason: str = Field(default="")
     exception_summary: str = Field(default="")
-    judgment_source: str = Field(default="", description="판정 소스 (rdb | llm_fallback | corpus_fallback | profile_fallback | none)")
+    judgment_source: str = Field(default="", description="판정 소스 (law_rule | qa_rule | corpus_fallback | llm_fallback | profile_fallback | none)")
 
 
 class CategoryAuditResult(BaseModel):
-    status: CategoryStatus = Field(description="적절 | 부적절 | 검토필요")
+    status: CategoryStatus = Field(description="적절 | 부적절")
     total: float = Field(description="카테고리 집행 합계 (원)")
     limit: Optional[float] = Field(default=None, description="법령상 한도액 (원)")
     exceeded: bool = Field(description="한도 초과 여부")
