@@ -133,10 +133,10 @@ class LegalRulesRepository:
             with conn.cursor(row_factory=dict_row) as cur:
                 cur.execute("""
                     SELECT
-                        master_id, source_id, rule_type, category_code, category_name,
-                        item_key AS keyword, item_pattern, body AS rule_text,
+                        id, source_name, rule_type, category_code, category_name,
+                        keyword, item_pattern, body AS rule_text,
                         legal_basis, allowed, limit_pct, cited_laws, keywords, metadata
-                    FROM legal_rag.legal_rule_master
+                    FROM legal_rag.legal_master
                     WHERE record_type = 'rule'
                 """)
                 rows = cur.fetchall()
@@ -144,19 +144,19 @@ class LegalRulesRepository:
         rules = []
         for row in rows:
             r = dict(row)
+            # id 필드를 source_id 키로도 노출 (기존 스코어링 코드 호환)
+            r["source_id"] = r.get("id", "")
             r["cited_laws"] = list(r.get("cited_laws") or [])
-            r["keywords"] = list(r.get("keywords") or [])
+            r["keywords"]   = list(r.get("keywords") or [])
             metadata = dict(r.get("metadata") or {})
             r["metadata"] = metadata
-            # V2 매핑 이전 원본 rule_type 복원 (스코어링 로직 유지)
-            # original_rule_type이 있으면 그것을 우선 사용
-            # 없으면 source_kind로 qa/heuristic 계열 추정
+            # original_rule_type이 있으면 우선 사용 (qa/heuristic 계열 복원)
             original_rule_type = metadata.get("original_rule_type")
             if original_rule_type:
                 r["rule_type"] = original_rule_type
             else:
                 source_kind = metadata.get("source_kind", "")
-                current_rt = r.get("rule_type", "")
+                current_rt  = r.get("rule_type", "")
                 if source_kind == "qa" and current_rt in {"allowed", "disallowed", "limit"}:
                     r["rule_type"] = f"qa_{current_rt}"
                 elif source_kind == "heuristic" and current_rt in {"allowed", "disallowed", "limit"}:
@@ -459,10 +459,11 @@ class LegalRulesRepository:
                 cur.execute(
                     """
                     SELECT body
-                    FROM legal_rag.legal_corpus
-                    WHERE body LIKE '%공정율%'
+                    FROM legal_rag.legal_master
+                    WHERE record_type = 'corpus'
+                      AND body LIKE '%공정율%'
                       AND body LIKE '%사용기준%'
-                    ORDER BY corpus_id
+                    ORDER BY id
                     LIMIT 20
                     """
                 )

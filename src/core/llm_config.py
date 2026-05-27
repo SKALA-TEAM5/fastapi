@@ -18,9 +18,10 @@ from langchain_openai import ChatOpenAI
 
 _llm: BaseChatModel | None = None
 _lock = Lock()
-_DEFAULT_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
 
-load_dotenv()
+load_dotenv()  # .env 먼저 로드해야 OPENAI_MODEL 등 환경변수가 반영됨
+
+_DEFAULT_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
 
 
 def configure(llm: BaseChatModel) -> None:

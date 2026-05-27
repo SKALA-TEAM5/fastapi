@@ -11,7 +11,12 @@
 # --------------------------------------------------------------------------
 from __future__ import annotations
 
+import re
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
+
+# Qdrant 문서에 삽입된 내부 마커 — LLM 입력 및 응답에 유출되지 않도록 제거
+_LEGAL_CITE_RE = re.compile(r"\[LEGAL_CITE:[^\]]*\]\s*")
 
 from pydantic import BaseModel, Field
 
@@ -41,6 +46,7 @@ class ItemRuleBundle:
     matches: list[ValidatorRuleMatch]
     context_text: str
     item_exception_text: str = ""
+    judgment_tier: str = "rdb"  # "rdb" | "llm" — 항목 판정에 사용된 계층
 
     @property
     def top_allowed(self) -> ValidatorRuleMatch | None:
@@ -90,6 +96,23 @@ def _has_rdb_match(matches: list[ValidatorRuleMatch], category_code: str) -> boo
         m.match_source in _AUTHORITATIVE_SOURCES
         and m.score >= _RDB_MATCH_SCORE_THRESHOLD
         and m.category_code == category_code
+        for m in matches
+    )
+
+
+def _has_rdb_disallowed_match(matches: list[ValidatorRuleMatch], category_code: str) -> bool:
+    """
+    같은 카테고리 내에서 신뢰할 수 있는 DB 불허 규칙이 있는지 확인.
+
+    허용 방향 DB 규칙은 키워드 겹침으로 과매칭될 수 있어 LLM 재검증이 필요.
+    (예: '소화기 허용' 규칙이 '사무실 소화기'에도 매칭되는 케이스)
+    불허 방향 DB 규칙은 명시적 제외 근거이므로 LLM 없이도 신뢰 가능.
+    """
+    return any(
+        m.match_source in _AUTHORITATIVE_SOURCES
+        and m.score >= _RDB_MATCH_SCORE_THRESHOLD
+        and m.category_code == category_code
+        and m.allowed is False
         for m in matches
     )
 
@@ -154,6 +177,66 @@ def _llm_item_fallback(
     )
 
 
+def _process_single_item(
+    *,
+    item: "CategoryItemRow",
+    block: "CategoryInputBlock",
+    retrieved: "CategoryRetrievedContext",
+    rules_repo: "LegalRulesRepository",
+) -> ItemRuleBundle:
+    """
+    단일 항목에 대해 컨텍스트 구성 → RDB 매칭 → LLM fallback 을 수행한다.
+    ThreadPoolExecutor에서 병렬 호출된다.
+    """
+    docs = retrieved.item_docs.get(item.item_name) or []
+    context_parts = [doc.page_content for doc in (docs or retrieved.category_docs)]
+    raw_context = "\n\n---\n\n".join(context_parts)
+    # [LEGAL_CITE: ...] 내부 마커 제거 — LLM 입력 및 evidence_snippets 오염 방지
+    context_text = _LEGAL_CITE_RE.sub("", raw_context)
+    item_exception_text = _LEGAL_CITE_RE.sub(
+        "",
+        "\n\n---\n\n".join(
+            doc.page_content for doc in docs
+            if any(keyword in (doc.page_content or "") for keyword in ("단,", "다만", "제외", "불가"))
+        ),
+    )
+    matches = rules_repo.find_validator_matches(
+        category=block.category_name,
+        item_text=item.item_name,
+        retrieved_context=context_text,
+        limit=8,
+    )
+
+    # 계층 판단:
+    # 강한 불허 RDB 매칭 → LLM 스킵 (불허 규칙은 명시적·구체적, 과매칭 위험 낮음)
+    # 허용만 있거나 RDB 약함 → LLM fallback 호출
+    #   ↳ 허용 규칙은 키워드 겹침으로 과매칭 가능 ('소화기 허용' → '사무실 소화기' 오인식)
+    #   ↳ LLM이 항목명·맥락을 읽고 실제 허용 여부를 재검증함
+    if _has_rdb_disallowed_match(matches, block.category_code):
+        judgment_tier = "rdb"
+    else:
+        llm_match = _llm_item_fallback(
+            item_text=item.item_name,
+            category_name=block.category_name,
+            category_code=block.category_code,
+            retrieved_context=context_text,
+        )
+        if llm_match is not None:
+            if _has_rdb_match(matches, block.category_code):
+                matches = matches + [llm_match]   # RDB 있음 → LLM은 보조
+            else:
+                matches = [llm_match] + matches   # RDB 없음 → LLM이 주 판단
+        judgment_tier = "llm"
+
+    return ItemRuleBundle(
+        item=item,
+        matches=matches,
+        context_text=context_text,
+        item_exception_text=item_exception_text,
+        judgment_tier=judgment_tier,
+    )
+
+
 def match_category_rules(
     *,
     block: CategoryInputBlock,
@@ -164,45 +247,25 @@ def match_category_rules(
     limit_pct, limit_rule, limit_laws = rules_repo.find_category_limit(block.category_name)
     progress_required_rate, progress_rule_text, progress_laws = rules_repo.find_progress_requirement(block.progress_rate)
 
-    item_bundles: list[ItemRuleBundle] = []
-    for item in block.items:
-        docs = retrieved.item_docs.get(item.item_name) or []
-        context_parts = [doc.page_content for doc in (docs or retrieved.category_docs)]
-        context_text = "\n\n---\n\n".join(context_parts)
-        item_exception_text = "\n\n---\n\n".join(
-            doc.page_content for doc in docs
-            if any(keyword in (doc.page_content or "") for keyword in ("단,", "다만", "제외", "불가"))
-        )
-        matches = rules_repo.find_validator_matches(
-            category=block.category_name,
-            item_text=item.item_name,
-            retrieved_context=context_text,
-            limit=8,
-        )
+    # 항목별 병렬 처리 — LLM fallback 호출이 항목마다 독립적이므로 동시 실행 가능
+    # 항목 수에 비례하되 최대 5개 스레드로 제한 (Claude API rate limit 고려)
+    n_workers = min(max(len(block.items), 1), 5)
+    item_bundles: list[ItemRuleBundle] = [None] * len(block.items)  # type: ignore[list-item]
 
-        # LLM이 법령 맥락을 읽고 항상 판단
-        # RDB 강한 매칭 존재 → LLM은 보조로 뒤에 추가
-        # RDB 매칭 약함  → LLM이 주 판단, 최상단에 삽입
-        llm_match = _llm_item_fallback(
-            item_text=item.item_name,
-            category_name=block.category_name,
-            category_code=block.category_code,
-            retrieved_context=context_text,
-        )
-        if llm_match is not None:
-            if _has_rdb_match(matches, block.category_code):
-                matches = matches + [llm_match]
-            else:
-                matches = [llm_match] + matches
-
-        item_bundles.append(
-            ItemRuleBundle(
+    with ThreadPoolExecutor(max_workers=n_workers) as executor:
+        future_to_idx = {
+            executor.submit(
+                _process_single_item,
                 item=item,
-                matches=matches,
-                context_text=context_text,
-                item_exception_text=item_exception_text,
-            )
-        )
+                block=block,
+                retrieved=retrieved,
+                rules_repo=rules_repo,
+            ): idx
+            for idx, item in enumerate(block.items)
+        }
+        for future in as_completed(future_to_idx):
+            idx = future_to_idx[future]
+            item_bundles[idx] = future.result()
 
     return CategoryRuleBundle(
         category_code=block.category_code,

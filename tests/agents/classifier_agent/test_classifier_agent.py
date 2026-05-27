@@ -129,8 +129,14 @@ def run_evaluation(
                 f"    [{mark}][{review_mark}] 행 {row.row_id:<2} {row.item_name[:26]:<26} "
                 f"{row.decision_status:<8} 최종:{row.final_category_code}"
             )
-            if verbose and row.reason:
-                print(f"           사유: {row.reason}")
+            if verbose:
+                import re as _re
+                path_match = _re.search(r'\[([^\]]+)\]$', row.reason or "")
+                reason_text = _re.sub(r'\s*\[[^\]]+\]$', '', row.reason or "").strip()
+                if reason_text:
+                    print(f"           사유: {reason_text}")
+                if path_match:
+                    print(f"           경로: {path_match.group(1)}")
 
             result_records.append(
                 {

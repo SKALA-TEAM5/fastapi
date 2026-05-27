@@ -1,30 +1,26 @@
 # --------------------------------------------------------------------------
 # 작성자   : 송상민(ss19801)
 # 작성일   : 2026-05-04
+# 수정일   : 2026-05-26
 #
 # [ 주요 클래스 및 함수 정의 ]
 #
 # 1. CategoryRetrievedContext    : 카테고리 RAG 검색 결과 집계 데이터 클래스
 # 2. retrieve_category_context() : 카테고리 + 항목별 병렬 벡터 DB 검색
-# 3. expand_exception_context()  : 예외 조항 관련 추가 문서 검색
-# 4. _build_category_query()     : 카테고리 수준 검색 쿼리 생성
-# 5. _build_item_query()         : 항목 수준 검색 쿼리 생성
+# 3. _build_category_query()     : 카테고리 수준 검색 쿼리 생성 (한도/전체 규정 중심)
+# 4. _build_item_query()         : 항목 수준 검색 쿼리 생성
 # --------------------------------------------------------------------------
 from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor, as_completed
-import re
 from dataclasses import dataclass
 
 from langchain_core.documents import Document
 
 from src.agents.validator_agent.parser import CategoryInputBlock, CategoryItemRow
 from src.core.rag import MAX_RETRY, build_retriever, rerank, retrieve, rewrite_query
-from src.core.storage import DEFAULT_COLLECTION, load_collection_documents, load_vectorstore
+from src.core.storage import DEFAULT_COLLECTION, load_vectorstore
 from src.repositories import LegalRulesRepository
-
-_EXCEPTION_KEYWORDS = ("단,", "다만", "예외", "제외", "불가")
-_ARTICLE_PATTERN = re.compile(r"제\d+조(?:제\d+항)?(?:제\d+호)?|별표\s*\d+")
 
 
 @dataclass
@@ -58,7 +54,6 @@ def retrieve_category_context(
     category_docs = _retrieve_docs(question=category_query, retriever=retriever)
 
     item_docs: dict[str, list[Document]] = {}
-    seed_docs = list(category_docs)
     with ThreadPoolExecutor(max_workers=min(max(len(block.items), 1), 4)) as executor:
         futures = {
             executor.submit(
@@ -72,7 +67,6 @@ def retrieve_category_context(
             item_name = futures[future]
             docs = future.result()
             item_docs[item_name] = docs
-            seed_docs.extend(docs)
 
     # VectorDB 1차 검색 결과가 없는 항목 → 더 넓은 fallback query로 재시도
     for item in block.items:
@@ -81,57 +75,14 @@ def retrieve_category_context(
             fallback_docs = _retrieve_docs(question=fallback_query, retriever=retriever)
             if fallback_docs:
                 item_docs[item.item_name] = fallback_docs
-                seed_docs.extend(fallback_docs)
 
-    exception_docs = expand_exception_context(base_docs=seed_docs, collection=collection)
+    # expand_exception_context 제거 — Qdrant 전체 문서 전수 스캔으로 인한 성능 병목
+    # 예외/단서 조항은 항목별 Qdrant 검색 결과에 이미 포함되거나 LLM fallback에서 처리
     return CategoryRetrievedContext(
         category_docs=category_docs,
         item_docs=item_docs,
-        exception_docs=exception_docs,
+        exception_docs=[],
     )
-
-
-def expand_exception_context(*, base_docs: list[Document], collection: str) -> list[Document]:
-    if not base_docs:
-        return []
-
-    need_expand = any(
-        any(keyword in (doc.page_content or "") for keyword in _EXCEPTION_KEYWORDS)
-        for doc in base_docs
-    )
-    if not need_expand:
-        return []
-
-    heads = set()
-    preferred_sources = {
-        str(doc.metadata.get("source", "")).strip()
-        for doc in base_docs
-        if str(doc.metadata.get("source", "")).strip()
-    }
-    for doc in base_docs:
-        heads |= set(_ARTICLE_PATTERN.findall(doc.page_content or ""))
-    if not heads:
-        return []
-
-    expanded: list[Document] = []
-    seen: set[tuple[str, str]] = set()
-    per_head_count: dict[str, int] = {}
-    for doc in load_collection_documents(collection):
-        source = str(doc.metadata.get("source", "")).strip()
-        if preferred_sources and source and source not in preferred_sources:
-            continue
-        matched_heads = [head for head in heads if head in (doc.page_content or "")]
-        if not matched_heads:
-            continue
-        primary_head = matched_heads[0]
-        if per_head_count.get(primary_head, 0) >= 6:
-            continue
-        key = _doc_key(doc)
-        if key not in seen:
-            seen.add(key)
-            expanded.append(doc)
-            per_head_count[primary_head] = per_head_count.get(primary_head, 0) + 1
-    return expanded
 
 
 def _retrieve_docs(*, question: str, retriever) -> list[Document]:
@@ -164,19 +115,8 @@ def _build_category_query(block: CategoryInputBlock, *, repo: LegalRulesReposito
         evidence_terms.append(limit_rule)
     law_terms.extend(limit_laws)
 
-    for item in block.items[:3]:
-        prelim_matches = repo.find_validator_matches(
-            category=block.category_name,
-            item_text=item.item_name,
-            retrieved_context="",
-            limit=3,
-        )
-        for match in prelim_matches:
-            # allowed=True 규칙만 힌트로 — disallowed evidence가 쿼리 방향 왜곡 방지
-            if match.allowed is True:
-                law_terms.extend(match.referenced_laws)
-                if match.evidence:
-                    evidence_terms.append(match.evidence)
+    # items 루프 제거 — find_validator_matches는 항목별 쿼리(_build_item_query)에서 이미 호출됨
+    # 카테고리 쿼리는 한도/전체 규정 문서 검색에만 집중
 
     category_hint = ", ".join(dict.fromkeys(term.strip() for term in hint_terms if term and term.strip()))
     law_hint = ", ".join(dict.fromkeys(term.strip() for term in law_terms if term and term.strip()))

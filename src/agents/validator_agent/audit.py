@@ -52,6 +52,17 @@ _DUPLICATE_COST_KEYWORDS = (
     "타 법령",
 )
 
+# 조건부 제외 규칙 감지: 특정 조건에서만 불가하고 조건 충족 시 허용 가능한 규칙 패턴
+# 예) 안전관리자 인건비: "1) 전담 안 함 2) 미신고 3) 자격 미달 ※ 실제 선임·신고 시 사용 가능"
+_CONDITIONAL_EXCLUSION_PATTERNS = (
+    re.compile(r"[0-9]+\)\s"),          # "1) ...", "2) ..." 번호 목록 (조건 열거)
+    re.compile(r"사용할\s*수\s*있"),     # "사용할 수 있음" — 조건 내 예외 허용 문구
+    re.compile(r"경우에는\s*사용"),      # "경우에는 사용할"
+    re.compile(r"아니한\s*경우"),        # "하지 아니한 경우" (부정 조건)
+)
+# RDB 기반 출처만 조건부 제외 판정 대상 — LLM이 생성한 불허 판단은 확정 판단으로 취급
+_RDB_SOURCES = frozenset({"law_rule", "qa_rule"})
+
 
 class CategoryDecisionOutput(BaseModel):
     status: Literal["적절", "부적절", "검토필요"] = Field(description="카테고리 최종 판정")
@@ -72,13 +83,22 @@ def decide_category(
     ]
     referenced_laws = _collect_laws(rule_bundle=rule_bundle, computation=computation)
 
-    decision = _llm_decision(
-        block=block,
-        retrieved=retrieved,
-        rule_bundle=rule_bundle,
-        computation=computation,
-        law_candidates=referenced_laws,
+    # Tier 1 최적화: 전 항목이 RDB 강한 매칭으로 해결된 경우 LLM 판단 호출 생략.
+    # _resolve_final_status()와 _compose_category_reason() 모두 decision을 사용하지 않으며,
+    # final_laws에만 추가 조항이 보충되므로 생략해도 판정 결과에 영향 없음.
+    all_rdb = rule_bundle.items and all(
+        b.judgment_tier == "rdb" for b in rule_bundle.items
     )
+    if all_rdb:
+        decision = None
+    else:
+        decision = _llm_decision(
+            block=block,
+            retrieved=retrieved,
+            rule_bundle=rule_bundle,
+            computation=computation,
+            law_candidates=referenced_laws,
+        )
 
     status = _resolve_final_status(
         hard_status=hard_status,
@@ -168,68 +188,44 @@ def _hard_status(
     *,
     rule_bundle: CategoryRuleBundle,
     computation: CategoryComputation,
-) -> tuple[Literal["적절", "부적절", "검토필요"], str]:
+) -> tuple[Literal["적절", "부적절"], str]:
+    # 1. 한도 초과
     if computation.exceeded and computation.limit_amount is not None:
         return (
             "부적절",
             f"카테고리 한도 초과: {computation.total:,.0f}원 > {computation.limit_amount:,.0f}원",
         )
 
+    # 2. 명확한 불허 항목
+    # 이중계상 위험은 upstream safety_docs 검토 단계에서 처리 — 여기서는 확인 안 함.
+    # 매칭 없음 · 근거 충돌 · 예외 조건은 허용으로 간주(근거 불충분 = 집행 가능).
     disallowed_items = []
-    duplicate_risk_items = []
-    no_match_items = []
-    conflict_items = []
-    exception_review_items = []
     for bundle in rule_bundle.items:
         if not bundle.matches:
-            no_match_items.append(bundle.item.item_name)
-            continue
-        if _has_duplicate_cost_risk(bundle):
-            duplicate_risk_items.append(bundle.item.item_name)
-            continue
+            continue  # 매칭 없음 → 허용으로 간주
         allowed = bundle.top_allowed
         disallowed = bundle.top_disallowed
-        exception_summary = _extract_exception_summary(_best_exception_source(bundle))
         if disallowed and (
             not allowed
             or disallowed.score >= allowed.score + 0.5
             or any(keyword in (disallowed.evidence or "") for keyword in ("불가", "제외", "사무실", "감리원", "대지"))
         ):
-            disallowed_items.append(bundle.item.item_name)
-        elif disallowed and allowed and abs(disallowed.score - allowed.score) < 1.0:
-            conflict_items.append(bundle.item.item_name)
-        elif exception_summary:
-            exception_review_items.append(bundle.item.item_name)
+            if _is_conditional_exclusion(disallowed):
+                # 조건부 제외: 전담·신고·자격 등 특정 상황에서만 불허 →
+                # 현장 상황 미확인이므로 이 단계에서는 허용으로 간주
+                pass
+            else:
+                disallowed_items.append(bundle.item.item_name)
     if disallowed_items:
         return ("부적절", f"직접적인 사용불가 근거가 확인된 항목: {', '.join(disallowed_items)}")
-    if duplicate_risk_items:
-        return (
-            "검토필요",
-            f"타 비용과의 중복 계상 가능성이 있는 항목: {', '.join(duplicate_risk_items)}",
-        )
+
+    # 3. 공정률 기준 미달 — 명백한 법령 위반이므로 부적절
     if computation.has_progress_shortfall and computation.usage_shortfall_amount is not None:
         return (
-            "검토필요",
+            "부적절",
             f"공정률 기준 부족: 누적 사용액이 {computation.usage_shortfall_amount:,.0f}원 부족합니다.",
         )
-    if no_match_items and not (conflict_items or exception_review_items):
-        return (
-            "검토필요",
-            f"직접적인 허용 근거가 충분히 확인되지 않은 항목: {', '.join(no_match_items)}",
-        )
-    if conflict_items or exception_review_items or no_match_items:
-        segments: list[str] = []
-        if conflict_items or exception_review_items:
-            review_targets = conflict_items + [item for item in exception_review_items if item not in conflict_items]
-            if review_targets:
-                segments.append(
-                    f"예외 조건 또는 근거 충돌로 검토가 필요한 항목: {', '.join(review_targets)}"
-                )
-        if no_match_items:
-            segments.append(
-                f"직접적인 허용 근거가 충분히 확인되지 않은 항목: {', '.join(no_match_items)}"
-            )
-        return ("검토필요", " ".join(segments).strip())
+
     return ("적절", "")
 
 
@@ -321,24 +317,14 @@ def _build_item_judgment(bundle: ItemRuleBundle, *, category_name: str) -> ItemJ
 
 def _resolve_final_status(
     *,
-    hard_status: Literal["적절", "부적절", "검토필요"],
+    hard_status: Literal["적절", "부적절"],
     decision: CategoryDecisionOutput | None,
     rule_bundle: CategoryRuleBundle,
     computation: CategoryComputation,
     retrieved: CategoryRetrievedContext,
-) -> Literal["적절", "부적절", "검토필요"]:
-    if hard_status in {"부적절", "검토필요"}:
-        return hard_status
-
-    conservative_review = _needs_conservative_review(
-        rule_bundle=rule_bundle,
-        computation=computation,
-        retrieved=retrieved,
-    )
-    if conservative_review:
-        return "검토필요"
-
-    return "적절"
+) -> Literal["적절", "부적절"]:
+    # 판정은 하드룰(_hard_status)이 결정. 보수적 검토 단계 제거.
+    return hard_status
 
 
 def _bundle_confidence(bundle: ItemRuleBundle) -> float:
@@ -496,6 +482,23 @@ def _build_item_review_reason(*, needs_review: bool, exception_summary: str, has
     if has_conflict:
         return "허용 근거와 불가 근거가 함께 확인되어 추가 검토가 필요합니다."
     return "예외 문구 또는 근거 충돌 확인이 필요합니다."
+
+
+def _is_conditional_exclusion(match) -> bool:
+    """
+    불허 매칭이 조건부 제외 규칙인지 확인한다.
+
+    RDB 규칙 중 '특정 조건에서만 불허, 조건 충족 시 허용 가능'한 규칙을 감지.
+    번호 목록(1), 2), 3))이나 '사용할 수 있음' 문구가 단서.
+    → 이런 경우 '부적절' 대신 '검토필요'로 완화한다.
+
+    LLM이 생성한 불허 판단(llm_fallback 등)은 자연어 단문 형태이므로
+    오탐 방지를 위해 RDB 출처(law_rule / qa_rule)만 대상으로 한다.
+    """
+    if getattr(match, "match_source", "") not in _RDB_SOURCES:
+        return False  # LLM 불허 판단은 항상 확정으로 취급
+    evidence = match.evidence or ""
+    return any(pattern.search(evidence) for pattern in _CONDITIONAL_EXCLUSION_PATTERNS)
 
 
 def _has_duplicate_cost_risk(bundle: ItemRuleBundle) -> bool:

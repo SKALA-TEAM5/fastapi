@@ -104,6 +104,7 @@ class _ClassificationSignals:
 class _ClassificationOutcome:
     classification: DocumentClassification
     signals: _ClassificationSignals
+    signal_path: str = ""  # 분류 경로: rdb-clear / rdb+vote-agree / citation-vote / rdb-only / header-hint / unclassified
 
 
 class _ClassifierLLMOutput(BaseModel):
@@ -355,9 +356,17 @@ def _coerce_usage_statement_input(
 
 
 def _vote_category_from_chunks(docs: list[Document]) -> dict[str, float]:
-    """청크별 LEGAL_CITE 태그에서 제7조제1항제X호 인용을 추출해 역순위 가중 투표."""
+    """청크별 LEGAL_CITE 태그에서 제7조제1항제X호 인용을 추출해 역순위 가중 투표.
+
+    law_article 타입 청크(법제처 Open API 조문)는 citation vote에서 제외하고
+    LLM 컨텍스트 보강에만 활용한다. 해당 청크에는 법령 자체의 LEGAL_CITE 태그가
+    있어 vote 신호를 오염시킬 수 있다.
+    """
     scores: dict[str, float] = {}
     for rank, doc in enumerate(docs):
+        # 법령 조문 청크는 citation vote 대상에서 제외
+        if doc.metadata.get("source_type") == "law_article":
+            continue
         weight = 1.0 / (rank + 1)
         found: set[str] = set()
         for raw in _CITE_TAG_RE.findall(doc.page_content):
@@ -532,6 +541,7 @@ def _classify_document_with_signals(
                 review_reason=review_reason,
             ),
             signals=final_signals,
+            signal_path=f"rdb-clear (score={rdb_top:.1f}, margin={rdb_margin:.1f})",
         )
 
     # ── 3. RDB 불확실 → Qdrant 조회 ───────────────────────────────────────
@@ -589,6 +599,7 @@ def _classify_document_with_signals(
                 needs_human_review=needs_review, review_reason=review_reason,
             ),
             signals=final_signals,
+            signal_path=f"rdb+vote-agree (rdb={rdb_top:.1f}, vote_ratio={vote_ratio:.2f})",
         )
 
     # ── 6. vote 단독으로 명확 ─────────────────────────────────────────────
@@ -608,6 +619,7 @@ def _classify_document_with_signals(
                 needs_human_review=needs_review, review_reason=review_reason,
             ),
             signals=final_signals,
+            signal_path=f"citation-vote (top={top_vote_cat}, ratio={vote_ratio:.2f})",
         )
 
     # ── 7. RDB 단독 (vote 없음, 약한 신호라도 사용) ───────────────────────
@@ -629,6 +641,7 @@ def _classify_document_with_signals(
                 needs_human_review=needs_review, review_reason=review_reason,
             ),
             signals=final_signals,
+            signal_path=f"rdb-only (score={rdb_top:.1f})",
         )
 
     # ── 8. 청크 헤더 힌트 (최후 폴백) ────────────────────────────────────
@@ -643,6 +656,7 @@ def _classify_document_with_signals(
                 needs_human_review=True, review_reason="청크 헤더 키워드 기반 분류. 확인 권장.",
             ),
             signals=final_signals,
+            signal_path="header-hint",
         )
 
     return _ClassificationOutcome(
@@ -654,6 +668,7 @@ def _classify_document_with_signals(
             review_reason="RDB 규칙과 법령 청크 인용 모두 카테고리 후보를 찾지 못했습니다.",
         ),
         signals=final_signals,
+        signal_path="unclassified",
     )
 
 
@@ -664,8 +679,8 @@ def _item_status(
     *,
     item_name: str = "",
     basic_info: dict | None = None,
-) -> tuple[str, str, str]:
-    """항목 판정 상태를 결정한다. 반환값: (판정상태, 최종카테고리코드, 사유)
+) -> tuple[str, str, str, str]:
+    """항목 판정 상태를 결정한다. 반환값: (판정상태, 최종카테고리코드, 사유, 판정경로)
     판정상태는 반드시 '유지' 또는 '카테고리변경' 중 하나. '검토필요' 없음.
     애매한 경우 LLM이 최종 결정한다.
     """
@@ -675,7 +690,7 @@ def _item_status(
     given_score = score_by_category.get(given_code or "", 0.0)
     top_score = candidates[0].score if candidates else 0.0
 
-    def _fallback_to_llm(reason_tag: str) -> tuple[str, str, str]:
+    def _fallback_to_llm(reason_tag: str) -> tuple[str, str, str, str]:
         """LLM에게 최종 분류를 위임한다. LLM 불가 시 '유지'로 안전하게 처리."""
         llm_code = _llm_classify_item(
             item_name=item_name,
@@ -685,8 +700,8 @@ def _item_status(
         )
         if llm_code and llm_code != given_code:
             cat_name = CATEGORIES.get(llm_code, llm_code)
-            return "카테고리변경", llm_code, f"{cat_name} 카테고리로 변경이 필요함."
-        return "유지", given_code or (predicted.category_id if predicted.category_id != UNCLASSIFIED else ""), ""
+            return "카테고리변경", llm_code, f"{cat_name} 카테고리로 변경이 필요함.", f"llm({reason_tag})"
+        return "유지", given_code or (predicted.category_id if predicted.category_id != UNCLASSIFIED else ""), "", f"llm({reason_tag})"
 
     # ── 1. 분류 불가 → LLM 위임
     if predicted.category_id == UNCLASSIFIED:
@@ -696,40 +711,41 @@ def _item_status(
     if given_code and predicted.category_id != given_code:
         # 후보 없고 확신도 낮음 → 유지
         if not candidates and predicted.confidence < 0.8:
-            return "유지", given_code, ""
+            return "유지", given_code, "", "rule(no_candidates_low_conf)"
 
         # 기존 카테고리 점수가 있고 예측 점수가 없음 → 유지
         if given_score > 0 and predicted_score <= 0:
             if given_score >= top_score:
-                return "유지", given_code, ""
+                return "유지", given_code, "", "rule(given_score_top)"
             # 기존이 top도 아니고 예측 점수도 없는 경우 → LLM 위임
             return _fallback_to_llm("given_not_top_no_predicted_score")
 
         margin = predicted_score - given_score
-        # 마진이 충분히 크지 않은 경우 → LLM 위임
+        # 마진이 충분히 크지 않은 경우 → 유지 우선 (LLM은 마진 작을 때 신뢰 어려움)
         if given_score > 0 and margin < _RECLASSIFY_MARGIN_MIN:
-            if predicted.needs_human_review or margin < 1.5:
-                return _fallback_to_llm("low_margin")
-            return "유지", given_code, ""
+            return "유지", given_code, "", "rule(low_margin_keep)"
 
         # 신뢰도 미달 → LLM 위임
         if predicted.confidence < _RECLASSIFY_CONFIDENCE_MIN:
             return _fallback_to_llm(f"low_confidence:{predicted.confidence:.2f}")
 
-    # ── 3. 예측 == 기존이지만 RDB 근거가 충분히 강하지 않으면 LLM 검증
-    # _LLM_VERIFY_SKIP_SCORE 미만: profile/rule 점수가 약해 틀린 카테고리를 유지할 위험
+    # ── 3. 예측 == 기존이지만 RDB 근거가 충분히 강하지 않으면 유지
+    # score가 너무 낮으면 (<= 3.0) 신호 자체가 없는 것이므로 그냥 유지
+    # 3.0 ~ _LLM_VERIFY_SKIP_SCORE 사이면 LLM 검증
     if predicted.category_id == given_code:
         top_score = candidates[0].score if candidates else 0.0
+        if top_score <= 3.0:
+            return "유지", predicted.category_id, "", "rule(too_weak_signal_keep)"
         if top_score < _LLM_VERIFY_SKIP_SCORE or predicted.confidence < _HUMAN_REVIEW_MIN_CONFIDENCE:
             return _fallback_to_llm("predicted_equals_given_weak_rdb")
-        return "유지", predicted.category_id, ""
+        return "유지", predicted.category_id, "", "rule(rdb_strong_match)"
 
     # ── 4. 사람 검토 필요 신호 → LLM 위임
     if predicted.needs_human_review:
         return _fallback_to_llm("needs_human_review")
 
     # ── 5. 확실한 재분류
-    return "카테고리변경", predicted.category_id, f"{predicted.category_name} 카테고리로 변경이 필요함."
+    return "카테고리변경", predicted.category_id, f"{predicted.category_name} 카테고리로 변경이 필요함.", "rule(confident_reclass)"
 
 
 def _review_single_usage_statement_row(
@@ -745,13 +761,19 @@ def _review_single_usage_statement_row(
     )
     predicted = outcome.classification
     signals = outcome.signals
-    decision_status, final_category_code, reason = _item_status(
+    decision_status, final_category_code, reason, decision_path = _item_status(
         predicted=predicted,
         given_code=row.given_category_code,
         candidates=signals.candidates,
         item_name=row.item_name,
         basic_info=basic_info,
     )
+    full_path = f"{outcome.signal_path} → {decision_path}"
+    full_reason = reason if decision_status != "유지" else ""
+    if full_reason:
+        full_reason = f"{full_reason} [{full_path}]"
+    else:
+        full_reason = f"[{full_path}]"
     return RowReviewResult(
         row_id=row.row_id,
         item_name=row.item_name,
@@ -759,7 +781,7 @@ def _review_single_usage_statement_row(
         final_category_code=final_category_code,
         decision_status=decision_status,
         needs_human_review=False,
-        reason=reason if decision_status != "유지" else "",
+        reason=full_reason,
     )
 
 
