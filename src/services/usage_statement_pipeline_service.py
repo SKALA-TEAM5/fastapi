@@ -107,8 +107,8 @@ def _classify_usage_statement(
     classifier_rows = [
         {
             "row_id": row_id,
-            "given_category_code": item.get("category_code"),
-            "item_name": item.get("item_name"),
+            "given_category_code": item.get("category_code") or item.get("항목코드"),
+            "item_name": item.get("item_name") or item.get("사용내역"),
         }
         for row_id, item in indexed_items
     ]
@@ -125,7 +125,7 @@ def _classify_usage_statement(
     classifier_results: list[dict[str, Any]] = []
 
     for row_id, item in indexed_items:
-        original_category = item.get("category_code")
+        original_category = item.get("category_code") or item.get("항목코드")
         review = review_map.get(row_id)
         updated_item = dict(item)
 
@@ -146,6 +146,8 @@ def _classify_usage_statement(
 
         updated_category = review.final_category_code or original_category
         status = "appropriate" if review.decision_status == "유지" else "inappropriate"
+        line_id = updated_item.get("line_id") or f"classifier-row-{row_id}"
+        updated_item["line_id"] = line_id
         if updated_category != original_category:
             changed_count += 1
         else:
@@ -155,6 +157,7 @@ def _classify_usage_statement(
 
         classifier_results.append(
             {
+                "line_id": line_id,
                 "row_id": row_id,
                 "item_name": review.item_name,
                 "original_category_code": original_category,
@@ -172,6 +175,58 @@ def _classify_usage_statement(
         "results": classifier_results,
     }
     return classified_usage, classifier_details
+
+
+def _attach_classifier_item_ids(
+    classifier_details: dict[str, Any],
+    line_id_to_item_id: dict[str, int],
+) -> dict[str, Any]:
+    """Attach usage_statement_items.id to classifier results using OCR line_id."""
+    results = classifier_details.get("results") or []
+    if not isinstance(results, list):
+        return classifier_details
+
+    updated_results: list[dict[str, Any]] = []
+    for result in results:
+        if not isinstance(result, dict):
+            updated_results.append(result)
+            continue
+        updated = dict(result)
+        line_id = updated.get("line_id")
+        item_id = line_id_to_item_id.get(str(line_id)) if line_id is not None else None
+        if item_id is not None:
+            updated["usage_statement_item_id"] = item_id
+            updated["item_id"] = item_id
+        updated_results.append(updated)
+
+    return {**classifier_details, "results": updated_results}
+
+
+def _complete_classifier_log(
+    conn,
+    *,
+    log_id: int,
+    usage_statement_id: int,
+    details: dict[str, Any],
+) -> None:
+    """Mark classifier log complete and bind it to the persisted usage_statement."""
+    import json as _json
+
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            UPDATE agent_logs
+            SET usage_statement_id = %(usage_statement_id)s,
+                status_code = 'completed',
+                details = %(details)s::jsonb
+            WHERE id = %(log_id)s
+            """,
+            {
+                "log_id": log_id,
+                "usage_statement_id": usage_statement_id,
+                "details": _json.dumps(details, ensure_ascii=False),
+            },
+        )
 
 
 # ─────────────────────────────────────────────────────────────
@@ -256,14 +311,18 @@ def parse_usage_statement(usage_file_id: int) -> dict[str, Any]:
             )
 
             line_items = parsed_usage.get("line_items") or parsed_usage.get("items") or []
-            insert_usage_statement_items(conn, usage_statement_id, line_items)
+            line_id_to_item_id = insert_usage_statement_items(conn, usage_statement_id, line_items)
+            classifier_details = _attach_classifier_item_ids(
+                classifier_details or {},
+                line_id_to_item_id,
+            )
 
             # ── 로그 completed ─────────────────────────────────────────────
             if classifier_log_id is not None:
-                update_agent_log_status(
+                _complete_classifier_log(
                     conn,
                     log_id=classifier_log_id,
-                    status_code="completed",
+                    usage_statement_id=usage_statement_id,
                     details=classifier_details or {},
                 )
 
