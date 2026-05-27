@@ -1,10 +1,11 @@
 # --------------------------------------------------------------------------
 # 작성자   : 송상민(ss19801)
 # 작성일   : 2026-05-04
+# 수정일   : 2026-05-22
 #
 # [ 주요 함수 정의 ]
 #
-# 1. run_pipeline() : 전체 인덱싱 파이프라인 (버전 체크 → Vector DB 적재)
+# 1. run_pipeline() : 전체 인덱싱 파이프라인
 # 2. process_pdf()  : PDF 법령 파일을 마크다운으로 변환 후 벡터 DB 적재
 # 3. run_query()    : Agentic RAG 기반 법령 질의응답
 # --------------------------------------------------------------------------
@@ -12,16 +13,16 @@
 RAG 인덱싱 파이프라인 + Agentic RAG 쿼리.
 
 Public API:
-    run_pipeline(...)   전체 인덱싱 파이프라인 (버전 체크 → Vector DB 적재)
+    run_pipeline(...)   전체 인덱싱 파이프라인
     run_query(...)      Agentic RAG 질의응답
 
-버전 체크 분기:
-    web_date <= pdf_date  →  "web+pdf"  → 웹 + PDF 모두 Vector DB 저장
-    web_date >  pdf_date  →  "web"      → 웹만 저장 (PDF보다 최신 법령)
-    웹 스크래핑 실패      →  "pdf"      → PDF fallback
+파이프라인 구성:
+    1. PDF 법령 파일 → 마크다운 변환 → Qdrant 청크
+    2. 법제처 Open API 조문 수집 → Qdrant (law_article)
+    3. 산안비 사용기준 고시 파싱 → Qdrant (usage_standard) + RDB (legal_rules)
 
 중복 실행 방지:
-    .cache/indexing_state_{collection}.json 상태 + 웹 캐시 TTL 유효 시 스킵.
+    .cache/indexing_state_{collection}.json 상태 파일 유효 시 스킵.
     force=True 로 강제 재인덱싱.
 
 TODO(refresh):
@@ -31,36 +32,36 @@ TODO(refresh):
 
 import json
 import logging
-import re
-from datetime import date, datetime
+import os
+from datetime import datetime
 from pathlib import Path
 
-from langchain_text_splitters import RecursiveCharacterTextSplitter
+from dotenv import load_dotenv
+
+# 프로젝트 루트 또는 상위 디렉토리의 .env 자동 탐색 (skala 모노레포 구조 대응)
+load_dotenv()
 
 from src.core.judge import judge
 from src.core.rag import MAX_RETRY, build_retriever, rerank, retrieve, rewrite_query
 from src.core.storage import (
     DEFAULT_COLLECTION,
-    LocalJSONCache,
     load_vectorstore,
     reset_collection,
-    upsert_documents,
 )
 from src.schemas.shared import AgenticRAGState, AuditResult
 from src.services.ingestion.breadcrumb import inject_breadcrumbs
 from src.services.ingestion.converter import convert_pdf_to_markdown
+from src.services.ingestion.law_api_scraper import run_law_api_pipeline
 from src.services.ingestion.restructure import restructure_markdown
-from src.services.ingestion.splitter import split_markdown
-from src.services.ingestion.web_scraper import LAW_URL, fetch_law_data
+from src.services.ingestion.usage_standard_scraper import run_usage_standard_pipeline
 
 log = logging.getLogger(__name__)
 
-_cache = LocalJSONCache()
-_LAW_CACHE_KEY = "law_go_kr_산안비_고시"
 _STATE_DIR = Path(".cache")
 
 
 # ── 인덱싱 상태 관리 ─────────────────────────────────────────────
+
 
 def _state_path(collection: str) -> Path:
     return _STATE_DIR / f"indexing_state_{collection}.json"
@@ -88,153 +89,18 @@ def _save_state(collection: str, result: dict) -> None:
     )
 
 
-# ── PDF 시행일 추출 ──────────────────────────────────────────────
-
-def _pdf_effective_date(data_dir: str) -> date | None:
-    dates: list[date] = []
-    for pdf in Path(data_dir).glob("*.pdf"):
-        m = re.search(r"(\d{4})(\d{2})(\d{2})", pdf.name)
-        if m:
-            try:
-                dates.append(date(int(m.group(1)), int(m.group(2)), int(m.group(3))))
-            except ValueError:
-                pass
-    return max(dates) if dates else None
-
-
-# ── 웹 데이터 → Vector DB ────────────────────────────────────────
-
-_ARTICLE_BOUNDARY = re.compile(r"(?=제\d+조(?:의\d+)?[\s(])")
-_ARTICLE_NUM_RE = re.compile(r"제\d+조(?:의\d+)?(?:제\d+항(?:제\d+호(?:[가-하]목)?)?)?")
-
-
-def _split_law_text(text: str) -> list[str]:
-    """법령 조문(제X조) 단위로 1차 분리 후 800자 초과 시 추가 분할."""
-    char_splitter = RecursiveCharacterTextSplitter(
-        chunk_size=800,
-        chunk_overlap=150,
-        separators=["\n\n", "\n", "。", ".", " "],
-    )
-    articles = [a.strip() for a in _ARTICLE_BOUNDARY.split(text) if a.strip()]
-    result = []
-    for article in articles:
-        if len(article) <= 800:
-            result.append(article)
-        else:
-            result.extend(char_splitter.split_text(article))
-    return result
-
-
-def _inject_web_cites(text: str) -> str:
-    """청크 본문에 등장하는 모든 법령 조항 번호를 LEGAL_CITE 태그로 주입."""
-    found = set(_ARTICLE_NUM_RE.findall(text))
-    if not found:
-        return text
-    cite_str = " | ".join(sorted(found))
-    return f"[LEGAL_CITE: {cite_str}]\n" + text
-
-
-def _web_to_vector_db(web_data: dict, alert: str | None, collection: str) -> int:
-    from langchain_core.documents import Document
-
-    # TODO(refresh): PostgreSQL 연동 이후에는 청크 메타데이터 저장과 갱신 이력 기록도
-    # 여기 또는 별도 repository 계층에서 함께 처리하도록 분리한다.
-    meta = {
-        "source": "web_법령",
-        "source_url": LAW_URL,
-        "effective_date": web_data["effective_date"],
-        "alert": alert or "",
-    }
-    chunks = _split_law_text(web_data["content"])
-    docs = [
-        Document(page_content=_inject_web_cites(c), metadata=meta)
-        for c in chunks if c.strip()
-    ]
-    upsert_documents(collection, docs)
-    log.info(f"웹 청크 {len(docs)}개 → Vector DB 저장")
-    return len(docs)
-
-
-# ── 버전 체크 + 소스 결정 ────────────────────────────────────────
-
-def _check_source(data_dir: str, collection: str, force: bool) -> dict:
-    # TODO(refresh): 추후에는 로컬 캐시뿐 아니라 PostgreSQL에 저장된 법령 버전/시행일과도
-    # 비교해 실제 재인덱싱 필요 여부를 판단한다.
-    if not force:
-        state = _load_state(collection)
-        if state and _cache.get(_LAW_CACHE_KEY) is not None:
-            log.info(f"이미 인덱싱됨 (소스: {state['source']}) — 스킵")
-            return {**state, "skipped": True}
-
-    web_data = _cache.get(_LAW_CACHE_KEY)
-    if web_data is None:
-        log.info("캐시 없음/만료 — 웹 스크래핑 시작")
-        web_data = fetch_law_data()
-        if web_data:
-            _cache.set(_LAW_CACHE_KEY, web_data)
-
-    pdf_date = _pdf_effective_date(data_dir)
-    log.info(f"PDF 시행일: {pdf_date}")
-
-    if web_data is None:
-        log.warning("웹 스크래핑 실패 — PDF fallback")
-        result = {
-            "source": "pdf",
-            "web_date": None,
-            "pdf_date": str(pdf_date) if pdf_date else None,
-            "alert": None,
-            "chunks_added": 0,
-            "skipped": False,
-        }
-        _save_state(collection, result)
-        return result
-
-    web_date = date.fromisoformat(web_data["effective_date"])
-    log.info(f"웹 시행일: {web_date}")
-
-    if pdf_date and web_date <= pdf_date:
-        log.info(f"웹({web_date}) <= PDF({pdf_date}) — 웹+PDF 적재")
-        chunks_added = _web_to_vector_db(web_data, alert=None, collection=collection)
-        result = {
-            "source": "web+pdf",
-            "web_date": str(web_date),
-            "pdf_date": str(pdf_date),
-            "alert": None,
-            "chunks_added": chunks_added,
-            "skipped": False,
-        }
-    else:
-        alert = (
-            f"알림: {web_data['effective_date']} 기준 최신 법령을 적용함. "
-            "기존 PDF 문서 업데이트 필요"
-        )
-        log.warning(alert)
-        chunks_added = _web_to_vector_db(web_data, alert=alert, collection=collection)
-        result = {
-            "source": "web",
-            "web_date": str(web_date),
-            "pdf_date": str(pdf_date) if pdf_date else None,
-            "alert": alert,
-            "chunks_added": chunks_added,
-            "skipped": False,
-        }
-
-    _save_state(collection, result)
-    return result
-
-
 # ── 단일 PDF 파이프라인 ───────────────────────────────────────────
+
 
 def process_pdf(
     pdf_path: str,
     output_dir: str = "outputs",
-    collection: str = DEFAULT_COLLECTION,
-    skip_vector_db: bool = False,
     reconvert: bool = False,
-) -> list:
-    """단일 PDF → markdown(final.md) → Vector DB.
+) -> Path:
+    """단일 PDF → markdown(final.md) 변환만 수행. Qdrant/RDB 적재는 run_pipeline에서 일괄 처리.
 
     reconvert=False(기본): 기존 final.md가 있으면 변환 단계를 건너뛴다.
+    반환: final.md 경로
     """
     pdf = Path(pdf_path)
     out = Path(output_dir) / pdf.stem
@@ -243,30 +109,23 @@ def process_pdf(
 
     if not reconvert and final_path.exists():
         print(f"  → 기존 마크다운 재사용: {final_path}")
-        final_md = final_path.read_text(encoding="utf-8")
-    else:
-        raw_md = convert_pdf_to_markdown(str(pdf))
+        return final_path
 
-        print("  계층 구조 재구성 중...")
-        restructured_md = restructure_markdown(raw_md)
+    raw_md = convert_pdf_to_markdown(str(pdf))
 
-        print("  Breadcrumb 주입 중...")
-        final_md = inject_breadcrumbs(restructured_md)
+    print("  계층 구조 재구성 중...")
+    restructured_md = restructure_markdown(raw_md)
 
-        final_path.write_text(final_md, encoding="utf-8")
-        print(f"  → 마크다운 저장: {final_path}")
+    print("  Breadcrumb 주입 중...")
+    final_md = inject_breadcrumbs(restructured_md)
 
-    print("  청킹 중...")
-    chunks = split_markdown(final_md, source_metadata={"source": pdf.name, "source_stem": pdf.stem})
-    print(f"  청크 {len(chunks)}개 생성")
-
-    if not skip_vector_db:
-        upsert_documents(collection, chunks)
-
-    return chunks
+    final_path.write_text(final_md, encoding="utf-8")
+    print(f"  → 마크다운 저장: {final_path}")
+    return final_path
 
 
 # ── 전체 파이프라인 ──────────────────────────────────────────────
+
 
 def run_pipeline(
     data_dir: str = "data",
@@ -275,57 +134,201 @@ def run_pipeline(
     force: bool = False,
     skip_vector_db: bool = False,
     reconvert: bool = False,
+    skip_law_api: bool = False,
+    skip_usage_standard: bool = False,
+    database_url: str | None = None,
 ) -> dict:
     """
     완전한 인덱싱 파이프라인.
 
     반환:
-        source, web_date, pdf_date, alert, chunks_added(웹),
-        pdf_chunks, total_chunks, skipped
+        pdf_chunks, total_chunks, skipped,
+        law_api_chunks, usage_standard_qdrant, usage_standard_rdb,
+        pdf_rdb_master, pdf_rdb_corpus, pdf_rdb_rules, pdf_rdb_profiles,
+        law_api_rdb
 
     force=True: Vector DB 컬렉션 초기화 후 전체 재인덱싱.
     reconvert=True: 기존 final.md를 무시하고 PDF 변환부터 재실행.
+    skip_law_api=True: 법제처 Open API 조문 수집 건너뜀.
+    skip_usage_standard=True: 산안비 사용기준 고시 수집/RDB 적재 건너뜀.
+    database_url: PostgreSQL 연결 문자열. 지정 시 PDF·법제처 조문도 legal_master에 적재.
+                  미지정 시 환경변수 DATABASE_URL 을 자동으로 사용한다.
 
     TODO(refresh):
         scheduler/cron/job에서 이 함수를 호출하는 자동 갱신 엔트리포인트를 나중에 추가한다.
         지금은 수동 실행 기준으로 유지한다.
     """
+    db_url = database_url or os.environ.get(
+        "DATABASE_URL",
+        "postgresql://safety_user:safety_password@localhost:5432/safety",
+    )
     if force and not skip_vector_db:
         log.info("force=True — Vector DB 컬렉션 초기화")
         reset_collection(collection)
-        _cache.invalidate(_LAW_CACHE_KEY)
 
-    source_result = _check_source(
-        data_dir=data_dir,
-        collection=collection,
-        force=force,
-    )
+    # 중복 실행 방지 (force=False 일 때)
+    if not force:
+        state = _load_state(collection)
+        if state:
+            log.info("이미 인덱싱됨 — 스킵 (force=True 로 재실행 가능)")
+            return {**state, "skipped": True}
 
-    if source_result.get("skipped"):
-        return {**source_result, "pdf_chunks": 0, "total_chunks": 0}
-
+    # ── PDF 적재 ─────────────────────────────────────────────────
     pdf_chunks: list = []
-    if source_result["source"] in ("pdf", "web+pdf"):
-        pdf_files = sorted(Path(data_dir).glob("*.pdf"))
+    pdf_rdb_master = 0
+    pdf_rdb_corpus = 0
+    pdf_rdb_rules = 0
+    pdf_rdb_profiles = 0
+    pdf_files = sorted(Path(data_dir).glob("*.pdf"))
+
+    # ── PDF: markdown 변환 (Qdrant/RDB 적재는 build_payload로 일괄) ──
+    if pdf_files:
+        print(f"\n  [PDF] {len(pdf_files)}개 파일 마크다운 변환 시작")
         for idx, pdf in enumerate(pdf_files, 1):
             print(f"\n  [{idx}/{len(pdf_files)}] {pdf.name}")
-            chunks = process_pdf(
-                pdf_path=str(pdf),
-                output_dir=output_dir,
-                collection=collection,
-                skip_vector_db=skip_vector_db,
-                reconvert=reconvert,
-            )
-            pdf_chunks.extend(chunks)
+            process_pdf(pdf_path=str(pdf), output_dir=output_dir, reconvert=reconvert)
 
-    return {
-        **source_result,
-        "pdf_chunks": len(pdf_chunks),
-        "total_chunks": source_result["chunks_added"] + len(pdf_chunks),
+    # ── PDF → Qdrant + RDB (build_payload 기반, chunk_id 1:1 연결) ──
+    if pdf_files:
+        try:
+            from langchain_core.documents import Document as LCDocument
+
+            from src.core.storage import make_chunk_id, upsert_with_ids
+            from src.repositories.legal_rules_exporter import (
+                build_payload,
+                execute_payload_to_rdb,
+            )
+
+            print("\n  [PDF → Qdrant + RDB] build_payload 파싱 중...")
+            payload = build_payload(Path(output_dir))
+
+            # corpus + rule 행 → LangChain Document (chunk_id = uuid5(master_id))
+            lc_docs: list[LCDocument] = []
+            chunk_ids: list[str] = []
+            for row in payload.get("master", []):
+                if row.get("record_type") not in ("corpus", "rule"):
+                    continue
+                master_id = row["master_id"]
+                chunk_id = make_chunk_id(master_id)
+                breadcrumb = row.get("section_path") or row.get("source_name", "")
+                body = row.get("body") or ""
+                page_content = f"{breadcrumb}\n\n{body}" if breadcrumb else body
+                lc_docs.append(
+                    LCDocument(
+                        page_content=page_content,
+                        metadata={
+                            "source": row.get("source_name", ""),
+                            "source_type": row.get("source_type", ""),
+                            "record_type": row.get("record_type", ""),
+                            "article_no": row.get("article_no"),
+                            "section_path": row.get("section_path"),
+                            "master_id": master_id,
+                            "chunk_id": chunk_id,
+                        },
+                    )
+                )
+                chunk_ids.append(chunk_id)
+                # master_id에 chunk_id를 역으로 기록 (RDB execute_payload_to_rdb에서 활용 가능하도록)
+                row["_chunk_id"] = chunk_id
+
+            pdf_chunks = lc_docs  # type: ignore[assignment]
+
+            if not skip_vector_db and lc_docs:
+                upsert_with_ids(
+                    collection_name=collection,
+                    documents=lc_docs,
+                    ids=chunk_ids,
+                )
+                print(f"  [PDF → Qdrant] 완료: {len(lc_docs)}개 (chunk_id 연결)")
+
+            if db_url:
+                rdb = execute_payload_to_rdb(payload, db_url)
+                pdf_rdb_master = rdb["master"]
+                pdf_rdb_corpus = rdb["corpus"]
+                pdf_rdb_rules = rdb["rules"]
+                pdf_rdb_profiles = rdb["profiles"]
+                print(
+                    f"  [PDF → RDB] 완료: "
+                    f"Master {pdf_rdb_master}개 (Corpus {pdf_rdb_corpus} / Rules {pdf_rdb_rules}), "
+                    f"Profiles {pdf_rdb_profiles}개"
+                )
+        except Exception as e:
+            log.warning("PDF Qdrant+RDB 적재 실패 (건너뜀): %s", e, exc_info=True)
+
+    # ── 법제처 Open API 조문 (Qdrant + RDB) ─────────────────────
+    law_api_chunks = 0
+    law_api_rdb = 0
+    if not skip_law_api and not skip_vector_db:
+        try:
+            print("\n  [법제처 Open API] 조문 수집 및 Qdrant+RDB 적재 시작...")
+            law_api_result = run_law_api_pipeline(
+                collection_name=collection,
+                database_url=db_url,
+            )
+            law_api_chunks = law_api_result["qdrant"]
+            law_api_rdb = law_api_result["rdb"]
+            print(
+                f"  [법제처 Open API] 완료: "
+                f"Qdrant {law_api_chunks}개, RDB {law_api_rdb}개"
+            )
+        except Exception as e:
+            log.warning("법제처 Open API 파이프라인 실패 (건너뜀): %s", e)
+
+    # ── 산안비 사용기준 고시 (Qdrant + RDB) ─────────────────────
+    usage_std_qdrant = 0
+    usage_std_master = 0
+    usage_std_corpus = 0
+    usage_std_rules = 0
+    usage_std_profiles = 0
+    if not skip_usage_standard:
+        try:
+            print("\n  [산안비 사용기준] 고시 수집 및 Qdrant+RDB 적재 시작...")
+            rdb = run_usage_standard_pipeline(
+                collection_name=collection,
+                skip_qdrant=skip_vector_db,
+                database_url=db_url,
+                # PDF 단계에서 execute_payload_to_rdb가 이미 profiles를 적재했으면 중복 방지
+                skip_profiles=bool(pdf_files and db_url),
+            )
+            usage_std_qdrant = rdb["qdrant"]
+            usage_std_master = rdb["master"]
+            usage_std_corpus = rdb["corpus"]
+            usage_std_rules = rdb["rules"]
+            usage_std_profiles = rdb["profiles"]
+            print(
+                f"  [산안비 사용기준] 완료: "
+                f"Qdrant {usage_std_qdrant}개, "
+                f"Master {usage_std_master}개 (Corpus {usage_std_corpus} / Rules {usage_std_rules}), "
+                f"Profiles {usage_std_profiles}개"
+            )
+        except Exception as e:
+            log.warning("산안비 사용기준 파이프라인 실패 (건너뜀): %s", e)
+
+    result = {
+        "pdf_chunks": len(pdf_chunks),  # build_payload 기반 Qdrant 문서 수
+        "total_chunks": len(pdf_chunks) + law_api_chunks + usage_std_qdrant,
+        "law_api_chunks": law_api_chunks,
+        # PDF → RDB
+        "pdf_rdb_master": pdf_rdb_master,
+        "pdf_rdb_corpus": pdf_rdb_corpus,
+        "pdf_rdb_rules": pdf_rdb_rules,
+        "pdf_rdb_profiles": pdf_rdb_profiles,
+        # 법제처 Open API → RDB
+        "law_api_rdb": law_api_rdb,
+        # 산안비 사용기준 → Qdrant + RDB
+        "usage_standard_qdrant": usage_std_qdrant,
+        "usage_standard_master": usage_std_master,
+        "usage_standard_corpus": usage_std_corpus,
+        "usage_standard_rules": usage_std_rules,
+        "usage_standard_profiles": usage_std_profiles,
+        "skipped": False,
     }
+    _save_state(collection, result)
+    return result
 
 
 # ── Agentic RAG 쿼리 ─────────────────────────────────────────────
+
 
 def run_query(question: str, collection: str = DEFAULT_COLLECTION) -> AuditResult:
     """

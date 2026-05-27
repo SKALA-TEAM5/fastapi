@@ -11,6 +11,7 @@
 import argparse
 import hashlib
 import json
+import os
 import re
 import subprocess
 from dataclasses import asdict, dataclass
@@ -1984,132 +1985,332 @@ def _sql_literal(value: object) -> str:
 
 
 def payload_to_sql(payload: dict, *, full_refresh: bool = False) -> str:
-    """Generate SQL to load the payload into the legal_db.
+    """Generate SQL to load the payload into the legal_db (새 3-table 스키마 기준).
+
+    대상 테이블: legal_master, legal_rule_profiles
+    (구 6-table 스키마 legal_source_documents / legal_corpus / legal_citations /
+     legal_rules / legal_rule_master 는 더 이상 사용하지 않는다.)
 
     Args:
         payload: the dict produced by build_payload().
-        full_refresh: if True, TRUNCATE all tables before inserting (replaces everything).
-                      if False (default), DELETE rows for only the source_ids present in
-                      the payload, then INSERT — safe for incremental source updates.
+        full_refresh: if True, TRUNCATE both tables before inserting.
+                      if False (default), source_name-scoped DELETE then INSERT
+                      — safe for incremental source updates.
+
+    Note:
+        chunk_id 는 Qdrant upsert 이후에 채워지므로 여기서는 NULL 로 기록된다.
+        hash  는 sha256(body) 로 계산한다.
     """
+    import hashlib as _hashlib
+    import re as _re
+
+    _PARA_RE = _re.compile(r"제\s*(\d+)\s*항")
+    _ITEM_RE = _re.compile(r"제\s*(\d+)\s*호")
+
+    def _parse_basis(basis: str | None) -> tuple[str | None, str | None]:
+        if not basis:
+            return None, None
+        para = _PARA_RE.search(basis)
+        item = _ITEM_RE.search(basis)
+        return (
+            f"제{para.group(1)}항" if para else None,
+            f"제{item.group(1)}호" if item else None,
+        )
+
     statements = ["BEGIN;", "SET LOCAL search_path TO legal_rag, public;"]
 
-    source_ids = list({row["source_id"] for row in payload.get("documents", [])})
-    sid_list = ", ".join(_sql_literal(sid) for sid in source_ids)
+    # ── source_name 목록 (master 레코드에서 추출) ─────────────────
+    source_names = list({
+        row.get("source_name", "")
+        for row in payload.get("master", [])
+        if row.get("record_type") in ("corpus", "rule") and row.get("source_name")
+    })
+    sn_list = ", ".join(_sql_literal(sn) for sn in source_names)
 
     if full_refresh:
         statements.append(
-            "TRUNCATE legal_rule_master, legal_rule_profiles, legal_citations, legal_rules, legal_corpus, legal_source_documents RESTART IDENTITY CASCADE;"
+            "TRUNCATE legal_master, legal_rule_profiles RESTART IDENTITY CASCADE;"
         )
     else:
-        # [8] source-scoped DELETE so other sources are untouched
-        if sid_list:
-            statements.extend([
-                f"DELETE FROM legal_rule_master WHERE source_id IN ({sid_list});",
-                f"DELETE FROM legal_citations   WHERE source_id IN ({sid_list});",
-                f"DELETE FROM legal_rules        WHERE source_id IN ({sid_list});",
-                f"DELETE FROM legal_corpus       WHERE source_id IN ({sid_list});",
-                f"DELETE FROM legal_source_documents WHERE source_id IN ({sid_list});",
-            ])
-        # rule_profiles are config (not per-source) — always replace entirely
+        if sn_list:
+            statements.append(
+                f"DELETE FROM legal_master WHERE source_name IN ({sn_list});"
+            )
         statements.append("DELETE FROM legal_rule_profiles WHERE true;")
 
-    for row in payload["documents"]:
-        v2_st = _V2_SOURCE_TYPE.get(row["source_type"], row["source_type"])
-        statements.append(
-            "INSERT INTO legal_source_documents "
-            "(source_id, source_name, source_type, source_path, title, effective_date, notice_no) VALUES "
-            f"({_sql_literal(row['source_id'])}, {_sql_literal(row['source_name'])}, {_sql_literal(v2_st)}, "
-            f"{_sql_literal(row['source_path'])}, {_sql_literal(row['title'])}, {_sql_literal(row['effective_date'])}, {_sql_literal(row['notice_no'])});"
-        )
-
-    for row in payload["corpus"]:
-        original_ct = row["content_type"]
-        v2_ct = _V2_CONTENT_TYPE.get(original_ct, original_ct)
-        metadata = {**row["metadata"], **({"original_content_type": original_ct} if v2_ct != original_ct else {})}
-        statements.append(
-            "INSERT INTO legal_corpus "
-            "(corpus_id, source_id, content_type, title, article_no, section_path, body, cited_laws, metadata) VALUES "
-            f"({_sql_literal(row['corpus_id'])}, {_sql_literal(row['source_id'])}, {_sql_literal(v2_ct)}, "
-            f"{_sql_literal(row['title'])}, {_sql_literal(row['article_no'])}, {_sql_literal(row['section_path'])}, "
-            f"{_sql_literal(row['body'])}, {_sql_literal(row['cited_laws'])}, {_sql_literal(metadata)});"
-        )
-
-    for row in payload["rules"]:
-        original_rt = row["rule_type"]
-        v2_rt = _V2_RULE_TYPE.get(original_rt, original_rt)
-        metadata = {**row["metadata"]}
-        # 원본 타입 보존 (복원 가능하도록)
-        if v2_rt != original_rt:
-            metadata["original_rule_type"] = original_rt
-        # 출처(source_kind)와 신뢰도(confidence) 기록
-        if original_rt in _SOURCE_KIND_BY_RULE_TYPE:
-            metadata.setdefault("source_kind", _SOURCE_KIND_BY_RULE_TYPE[original_rt])
-        if original_rt in _CONFIDENCE_BY_RULE_TYPE:
-            metadata.setdefault("confidence", _CONFIDENCE_BY_RULE_TYPE[original_rt])
-        statements.append(
-            "INSERT INTO legal_rules "
-            "(rule_id, source_id, rule_type, category_code, category_number, category_name, allowed, keyword, item_pattern, legal_basis, limit_pct, rule_text, metadata) VALUES "
-            f"({_sql_literal(row['rule_id'])}, {_sql_literal(row['source_id'])}, {_sql_literal(v2_rt)}, "
-            f"{_sql_literal(row['category_code'])}, {_sql_literal(row['category_number'])}, {_sql_literal(row['category_name'])}, "
-            f"{_sql_literal(row['allowed'])}, {_sql_literal(row['keyword'])}, {_sql_literal(row['item_pattern'])}, "
-            f"{_sql_literal(row['legal_basis'])}, {_sql_literal(row['limit_pct'])}, {_sql_literal(row['rule_text'])}, {_sql_literal(metadata)});"
-        )
-
-    for row in payload["citations"]:
-        statements.append(
-            "INSERT INTO legal_citations "
-            "(citation_id, source_id, parent_type, parent_id, sequence_no, citation_text, article_no, paragraph_no, item_no, subitem_no) VALUES "
-            f"({_sql_literal(row['citation_id'])}, {_sql_literal(row['source_id'])}, {_sql_literal(row['parent_type'])}, "
-            f"{_sql_literal(row['parent_id'])}, {_sql_literal(row['sequence_no'])}, {_sql_literal(row['citation_text'])}, "
-            f"{_sql_literal(row['article_no'])}, {_sql_literal(row['paragraph_no'])}, {_sql_literal(row['item_no'])}, {_sql_literal(row['subitem_no'])});"
-        )
-
-    for row in payload.get("rule_profiles", []):
-        original_scope = row["profile_scope"]
-        v2_scope = _V2_PROFILE_SCOPE.get(original_scope, original_scope)
-        metadata = {**row["metadata"], **({"original_scope": original_scope} if v2_scope != original_scope else {})}
-        vj = row["values_json"]
-        vj_sql = _sql_literal(vj) if isinstance(vj, dict) else "'" + json.dumps(vj, ensure_ascii=False).replace("'", "''") + "'::jsonb"
-        statements.append(
-            "INSERT INTO legal_rule_profiles "
-            "(profile_id, profile_scope, category_code, profile_key, values_json, metadata) VALUES "
-            f"({_sql_literal(row['profile_id'])}, {_sql_literal(v2_scope)}, {_sql_literal(row['category_code'])}, "
-            f"{_sql_literal(row['profile_key'])}, {vj_sql}, {_sql_literal(metadata)});"
-        )
+    # ── legal_master INSERT ───────────────────────────────────────
+    source_map = {doc["source_id"]: doc for doc in payload.get("documents", [])}
 
     for row in payload.get("master", []):
-        original_ct = row.get("content_type")
-        v2_ct = _V2_CONTENT_TYPE.get(original_ct, original_ct) if original_ct else None
-        original_rt = row.get("rule_type")
-        v2_rt = _V2_RULE_TYPE.get(original_rt, original_rt) if original_rt else None
-        original_ps = row.get("profile_scope")
-        v2_ps = _V2_PROFILE_SCOPE.get(original_ps, original_ps) if original_ps else None
+        record_type = row.get("record_type")
+        if record_type not in ("corpus", "rule"):
+            continue  # profile 타입은 legal_rule_profiles 로 적재
+
         original_st = row.get("source_type")
-        v2_st = _V2_SOURCE_TYPE.get(original_st, original_st) if original_st else None
-        metadata = dict(row["metadata"])
-        if v2_ct != original_ct and original_ct:
-            metadata["original_content_type"] = original_ct
-        if v2_rt != original_rt and original_rt:
-            metadata["original_rule_type"] = original_rt
-        if v2_ps != original_ps and original_ps:
-            metadata["original_scope"] = original_ps
+        v2_st       = _V2_SOURCE_TYPE.get(original_st, original_st) or "law"
+        original_ct = row.get("content_type")
+        v2_ct       = _V2_CONTENT_TYPE.get(original_ct, original_ct) if original_ct else None
+        original_rt = row.get("rule_type")
+        v2_rt       = _V2_RULE_TYPE.get(original_rt, original_rt) if original_rt else None
+
+        source_id   = row.get("source_id")
+        source_doc  = source_map.get(source_id or "", {})
+        source_path = source_doc.get("source_path", "")
+
+        body      = row.get("body") or ""
+        body_hash = _hashlib.sha256(body.encode("utf-8")).hexdigest()
+
+        legal_basis           = row.get("legal_basis")
+        paragraph_no, item_no = _parse_basis(legal_basis)
+
+        meta = dict(row.get("metadata") or {})
+        if original_ct and v2_ct != original_ct:
+            meta["original_content_type"] = original_ct
+        if original_rt and v2_rt != original_rt:
+            meta["original_rule_type"] = original_rt
+        if original_rt in _SOURCE_KIND_BY_RULE_TYPE:
+            meta.setdefault("source_kind", _SOURCE_KIND_BY_RULE_TYPE[original_rt])
+        if original_rt in _CONFIDENCE_BY_RULE_TYPE:
+            meta.setdefault("confidence", _CONFIDENCE_BY_RULE_TYPE[original_rt])
+
+        cited_laws_arr = "ARRAY[" + ", ".join(_sql_literal(c) for c in (row.get("cited_laws") or [])) + "]::TEXT[]"
+        keywords_arr   = "ARRAY[" + ", ".join(_sql_literal(k) for k in (row.get("keywords") or [])) + "]::TEXT[]"
+
         statements.append(
-            "INSERT INTO legal_rule_master "
-            "(master_id, source_id, source_name, source_type, record_type, content_type, rule_type, profile_scope, "
-            "category_code, category_name, article_no, title, section_path, legal_basis, item_key, item_pattern, "
-            "allowed, limit_pct, body, cited_laws, keywords, metadata) VALUES "
-            f"({_sql_literal(row['master_id'])}, {_sql_literal(row['source_id'])}, {_sql_literal(row['source_name'])}, "
-            f"{_sql_literal(v2_st)}, {_sql_literal(row['record_type'])}, {_sql_literal(v2_ct)}, "
-            f"{_sql_literal(v2_rt)}, {_sql_literal(v2_ps)}, {_sql_literal(row['category_code'])}, "
-            f"{_sql_literal(row['category_name'])}, {_sql_literal(row['article_no'])}, {_sql_literal(row['title'])}, "
-            f"{_sql_literal(row['section_path'])}, {_sql_literal(row['legal_basis'])}, {_sql_literal(row['item_key'])}, "
-            f"{_sql_literal(row['item_pattern'])}, {_sql_literal(row['allowed'])}, {_sql_literal(row['limit_pct'])}, "
-            f"{_sql_literal(row['body'])}, {_sql_literal(row['cited_laws'])}, {_sql_literal(row['keywords'])}, {_sql_literal(metadata)});"
+            "INSERT INTO legal_master "
+            "(id, source_name, source_type, source_path, "
+            "article_no, paragraph_no, item_no, section_path, "
+            "chunk_id, body, record_type, content_type, rule_type, "
+            "category_code, category_name, allowed, limit_pct, "
+            "keyword, item_pattern, legal_basis, "
+            "cited_laws, keywords, hash, metadata) VALUES ("
+            f"{_sql_literal(row['master_id'])}, "
+            f"{_sql_literal(row.get('source_name', ''))}, "
+            f"{_sql_literal(v2_st)}, "
+            f"{_sql_literal(source_path)}, "
+            f"{_sql_literal(row.get('article_no'))}, "
+            f"{_sql_literal(paragraph_no)}, "
+            f"{_sql_literal(item_no)}, "
+            f"{_sql_literal(row.get('section_path'))}, "
+            f"NULL, "   # chunk_id — Qdrant 연동 후 채움
+            f"{_sql_literal(body)}, "
+            f"{_sql_literal(record_type)}, "
+            f"{_sql_literal(v2_ct)}, "
+            f"{_sql_literal(v2_rt)}, "
+            f"{_sql_literal(row.get('category_code'))}, "
+            f"{_sql_literal(row.get('category_name'))}, "
+            f"{_sql_literal(row.get('allowed'))}, "
+            f"{_sql_literal(row.get('limit_pct'))}, "
+            f"{_sql_literal(row.get('item_key'))}, "
+            f"{_sql_literal(row.get('item_pattern'))}, "
+            f"{_sql_literal(legal_basis)}, "
+            f"{cited_laws_arr}, "
+            f"{keywords_arr}, "
+            f"{_sql_literal(body_hash)}, "
+            f"{_sql_literal(meta)}::jsonb"
+            ") ON CONFLICT (id) DO UPDATE SET "
+            "body = EXCLUDED.body, hash = EXCLUDED.hash, metadata = EXCLUDED.metadata;"
+        )
+
+    # ── legal_rule_profiles INSERT ────────────────────────────────
+    for row in payload.get("rule_profiles", []):
+        original_scope = row.get("profile_scope")
+        v2_scope       = _V2_PROFILE_SCOPE.get(original_scope, original_scope)
+        meta = dict(row.get("metadata") or {})
+        if v2_scope != original_scope:
+            meta["original_scope"] = original_scope
+        vj  = row.get("values_json")
+        vj_sql = (
+            "'" + json.dumps(vj, ensure_ascii=False).replace("'", "''") + "'::jsonb"
+        )
+        statements.append(
+            "INSERT INTO legal_rule_profiles "
+            "(profile_id, profile_scope, category_code, profile_key, values_json, metadata) VALUES ("
+            f"{_sql_literal(row['profile_id'])}, "
+            f"{_sql_literal(v2_scope)}, "
+            f"{_sql_literal(row.get('category_code'))}, "
+            f"{_sql_literal(row['profile_key'])}, "
+            f"{vj_sql}, "
+            f"{_sql_literal(meta)}::jsonb"
+            ") ON CONFLICT (profile_scope, category_code, profile_key) DO UPDATE SET "
+            "values_json = EXCLUDED.values_json, metadata = EXCLUDED.metadata;"
         )
 
     statements.append("COMMIT;")
     return "\n".join(statements) + "\n"
+
+
+def execute_payload_to_rdb(payload: dict, database_url: str) -> dict:
+    """payload['master'] + payload['rule_profiles'] 를 새 legal_rag 스키마에 직접 적재.
+
+    - legal_master        : record_type='corpus'|'rule' 레코드 INSERT
+    - legal_rule_profiles : 전체 교체 (DELETE → INSERT)
+
+    source_name 기준 source-scoped DELETE 후 INSERT (다른 소스 데이터는 보존).
+    chunk_id 는 Qdrant 적재 후 별도로 채운다 (여기선 NULL).
+    """
+    import psycopg2
+    from psycopg2.extras import Json, execute_values
+
+    _PARA_RE = re.compile(r"제\s*(\d+)\s*항")
+    _ITEM_RE = re.compile(r"제\s*(\d+)\s*호")
+
+    def _parse_basis(basis: str | None) -> tuple[str | None, str | None]:
+        if not basis:
+            return None, None
+        para = _PARA_RE.search(basis)
+        item = _ITEM_RE.search(basis)
+        return (
+            f"제{para.group(1)}항" if para else None,
+            f"제{item.group(1)}호" if item else None,
+        )
+
+    source_map = {doc["source_id"]: doc for doc in payload.get("documents", [])}
+
+    # ── legal_master 레코드 구성 ─────────────────────────────────
+    master_records: list[tuple] = []
+    for row in payload.get("master", []):
+        record_type = row.get("record_type")
+        if record_type not in ("corpus", "rule"):
+            continue  # 'profile' 타입은 legal_rule_profiles로 적재
+
+        original_st = row.get("source_type")
+        v2_st       = _V2_SOURCE_TYPE.get(original_st, original_st) or "law"
+        original_ct = row.get("content_type")
+        v2_ct       = _V2_CONTENT_TYPE.get(original_ct, original_ct) if original_ct else None
+        original_rt = row.get("rule_type")
+        v2_rt       = _V2_RULE_TYPE.get(original_rt, original_rt) if original_rt else None
+
+        source_id  = row.get("source_id")
+        source_doc = source_map.get(source_id or "", {})
+        source_path = source_doc.get("source_path", "")
+
+        body      = row.get("body") or ""
+        body_hash = hashlib.sha256(body.encode("utf-8")).hexdigest()
+
+        legal_basis             = row.get("legal_basis")
+        paragraph_no, item_no  = _parse_basis(legal_basis)
+
+        meta = dict(row.get("metadata") or {})
+        if original_ct and v2_ct != original_ct:
+            meta["original_content_type"] = original_ct
+        if original_rt and v2_rt != original_rt:
+            meta["original_rule_type"] = original_rt
+        if original_rt in _SOURCE_KIND_BY_RULE_TYPE:
+            meta.setdefault("source_kind", _SOURCE_KIND_BY_RULE_TYPE[original_rt])
+        if original_rt in _CONFIDENCE_BY_RULE_TYPE:
+            meta.setdefault("confidence", _CONFIDENCE_BY_RULE_TYPE[original_rt])
+
+        master_records.append((
+            row["master_id"],          # id
+            row.get("source_name", ""),# source_name
+            v2_st,                     # source_type
+            source_path,               # source_path
+            row.get("article_no"),     # article_no
+            paragraph_no,              # paragraph_no
+            item_no,                   # item_no
+            row.get("section_path"),   # section_path
+            None,                      # chunk_id (Qdrant 연동 후 채움)
+            body,                      # body
+            record_type,               # record_type
+            v2_ct,                     # content_type
+            v2_rt,                     # rule_type
+            row.get("category_code"),  # category_code
+            row.get("category_name"),  # category_name
+            row.get("allowed"),        # allowed
+            row.get("limit_pct"),      # limit_pct
+            row.get("item_key"),       # keyword
+            row.get("item_pattern"),   # item_pattern
+            legal_basis,               # legal_basis
+            row.get("cited_laws") or [],  # cited_laws (TEXT[])
+            row.get("keywords") or [],    # keywords   (TEXT[])
+            body_hash,                 # hash
+            Json(meta),                # metadata (JSONB)
+        ))
+
+    # ── legal_rule_profiles 레코드 구성 ──────────────────────────
+    profile_records: list[tuple] = []
+    for row in payload.get("rule_profiles", []):
+        original_scope = row.get("profile_scope")
+        v2_scope       = _V2_PROFILE_SCOPE.get(original_scope, original_scope)
+        meta = dict(row.get("metadata") or {})
+        if v2_scope != original_scope:
+            meta["original_scope"] = original_scope
+        vj = row.get("values_json")
+        profile_records.append((
+            row["profile_id"],
+            v2_scope,
+            row.get("category_code"),
+            row["profile_key"],
+            Json(vj),       # values_json (JSONB)
+            Json(meta),     # metadata   (JSONB)
+        ))
+
+    # ── DB 적재 ───────────────────────────────────────────────────
+    source_names = list({r[1] for r in master_records if r[1]})
+
+    conn = psycopg2.connect(database_url)
+    try:
+        with conn:
+            with conn.cursor() as cur:
+                cur.execute("SET search_path TO legal_rag, public")
+
+                # source-scoped DELETE (다른 소스 유지)
+                if source_names:
+                    cur.execute(
+                        "DELETE FROM legal_master WHERE source_name = ANY(%s)",
+                        (source_names,),
+                    )
+                cur.execute("DELETE FROM legal_rule_profiles WHERE true")
+
+                # INSERT legal_master
+                if master_records:
+                    execute_values(
+                        cur,
+                        """
+                        INSERT INTO legal_master (
+                            id, source_name, source_type, source_path,
+                            article_no, paragraph_no, item_no, section_path,
+                            chunk_id, body, record_type, content_type, rule_type,
+                            category_code, category_name, allowed, limit_pct,
+                            keyword, item_pattern, legal_basis,
+                            cited_laws, keywords, hash, metadata
+                        ) VALUES %s
+                        ON CONFLICT (id) DO UPDATE SET
+                            body        = EXCLUDED.body,
+                            hash        = EXCLUDED.hash,
+                            metadata    = EXCLUDED.metadata
+                        """,
+                        master_records,
+                    )
+
+                # INSERT legal_rule_profiles
+                if profile_records:
+                    execute_values(
+                        cur,
+                        """
+                        INSERT INTO legal_rule_profiles (
+                            profile_id, profile_scope, category_code,
+                            profile_key, values_json, metadata
+                        ) VALUES %s
+                        ON CONFLICT (profile_scope, category_code, profile_key)
+                        DO UPDATE SET
+                            values_json = EXCLUDED.values_json,
+                            metadata    = EXCLUDED.metadata
+                        """,
+                        profile_records,
+                    )
+    finally:
+        conn.close()
+
+    corpus_count = sum(1 for r in master_records if r[10] == "corpus")
+    rules_count  = sum(1 for r in master_records if r[10] == "rule")
+    return {
+        "master":   len(master_records),
+        "corpus":   corpus_count,
+        "rules":    rules_count,
+        "profiles": len(profile_records),
+    }
 
 
 def _run_psql(sql_path: Path, database_url: str | None, psql_bin: str) -> None:
@@ -2127,37 +2328,58 @@ def main() -> None:
     parser.add_argument("--outputs-dir", default="outputs")
     parser.add_argument("--rule-config-path", default="scripts/seed_legal_rule_profiles.json")
     parser.add_argument("--json-out", default="artifacts/legal_rules_payload.json")
-    parser.add_argument("--sql-out", default="artifacts/legal_rules_seed.sql")
-    parser.add_argument("--apply", action="store_true", help="Seed SQL을 legal_rag 스키마에 적재한다 (스키마는 Flyway V2가 생성).")
-    parser.add_argument("--full-refresh", action="store_true", help="전체 테이블 TRUNCATE 후 재적재 (기존 데이터 완전 교체). 기본은 소스 단위 DELETE+INSERT.")
-    parser.add_argument("--database-url", default=None, help="PostgreSQL connection string for psql.")
-    parser.add_argument("--psql-bin", default="psql")
-    parser.add_argument("--cleanup", action="store_true", help="DB 적재 성공 후 중간 파일(json/sql) 삭제.")
+    parser.add_argument("--sql-out", default="artifacts/legal_rules_seed.sql",
+                        help="SQL 파일 출력 경로 (--apply 없이 SQL만 확인할 때 사용).")
+    parser.add_argument("--apply", action="store_true",
+                        help="legal_rag 스키마에 직접 적재한다 (psycopg2, 새 3-table 스키마 기준).")
+    parser.add_argument("--full-refresh", action="store_true",
+                        help="전체 테이블 TRUNCATE 후 재적재. 기본은 source_name 단위 DELETE+INSERT.")
+    parser.add_argument("--database-url", default=None,
+                        help="PostgreSQL connection string. 미지정 시 DATABASE_URL 환경변수 사용.")
+    parser.add_argument("--psql-bin", default="psql",
+                        help="(SQL 파일 직접 실행 시) psql 바이너리 경로.")
+    parser.add_argument("--use-psql", action="store_true",
+                        help="--apply 시 psycopg2 대신 psql 바이너리로 SQL 파일을 실행한다.")
+    parser.add_argument("--cleanup", action="store_true",
+                        help="DB 적재 성공 후 중간 파일(json/sql) 삭제.")
     args = parser.parse_args()
 
     payload = build_payload(Path(args.outputs_dir), Path(args.rule_config_path))
 
+    # JSON 아티팩트 저장
     json_out = Path(args.json_out)
     json_out.parent.mkdir(parents=True, exist_ok=True)
     json_out.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
 
+    # SQL 파일 생성 (새 3-table 스키마 기준)
     sql_out = Path(args.sql_out)
     sql_out.parent.mkdir(parents=True, exist_ok=True)
     sql_out.write_text(payload_to_sql(payload, full_refresh=args.full_refresh), encoding="utf-8")
 
     if args.apply:
-        _run_psql(sql_out, args.database_url, args.psql_bin)
+        db_url = args.database_url or os.environ.get("DATABASE_URL")
+        if not db_url:
+            raise SystemExit("--apply 실행에는 --database-url 또는 DATABASE_URL 환경변수가 필요합니다.")
+
+        if args.use_psql:
+            # SQL 파일을 psql 바이너리로 직접 실행 (디버깅/수동 적재용)
+            _run_psql(sql_out, db_url, args.psql_bin)
+        else:
+            # 권장: psycopg2로 직접 적재 (새 3-table 스키마 기준)
+            result = execute_payload_to_rdb(payload, db_url)
+            print(
+                f"[적재 완료] legal_master {result['master']}개 "
+                f"(corpus {result['corpus']} / rule {result['rules']}), "
+                f"legal_rule_profiles {result['profiles']}개"
+            )
+
         if args.cleanup:
             json_out.unlink(missing_ok=True)
             sql_out.unlink(missing_ok=True)
             print("cleanup: 중간 파일 삭제 완료")
 
-    print(f"documents={len(payload['documents'])}")
-    print(f"corpus={len(payload['corpus'])}")
-    print(f"rules={len(payload['rules'])}")
-    print(f"citations={len(payload['citations'])}")
-    print(f"rule_profiles={len(payload.get('rule_profiles', []))}")
     print(f"master={len(payload.get('master', []))}")
+    print(f"rule_profiles={len(payload.get('rule_profiles', []))}")
     print(f"verified_sources={len(payload['verification'])}")
 
 

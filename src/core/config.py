@@ -10,9 +10,10 @@ from pathlib import Path
 
 from dotenv import load_dotenv
 
-# 프로젝트 루트의 .env 로드
+# 프로젝트 루트의 .env 로드 (없으면 상위 디렉토리까지 탐색 — skala 모노레포 구조 대응)
 _ROOT = Path(__file__).parent.parent.parent
-load_dotenv(_ROOT / ".env")
+load_dotenv(_ROOT / ".env")          # fastapi/.env 우선
+load_dotenv(_ROOT.parent / ".env")   # skala/.env fallback (override=False 기본값 — 이미 로드된 값은 덮어쓰지 않음)
 
 
 # ══════════════════════════════════════════════
