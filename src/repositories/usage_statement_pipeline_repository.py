@@ -392,10 +392,10 @@ def insert_agent_log(
     sql = """
         INSERT INTO agent_logs
             (project_id, usage_statement_id, agent_type_code,
-             status_code, details, model_name, run_id)
+             status_code, details, model_name)
         VALUES
             (%(project_id)s, %(usage_statement_id)s, %(agent_type_code)s,
-             %(status_code)s, %(details)s::jsonb, %(model_name)s, %(run_id)s::uuid)
+             %(status_code)s, %(details)s::jsonb, %(model_name)s)
         RETURNING id
     """
     with conn.cursor() as cur:
@@ -406,7 +406,6 @@ def insert_agent_log(
             "status_code":        status_code,
             "agent_type_code":    agent_type_code,
             "model_name":         model_name,
-            "run_id":             run_id,
         })
         row = cur.fetchone()
     return row[0]
@@ -427,25 +426,42 @@ def update_agent_log_status(
     """
     import json as _json
 
+    normalized_status_code = {
+        "completed": "success",
+        "failed": "fail",
+    }.get(status_code, status_code)
+    result_code = {
+        "success": "success",
+        "fail": "fail",
+        "canceled": "fail",
+    }.get(normalized_status_code)
+
     if details is not None:
         sql = """
             UPDATE agent_logs
             SET status_code = %(status_code)s,
+                result_code = %(result_code)s,
                 details     = %(details)s::jsonb
             WHERE id = %(log_id)s
         """
         params = {
             "log_id":      log_id,
-            "status_code": status_code,
+            "status_code": normalized_status_code,
+            "result_code": result_code,
             "details":     _json.dumps(details, ensure_ascii=False),
         }
     else:
         sql = """
             UPDATE agent_logs
-            SET status_code = %(status_code)s
+            SET status_code = %(status_code)s,
+                result_code = %(result_code)s
             WHERE id = %(log_id)s
         """
-        params = {"log_id": log_id, "status_code": status_code}
+        params = {
+            "log_id": log_id,
+            "status_code": normalized_status_code,
+            "result_code": result_code,
+        }
 
     with conn.cursor() as cur:
         cur.execute(sql, params)

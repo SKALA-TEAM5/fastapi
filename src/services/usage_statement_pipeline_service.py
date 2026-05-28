@@ -97,7 +97,14 @@ def _classify_usage_statement(
     line_items = parsed_usage.get("line_items") or []
     if not line_items:
         classifier_details = {
-            "results": [],
+            "event": "classification_checked",
+            "summary": "분류할 세부내역이 없습니다.",
+            "payload": {
+                "changed_count": 0,
+                "kept_count": 0,
+                "changes": [],
+                "results": [],
+            },
         }
         return parsed_usage, classifier_details
 
@@ -123,6 +130,7 @@ def _classify_usage_statement(
     kept_count = 0
     updated_items: list[dict[str, Any]] = []
     classifier_results: list[dict[str, Any]] = []
+    changes: list[dict[str, Any]] = []
 
     for row_id, item in indexed_items:
         original_category = item.get("category_code")
@@ -148,6 +156,15 @@ def _classify_usage_statement(
         status = "appropriate" if review.decision_status == "유지" else "inappropriate"
         if updated_category != original_category:
             changed_count += 1
+            changes.append(
+                {
+                    "row_id": row_id,
+                    "item_name": review.item_name,
+                    "before": {"category_code": original_category},
+                    "after": {"category_code": updated_category},
+                    "reason": review.reason,
+                }
+            )
         else:
             kept_count += 1
 
@@ -168,8 +185,20 @@ def _classify_usage_statement(
     classified_usage = dict(parsed_usage)
     classified_usage["line_items"] = updated_items
 
+    summary = (
+        f"세부내역 {changed_count}건을 올바른 항목으로 이동했습니다."
+        if changed_count
+        else "세부내역 분류 이동 없음"
+    )
     classifier_details = {
-        "results": classifier_results,
+        "event": "classification_updated" if changed_count else "classification_checked",
+        "summary": summary,
+        "payload": {
+            "changed_count": changed_count,
+            "kept_count": kept_count,
+            "changes": changes,
+            "results": classifier_results,
+        },
     }
     return classified_usage, classifier_details
 
@@ -279,7 +308,7 @@ def parse_usage_statement(usage_file_id: int) -> dict[str, Any]:
     elapsed = round(time.time() - start, 2)
     classifier_changed_count = sum(
         1
-        for result in ((classifier_details or {}).get("results") or [])
+        for result in (((classifier_details or {}).get("payload") or {}).get("results") or [])
         if result.get("original_category_code") != result.get("final_category_code")
     )
 
