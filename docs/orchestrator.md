@@ -117,11 +117,13 @@ SHE 담당자가 legal 실행
 ### 5. 보고서 초안
 
 ```text
-legal success
+legal success/success 또는 success/hil
 -> report Agent 실행
 -> 보고서 초안 생성
 -> SHE 담당자가 수정
 ```
+
+legal이 `success/hil`인 경우에도 보고서 초안은 생성한다. 이때 report는 legal의 보완·검토 필요 항목을 보고서 상세 이슈와 보완 필요 사항에 반영한다.
 
 ## agent_logs 규칙
 

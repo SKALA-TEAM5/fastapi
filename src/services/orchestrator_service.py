@@ -420,13 +420,13 @@ def run_report_draft(
             event="report_draft_blocked",
             status_code="fail",
             result_code="fail",
-            reason="legal이 success/success 상태가 아니어서 report를 실행할 수 없습니다.",
+            reason="legal 실행이 정상 완료되지 않아 report를 실행할 수 없습니다.",
         )
         return OrchestratorActionResponse(
             status="blocked",
-            message="legal 검토가 성공한 뒤 report 초안을 생성할 수 있습니다.",
+            message="legal 실행이 완료된 뒤 report 초안을 생성할 수 있습니다.",
             usage_statement_id=usage_statement_id,
-            hil_agents=["legal"] if (state.logs.get("legal") or {}).get("result_code") == "hil" else [],
+            hil_agents=[],
         )
 
     result = _run_report_agent(project_id, usage_statement_id, she_user_id=she_user_id)

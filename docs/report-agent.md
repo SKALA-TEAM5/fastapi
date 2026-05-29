@@ -18,7 +18,7 @@ DB rows
   -> DOCX export
 ```
 
-운영 흐름에서는 Spring Backend가 FastAPI의 report agent 엔드포인트를 호출합니다. FastAPI는 기존 DB 테이블에서 `ReportContext`를 조립한 뒤 `ReportAgent`를 실행하고, 결과 `ReportDraft` JSON을 반환합니다. CLI는 로컬 샘플 실행과 디버깅 용도로만 사용합니다.
+운영 흐름에서는 Spring Backend가 FastAPI Orchestrator의 report 엔드포인트를 호출합니다. Orchestrator는 `legal` 성공 상태를 확인한 뒤 기존 DB 테이블에서 `ReportContext`를 조립하고 `ReportAgent`를 실행해 `ReportDraft` JSON을 반환합니다. CLI와 단독 report 라우터는 로컬 샘플 실행과 디버깅 용도로만 사용합니다.
 
 ## 코드 구성과 책임
 
@@ -31,7 +31,7 @@ DB rows
 | `agent.py`                                   | 보고서 초안을 만드는 핵심 파일입니다. 입력 데이터를 표, 이슈, 보완사항 구조로 바꾸고 classifier/validator 결과를 반영합니다. LLM 결과가 있으면 허용된 문장 필드만 병합합니다.                      |
 | `cli.py`                                     | `ReportContext` JSON 파일을 읽어 `ReportDraft` JSON 보고서 파일을 생성하는 로컬 실행 진입점입니다.                                                                                             |
 | `llm.py`                                     | OpenAI API 호출 어댑터입니다. LLM에게 전체 보고서를 맡기지 않고 결론, 종합 의견, 필요 조치 같은 문장 필드만 JSON 패치로 요청합니다.                                                                |
-| `src/api/routers/report_agent.py`            | Spring Backend가 호출하는 `POST /api/v1/agents/report/run` FastAPI 엔드포인트입니다.                                                                                                             |
+| `src/api/routers/report_agent.py`            | `POST /api/v1/agents/report/run` 단독 실행 라우터입니다. 운영 경로는 Orchestrator를 사용하므로 테스트와 디버깅 용도로 둡니다.                                                                     |
 | `src/repositories/report_repository.py`      | 기존 Postgres 테이블에서 보고서 입력 row를 읽어 `ReportContext` 조립에 사용할 저장소 구현입니다.                                                                                                 |
 | `src/prompts/report_agent_system.md`         | LLM의 기본 역할과 금지사항을 정의합니다. 근거 없는 법령 생성, 금액/판정 변경을 금지합니다.                                                                                                         |
 | `src/prompts/report_agent_draft_template.md` | LLM에게 넘기는 작업 프롬프트입니다. 어떤 JSON 필드만 반환해야 하는지 정의합니다.                                                                                                                   |
@@ -56,8 +56,11 @@ agent.py
 llm.py
   ReportDraft의 문장 필드만 보강
 
+services/orchestrator_service.py
+  legal success/success 또는 success/hil 확인 -> ReportDraft JSON response
+
 api/routers/report_agent.py
-  HTTP request -> ReportDraft JSON response
+  단독 디버깅 request -> ReportDraft JSON response
 
 cli.py
   ReportContext JSON -> ReportDraft JSON 파일 (로컬 실행용)
@@ -65,7 +68,7 @@ cli.py
 
 ## API 실행 흐름
 
-보고서 생성은 Spring Backend가 FastAPI를 호출하는 방식으로 실행합니다.
+보고서 생성은 Spring Backend가 FastAPI Orchestrator를 호출하는 방식으로 실행합니다.
 
 ```text
 Frontend
@@ -73,11 +76,11 @@ Frontend
 
 Spring Backend
   권한 확인
-  runId 생성
-  FastAPI 호출
+  FastAPI Orchestrator 호출
 
 FastAPI
-  POST /api/v1/agents/report/run
+  POST /api/v1/orchestrator/usage-statements/report
+  legal success/success 또는 success/hil 확인
   DB row -> ReportContext
   agent_logs의 classi/legal success 결과를 item별 입력에 반영
   ReportAgent.generate(context)
@@ -89,26 +92,19 @@ Frontend
   /api/report-docx로 DOCX 추출
 ```
 
-FastAPI 엔드포인트:
+운영 FastAPI 엔드포인트:
 
 ```http
-POST /api/v1/agents/report/run
+POST /api/v1/orchestrator/usage-statements/report
 ```
 
 요청 예시:
 
 ```json
 {
-  "run_id": "11111111-1111-1111-1111-111111111111",
   "project_id": 1,
   "usage_statement_id": 2008,
-  "report_written_date": "2026-05-22",
-  "report_period_label": "2026년 05월",
-  "reviewer": {
-    "name": "홍길동",
-    "department": "안전관리팀",
-    "title": "담당자"
-  }
+  "she_user_id": 3
 }
 ```
 
@@ -116,20 +112,29 @@ POST /api/v1/agents/report/run
 
 ```json
 {
-  "run_id": "11111111-1111-1111-1111-111111111111",
-  "agent_type": "report",
   "status": "success",
-  "log_ids": [123],
+  "message": "report Agent 실행을 완료했습니다.",
+  "usage_statement_id": 2008,
+  "target_agents": ["report"],
   "result": {
-    "reportDraft": {
-      "layout_version": "safety_cost_report_v1",
-      "report_no": "AR-20260522-1-2008",
-      "report_sections": []
+    "report": {
+      "status_code": "success",
+      "result_code": "success",
+      "reason": "보고서 초안 생성 완료",
+      "result": {
+        "run_id": "11111111-1111-1111-1111-111111111111",
+        "reportDraft": {
+          "layout_version": "safety_cost_report_v1",
+          "report_no": "AR-20260522-1-2008",
+          "report_sections": []
+        }
+      }
     }
   }
 }
 ```
 
+`POST /api/v1/agents/report/run` 단독 라우터는 운영 앱의 기본 등록 대상이 아니며, `context` 직접 전달 테스트나 디버깅에서만 사용합니다.
 `context` 필드를 직접 전달하면 DB 조회 없이 `ReportContext`를 그대로 사용합니다. 이 경로는 테스트와 디버깅용입니다.
 
 ## 입력

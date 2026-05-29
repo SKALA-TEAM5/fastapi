@@ -1,9 +1,9 @@
 from __future__ import annotations
 
-"""보고서 생성 agent HTTP 라우터.
+"""보고서 생성 agent 단독 실행 라우터.
 
-Spring Backend가 호출하는 `/api/v1/agents/report/run` 엔드포인트를 제공하고,
-기존 DB row를 ReportContext로 조립한 뒤 ReportDraft JSON을 반환합니다.
+운영 report 실행은 orchestrator의 `/api/v1/orchestrator/usage-statements/report`가 담당합니다.
+이 라우터는 테스트나 단독 디버깅에서 ReportContext -> ReportDraft 경로를 직접 확인할 때 사용합니다.
 """
 
 from datetime import date
