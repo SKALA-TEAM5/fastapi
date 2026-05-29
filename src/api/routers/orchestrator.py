@@ -20,9 +20,11 @@ from src.schemas.orchestrator import (
     OrchestratorStatusResponse,
     EvidenceReviewRequest,
     ReportDraftRequest,
+    UsageStatementClassifyRequest,
     UsageStatementParseRequest,
 )
 from src.services.orchestrator_service import (
+    classify_existing_usage_statement,
     get_orchestrator_dashboard,
     get_orchestrator_status,
     parse_and_classify_usage_statement,
@@ -47,6 +49,21 @@ async def parse_usage_statement(request: UsageStatementParseRequest) -> Orchestr
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f"사용내역서 파싱/classi 실행 실패: {type(exc).__name__}: {exc}",
+        ) from exc
+
+
+@router.post(
+    "/usage-statements/classify",
+    response_model=OrchestratorActionResponse,
+    summary="저장된 사용내역서 세부항목 classi 재분류",
+)
+async def classify_usage_statement(request: UsageStatementClassifyRequest) -> OrchestratorActionResponse:
+    try:
+        return classify_existing_usage_statement(request.project_id, request.usage_statement_id)
+    except Exception as exc:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"사용내역서 세부항목 classi 재분류 실패: {type(exc).__name__}: {exc}",
         ) from exc
 
 

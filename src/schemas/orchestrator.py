@@ -20,6 +20,11 @@ class UsageStatementParseRequest(BaseModel):
     file_id: int = Field(..., description="files.id. uploaded_evidence_type_code=usage_statement인 파일")
 
 
+class UsageStatementClassifyRequest(BaseModel):
+    project_id: int
+    usage_statement_id: int
+
+
 class OrchestratorActionResponse(BaseModel):
     status: str = Field(..., description="업무 단계 처리 상태")
     message: str = Field("", description="프론트 표시용 메시지")

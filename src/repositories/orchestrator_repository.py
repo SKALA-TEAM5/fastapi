@@ -149,6 +149,51 @@ def list_usage_statement_item_ids(usage_statement_id: int) -> list[int]:
             return [int(row[0]) for row in cur.fetchall()]
 
 
+def list_usage_statement_items_for_classi(usage_statement_id: int) -> list[dict[str, Any]]:
+    with get_connection() as conn:
+        with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+            cur.execute(
+                """
+                SELECT id, category_code, item_name, unit, quantity, unit_price,
+                       total_amount, remark, page_no, used_on
+                FROM usage_statement_items
+                WHERE usage_statement_id = %(usage_statement_id)s
+                ORDER BY id
+                """,
+                {"usage_statement_id": usage_statement_id},
+            )
+            return [dict(row) for row in cur.fetchall()]
+
+
+def update_usage_statement_item_categories(
+    *,
+    usage_statement_id: int,
+    changes: list[dict[str, Any]],
+) -> int:
+    if not changes:
+        return 0
+
+    with get_connection() as conn:
+        with conn.cursor() as cur:
+            updated_count = 0
+            for change in changes:
+                cur.execute(
+                    """
+                    UPDATE usage_statement_items
+                    SET category_code = %(category_code)s
+                    WHERE id = %(item_id)s
+                      AND usage_statement_id = %(usage_statement_id)s
+                    """,
+                    {
+                        "item_id": change["item_id"],
+                        "usage_statement_id": usage_statement_id,
+                        "category_code": change["category_code"],
+                    },
+                )
+                updated_count += int(cur.rowcount or 0)
+            return updated_count
+
+
 def list_evidence_file_ids_by_type(project_id: int) -> dict[str, list[int]]:
     with get_connection() as conn:
         with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:

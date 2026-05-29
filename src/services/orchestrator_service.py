@@ -19,15 +19,18 @@ from uuid import uuid4
 from src.agents.report_agent.agent import ReportAgent
 from src.agents.report_agent.context_builder import build_report_context
 from src.agents.safety_doc_agent.agent import check_missing_evidence
+from src.agents.classifier_agent.agent import review_usage_statement
 from src.repositories.orchestrator_repository import (
     close_supplement_todos,
     create_supplement_todos,
     list_evidence_file_ids_by_type,
     list_latest_agent_logs,
     list_usage_statement_item_ids,
+    list_usage_statement_items_for_classi,
     mark_orchestrator,
     scan_orchestrator_state,
     select_evidence_agents,
+    update_usage_statement_item_categories,
     upsert_agent_log,
 )
 from src.repositories.db import get_connection
@@ -51,6 +54,177 @@ def parse_and_classify_usage_statement(file_id: int) -> OrchestratorActionRespon
         target_agents=["classi"],
         result=result,
     )
+
+
+def classify_existing_usage_statement(
+    project_id: int,
+    usage_statement_id: int,
+) -> OrchestratorActionResponse:
+    items = list_usage_statement_items_for_classi(usage_statement_id)
+    upsert_agent_log(
+        project_id=project_id,
+        usage_statement_id=usage_statement_id,
+        agent_type_code="classi",
+        status_code="running",
+        result_code=None,
+        reason="저장된 세부내역 기준 classi 재분류를 실행 중입니다.",
+        details={
+            "event": "classification_running",
+            "summary": "저장된 세부내역 기준 classi 재분류를 실행 중입니다.",
+            "payload": {"item_count": len(items)},
+        },
+        model_name="classifier_agent",
+    )
+
+    if not items:
+        details = {
+            "event": "classification_checked",
+            "summary": "분류할 세부내역이 없습니다.",
+            "payload": {
+                "changed_count": 0,
+                "kept_count": 0,
+                "changes": [],
+                "results": [],
+            },
+        }
+        upsert_agent_log(
+            project_id=project_id,
+            usage_statement_id=usage_statement_id,
+            agent_type_code="classi",
+            status_code="success",
+            result_code="success",
+            reason=details["summary"],
+            details=details,
+            model_name="classifier_agent",
+        )
+        return OrchestratorActionResponse(
+            status="success",
+            message=details["summary"],
+            usage_statement_id=usage_statement_id,
+            target_agents=["classi"],
+            result=details,
+        )
+
+    try:
+        classifier_rows = [
+            {
+                "row_id": index,
+                "given_category_code": item.get("category_code"),
+                "item_name": item.get("item_name"),
+            }
+            for index, item in enumerate(items, start=1)
+        ]
+        review_response = review_usage_statement(
+            usage_statement_id=usage_statement_id,
+            rows=classifier_rows,
+            basic_info={},
+        )
+        review_map = {result.row_id: result for result in review_response.results}
+
+        kept_count = 0
+        changes: list[dict[str, Any]] = []
+        category_updates: list[dict[str, Any]] = []
+        classifier_results: list[dict[str, Any]] = []
+
+        for row_id, item in enumerate(items, start=1):
+            original_category = item.get("category_code")
+            review = review_map.get(row_id)
+            if review is None:
+                kept_count += 1
+                classifier_results.append(
+                    {
+                        "row_id": row_id,
+                        "item_id": item.get("id"),
+                        "item_name": item.get("item_name"),
+                        "original_category_code": original_category,
+                        "final_category_code": original_category,
+                        "status": "appropriate",
+                        "reason": "classifier result was missing, so the current category was kept.",
+                    }
+                )
+                continue
+
+            updated_category = review.final_category_code or original_category
+            status = "appropriate" if review.decision_status == "유지" else "inappropriate"
+            if updated_category != original_category:
+                changes.append(
+                    {
+                        "row_id": row_id,
+                        "item_id": item.get("id"),
+                        "item_name": review.item_name,
+                        "before": {"category_code": original_category},
+                        "after": {"category_code": updated_category},
+                        "reason": review.reason,
+                    }
+                )
+                category_updates.append(
+                    {
+                        "item_id": item["id"],
+                        "category_code": updated_category,
+                    }
+                )
+            else:
+                kept_count += 1
+
+            classifier_results.append(
+                {
+                    "row_id": row_id,
+                    "item_id": item.get("id"),
+                    "item_name": review.item_name,
+                    "original_category_code": original_category,
+                    "final_category_code": updated_category,
+                    "status": status,
+                    "reason": review.reason,
+                }
+            )
+
+        updated_count = update_usage_statement_item_categories(
+            usage_statement_id=usage_statement_id,
+            changes=category_updates,
+        )
+        changed_count = len(changes)
+        summary = (
+            f"세부내역 {changed_count}건을 올바른 항목으로 이동했습니다."
+            if changed_count
+            else "세부내역 분류 이동 없음"
+        )
+        details = {
+            "event": "classification_updated" if changed_count else "classification_checked",
+            "summary": summary,
+            "payload": {
+                "changed_count": changed_count,
+                "updated_count": updated_count,
+                "kept_count": kept_count,
+                "changes": changes,
+                "results": classifier_results,
+            },
+        }
+        upsert_agent_log(
+            project_id=project_id,
+            usage_statement_id=usage_statement_id,
+            agent_type_code="classi",
+            status_code="success",
+            result_code="success",
+            reason=summary,
+            details=details,
+            model_name="classifier_agent",
+        )
+        return OrchestratorActionResponse(
+            status="success",
+            message=summary,
+            usage_statement_id=usage_statement_id,
+            target_agents=["classi"],
+            result=details,
+        )
+    except Exception as exc:
+        result = _mark_agent_failed(project_id, usage_statement_id, "classi", exc)
+        return OrchestratorActionResponse(
+            status="fail",
+            message=result["reason"],
+            usage_statement_id=usage_statement_id,
+            target_agents=["classi"],
+            result={"classi": result},
+        )
 
 
 def get_orchestrator_status(project_id: int, usage_statement_id: int) -> OrchestratorStatusResponse:

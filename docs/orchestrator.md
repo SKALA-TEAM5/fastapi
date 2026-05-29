@@ -29,6 +29,7 @@ Spring Backend가 프론트 요청을 받아 권한을 확인한 뒤 FastAPI Orc
 | Method   | FastAPI Path                                                                                | 역할                                                                             |
 | -------- | ------------------------------------------------------------------------------------------- | -------------------------------------------------------------------------------- |
 | `POST` | `/api/v1/orchestrator/usage-statements/parse`                                             | 사용내역서 업로드 후 OCR/Parse와 `classi` 실행                                 |
+| `POST` | `/api/v1/orchestrator/usage-statements/classify`                                          | 저장된 세부항목 수정 후 원본 파일 재파싱 없이 `classi` 재분류                  |
 | `POST` | `/api/v1/orchestrator/usage-statements/evidence`                                          | 증빙 검증 버튼.`safety-doc`, 조건부 `link`, 조건부 `vision` 실행 대상 결정 |
 | `POST` | `/api/v1/orchestrator/usage-statements/legal`                                             | SHE 담당자 법령 검토 실행 조건 확인 및 `legal` 실행 대상 결정                  |
 | `POST` | `/api/v1/orchestrator/usage-statements/report`                                            | `legal` 성공 후 `report` 실행 대상 결정                                      |
@@ -179,7 +180,7 @@ src/repositories/orchestrator_repository.py
 
 | Agent | 연결 상태 | 설명 |
 |---|---|---|
-| `classi` | 연결됨 | `parse_usage_statement()`를 통해 사용내역서 OCR/Parse와 분류를 실행 |
+| `classi` | 연결됨 | 최초 업로드는 `parse_usage_statement()`로 OCR/Parse와 분류 실행, 세부항목 수정 후에는 저장된 DB 항목 기준 재분류 |
 | `safety-doc` | 연결됨 | 사용내역서 세부항목별 `check_missing_evidence(item_id)` 실행 |
 | `link` | 연결됨 | 영수증/거래명세표/세금계산서 파일이 있을 때 `run_link_pipeline()` 실행 |
 | `vision` | 미구현 | 현장사진 파일이 있으면 실행 대상은 되지만, 실제 Vision Agent 구현체가 아직 없어 `fail/fail` 로그 기록 |
