@@ -31,7 +31,7 @@ log = logging.getLogger(__name__)
 MAX_RETRY = 3
 
 _kiwi = Kiwi()
-_RERANK_MODEL = "BAAI/bge-reranker-base"
+_RERANK_MODEL = "BAAI/bge-reranker-v2-m3"
 _TOP_N = 5
 _BATCH_SIZE = 8
 
