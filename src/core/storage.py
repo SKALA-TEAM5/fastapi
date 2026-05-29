@@ -1,14 +1,13 @@
 # --------------------------------------------------------------------------
 # 작성자   : 송상민(ss19801)
 # 작성일   : 2026-05-04
+# 수정일   : 2026-05-29
 #
 # [ 주요 클래스 및 함수 정의 ]
 #
-# 1. LocalJSONCache       : TTL 기반 로컬 JSON 캐시 클래스
-# 2. upsert_documents()   : Qdrant 벡터 DB에 문서 적재(upsert)
-# 3. load_vectorstore()   : Qdrant 컬렉션 벡터스토어 로드
-# 4. load_collection_documents() : 컬렉션 전체 문서 로드
-# 5. reset_collection()   : 컬렉션 초기화
+# 1. LocalJSONCache              : TTL 기반 로컬 JSON 캐시 클래스
+# 2. load_vectorstore()          : Qdrant 컬렉션 벡터스토어 로드 (read)
+# 3. load_collection_documents() : 컬렉션 전체 문서 로드 (read)
 # --------------------------------------------------------------------------
 import json
 import logging
@@ -30,17 +29,6 @@ DEFAULT_DIR = Path(".cache")
 DEFAULT_EMBED_MODEL = "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2"
 DEFAULT_QDRANT_URL = "http://localhost:6333"
 DEFAULT_COLLECTION = "legal_documents"
-
-# ── chunk_id 결정론적 생성 ──────────────────────────────────────────
-# legal_master.id(master_id) → uuid5 → Qdrant point ID
-# 동일한 master_id는 항상 동일한 chunk_id를 반환하므로
-# RDB 변경 감지 후 chunk_id 만으로 Qdrant 포인트를 특정할 수 있다.
-_CHUNK_ID_NAMESPACE = uuid.UUID("6ba7b810-9dad-11d1-80b4-00c04fd430c8")
-
-
-def make_chunk_id(master_id: str) -> str:
-    """master_id(legal_master.id) → 결정론적 UUID (Qdrant point ID 겸용)."""
-    return str(uuid.uuid5(_CHUNK_ID_NAMESPACE, master_id))
 
 _embeddings_cache: dict[str, HuggingFaceEmbeddings] = {}
 _vectorstore_cache: dict[tuple, Any] = {}
@@ -114,121 +102,7 @@ def _get_qdrant_url(qdrant_url: str | None = None) -> str:
 
 def _get_qdrant_client(qdrant_url: str | None = None):
     from qdrant_client import QdrantClient
-
     return QdrantClient(url=_get_qdrant_url(qdrant_url))
-
-
-def reset_collection(
-    collection_name: str,
-    *,
-    qdrant_url: str | None = None,
-) -> None:
-    collection = _sanitize_name(collection_name)
-    _invalidate_collection_cache(collection)
-    try:
-        client = _get_qdrant_client(qdrant_url)
-        client.delete_collection(collection)
-        log.info(f"Qdrant collection deleted: {collection}")
-    except Exception as e:
-        log.info(f"Collection reset skipped (missing or failed): {e}")
-
-
-def upsert_documents(
-    collection_name: str,
-    documents: list[Document],
-    *,
-    qdrant_url: str | None = None,
-    embed_model: str = DEFAULT_EMBED_MODEL,
-) -> Any:
-    from langchain_qdrant import QdrantVectorStore
-    from qdrant_client.models import Distance, VectorParams
-
-    collection = _sanitize_name(collection_name)
-    embeddings = _get_embeddings(embed_model)
-    url = _get_qdrant_url(qdrant_url)
-    client = _get_qdrant_client(url)
-    key = (collection, url, embed_model)
-
-    try:
-        collection_exists = bool(client.collection_exists(collection))
-    except Exception:
-        collection_exists = False
-
-    print(f"Qdrant embedding/upsert in progress (collection: {collection}, docs: {len(documents)})...")
-    if not collection_exists:
-        sample_vector = embeddings.embed_query(documents[0].page_content if documents else "legal")
-        client.create_collection(
-            collection_name=collection,
-            vectors_config=VectorParams(size=len(sample_vector), distance=Distance.COSINE),
-        )
-
-    vectorstore = QdrantVectorStore(
-        client=client,
-        collection_name=collection,
-        embedding=embeddings,
-        validate_collection_config=False,
-    )
-    if documents:
-        vectorstore.add_documents(documents)
-    _vectorstore_cache[key] = vectorstore
-    _invalidate_collection_cache(collection)
-    print(f"Qdrant upsert complete -> {url} / {collection}")
-    return vectorstore
-
-
-def upsert_with_ids(
-    collection_name: str,
-    documents: list[Document],
-    ids: list[str],
-    *,
-    qdrant_url: str | None = None,
-    embed_model: str = DEFAULT_EMBED_MODEL,
-) -> Any:
-    """Qdrant에 문서를 적재하되 point ID를 외부에서 지정한다.
-
-    ids[i] 가 documents[i] 의 Qdrant point ID 가 된다.
-    make_chunk_id(master_id) 로 생성한 UUID 를 넘기면
-    legal_master.id ↔ Qdrant point ID 가 1:1로 고정된다.
-
-    이미 동일 ID가 존재하면 Qdrant 내부 upsert 로 덮어쓴다.
-    """
-    from langchain_qdrant import QdrantVectorStore
-    from qdrant_client.models import Distance, VectorParams
-
-    if len(documents) != len(ids):
-        raise ValueError(f"documents({len(documents)})와 ids({len(ids)}) 길이가 다릅니다.")
-
-    collection = _sanitize_name(collection_name)
-    embeddings  = _get_embeddings(embed_model)
-    url         = _get_qdrant_url(qdrant_url)
-    client      = _get_qdrant_client(url)
-    key         = (collection, url, embed_model)
-
-    try:
-        collection_exists = bool(client.collection_exists(collection))
-    except Exception:
-        collection_exists = False
-
-    print(f"Qdrant upsert_with_ids (collection: {collection}, docs: {len(documents)})...")
-    if not collection_exists:
-        sample_vector = embeddings.embed_query(documents[0].page_content if documents else "legal")
-        client.create_collection(
-            collection_name=collection,
-            vectors_config=VectorParams(size=len(sample_vector), distance=Distance.COSINE),
-        )
-
-    vectorstore = QdrantVectorStore(
-        client=client,
-        collection_name=collection,
-        embedding=embeddings,
-        validate_collection_config=False,
-    )
-    if documents:
-        vectorstore.add_documents(documents, ids=ids)
-    _vectorstore_cache[key] = vectorstore
-    _invalidate_collection_cache(collection)
-    print(f"Qdrant upsert_with_ids complete -> {url} / {collection}")
-    return vectorstore
 
 
 def load_vectorstore(
