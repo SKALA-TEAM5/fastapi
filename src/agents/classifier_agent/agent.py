@@ -8,11 +8,17 @@
 # 2. review_usage_statement() : 사용내역서 행 단위 카테고리 검토
 # 3. verify_categories() : 분류 결과 검증 응답 생성
 # --------------------------------------------------------------------------
+import json
 import logging
 import re
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from typing import Any
+
+try:
+    from langchain_community.callbacks import get_openai_callback
+except ImportError:  # pragma: no cover
+    get_openai_callback = None  # type: ignore
 
 from langchain_core.documents import Document
 try:
@@ -785,6 +791,79 @@ def _review_single_usage_statement_row(
     )
 
 
+_INSERT_CLASSI_LOG_SQL = """
+    INSERT INTO agent_logs (
+        project_id, usage_statement_id, usage_statement_item_id,
+        agent_type_code, status_code, result_code,
+        reason, details, model_name, token
+    )
+    VALUES (
+        %(project_id)s, %(usage_statement_id)s, %(item_db_id)s,
+        'classi', 'success', %(result_code)s,
+        %(reason)s, %(details)s::jsonb, %(model_name)s, %(token)s
+    )
+    RETURNING id
+"""
+
+
+def _write_classi_agent_log(
+    *,
+    project_id: int,
+    usage_statement_id: int,
+    results: list[RowReviewResult],
+    model_name: str,
+    token: int | None,
+) -> None:
+    """classi 에이전트 결과를 agent_logs에 INSERT한다 (행당 1행)."""
+    from src.repositories.db import get_connection
+
+    try:
+        with get_connection() as conn:
+            # item_name → usage_statement_items.id 맵 선조회
+            item_id_map: dict[str, int] = {}
+            with conn.cursor() as cur:
+                cur.execute(
+                    "SELECT id, item_name FROM usage_statement_items WHERE usage_statement_id = %s ORDER BY id",
+                    (usage_statement_id,),
+                )
+                for row_id, item_name in cur.fetchall():
+                    if item_name not in item_id_map:
+                        item_id_map[item_name] = row_id
+
+            inserted = 0
+            with conn.cursor() as cur:
+                for result in results:
+                    item_db_id = item_id_map.get(result.item_name)
+                    result_code = (
+                        "hil"
+                        if result.decision_status == "카테고리변경" or result.needs_human_review
+                        else "success"
+                    )
+                    details = {
+                        "item": {
+                            "item_name": result.item_name,
+                            "given_category_code": result.given_category_code,
+                            "final_category_code": result.final_category_code,
+                            "decision_status": result.decision_status,
+                        }
+                    }
+                    cur.execute(_INSERT_CLASSI_LOG_SQL, {
+                        "project_id":         project_id,
+                        "usage_statement_id": usage_statement_id,
+                        "item_db_id":         item_db_id,
+                        "result_code":        result_code,
+                        "reason":             result.reason[:1000] if result.reason else None,
+                        "details":            json.dumps(details, ensure_ascii=False),
+                        "model_name":         model_name,
+                        "token":              token,
+                    })
+                    inserted += 1
+
+        log.info("[agent_log] classi INSERT %d건 완료", inserted)
+    except Exception as exc:
+        log.warning("[agent_log] classi INSERT 실패 (로그 생략 후 계속): %s", exc)
+
+
 @traceable(name="classifier.review_usage_statement")
 def review_usage_statement(
     payload: dict[str, Any] | None = None,
@@ -793,10 +872,14 @@ def review_usage_statement(
     rows: list[dict[str, Any]] | list[UsageStatementRow] | None = None,
     basic_info: dict[str, Any] | None = None,
     collection: str = DEFAULT_COLLECTION,
+    project_id: int | None = None,
+    model_name: str = "gpt-4o-mini",
 ) -> UsageStatementReviewResponse:
     """
     사용내역서 row 목록을 받아 각 항목의 카테고리가 맞는지 검토하고
     필요하면 최종 카테고리 코드를 수정한다.
+
+    project_id, usage_statement_id(int)가 모두 제공되면 agent_logs에 INSERT한다.
     """
     request = _coerce_usage_statement_input(
         payload=payload,
@@ -805,6 +888,8 @@ def review_usage_statement(
         basic_info=basic_info,
     )
 
+    total_tokens: int | None = None
+
     if not request.rows:
         results: list[RowReviewResult] = []
     else:
@@ -812,17 +897,37 @@ def review_usage_statement(
         # 스레드 간 중복 모델 로딩과 종료 시 리소스 경고를 줄인다.
         _get_rerank_model()
         max_workers = min(8, len(request.rows))
-        with ThreadPoolExecutor(max_workers=max_workers) as executor:
-            results = list(
-                executor.map(
-                    lambda row: _review_single_usage_statement_row(
-                        row=row,
-                        basic_info=request.basic_info,
-                        collection=collection,
-                    ),
-                    request.rows,
+
+        def _run() -> list[RowReviewResult]:
+            with ThreadPoolExecutor(max_workers=max_workers) as executor:
+                return list(
+                    executor.map(
+                        lambda row: _review_single_usage_statement_row(
+                            row=row,
+                            basic_info=request.basic_info,
+                            collection=collection,
+                        ),
+                        request.rows,
+                    )
                 )
-            )
+
+        if get_openai_callback is not None:
+            with get_openai_callback() as cb:
+                results = _run()
+            total_tokens = cb.total_tokens or None
+        else:
+            results = _run()
+
+    # agent_logs INSERT (project_id + int usage_statement_id 있을 때만)
+    _uid = request.usage_statement_id
+    if project_id is not None and isinstance(_uid, int):
+        _write_classi_agent_log(
+            project_id=project_id,
+            usage_statement_id=_uid,
+            results=results,
+            model_name=model_name,
+            token=total_tokens,
+        )
 
     return UsageStatementReviewResponse(
         usage_statement_id=request.usage_statement_id,
