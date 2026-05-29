@@ -55,9 +55,8 @@ class ReportAgentRunResponse(BaseModel):
     description="""
 ReportContext를 ReportDraft JSON으로 변환합니다.
 
-현재 단계에서는 `context`를 직접 전달한 요청을 처리합니다.
-`project_id`와 `usage_statement_id`만으로 DB에서 ReportContext를 조립하는 경로는
-다음 단계에서 repository 구현과 함께 연결합니다.
+`context`가 없으면 `project_id`와 `usage_statement_id`로 DB에서 ReportContext를 조립합니다.
+실행 결과는 `agent_logs`에 service 스키마의 `success/fail` 상태값으로 기록합니다.
     """,
 )
 async def run_report_agent(request: ReportAgentRunRequest) -> ReportAgentRunResponse:
@@ -97,11 +96,12 @@ async def run_report_agent(request: ReportAgentRunRequest) -> ReportAgentRunResp
                 update_agent_log_status(
                     conn,
                     log_id=log_id,
-                    status_code="completed",
+                    status_code="success",
                     details={
                         "report_no": draft.report_no,
                         "site_name": draft.site_name,
                         "needs_human_review": draft.needs_human_review,
+                        "event": "report_completed",
                     },
                 )
     except ReportLLMError as exc:
@@ -125,7 +125,7 @@ async def run_report_agent(request: ReportAgentRunRequest) -> ReportAgentRunResp
 
     return ReportAgentRunResponse(
         run_id=request.run_id,
-        status="completed",
+        status="success",
         log_ids=[log_id] if log_id is not None else [],
         result={"reportDraft": draft.model_dump(mode="json")},
     )
@@ -142,6 +142,6 @@ def _mark_failed(log_id: int | None, message: str) -> None:
         update_agent_log_status(
             conn,
             log_id=log_id,
-            status_code="failed",
-            details={"error": message},
+            status_code="fail",
+            details={"event": "report_failed", "error": message},
         )

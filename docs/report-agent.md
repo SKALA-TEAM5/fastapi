@@ -79,6 +79,7 @@ Spring Backend
 FastAPI
   POST /api/v1/agents/report/run
   DB row -> ReportContext
+  agent_logs의 classi/legal success 결과를 item별 입력에 반영
   ReportAgent.generate(context)
   agent_logs 기록
   ReportDraft JSON 반환
@@ -117,7 +118,7 @@ POST /api/v1/agents/report/run
 {
   "run_id": "11111111-1111-1111-1111-111111111111",
   "agent_type": "report",
-  "status": "completed",
+  "status": "success",
   "log_ids": [123],
   "result": {
     "reportDraft": {
@@ -147,6 +148,7 @@ POST /api/v1/agents/report/run
 - 법령 validator 결과: `legal_validation_result`
 
 생성된 report 실행 로그는 기존 `agent_logs`에 `agent_type_code = 'report'`로 기록합니다.
+로그 상태값은 service 스키마와 동일하게 `status_code = success/fail`, `result_code = success/fail`을 사용합니다.
 
 집행 항목별 classifier/validator 결과는 `UsageStatementItemContext`에 붙입니다.
 
@@ -159,6 +161,25 @@ UsageStatementItemContext(
 ```
 
 `legal_validation_result.citations`는 보고서의 법령 근거와 감사 추적용 citation으로 보존됩니다.
+
+legal 결과는 우선 `agent_logs.details.payload.results[]`에서 항목별로 읽습니다.
+
+```json
+{
+  "item_id": 123,
+  "category_code": "CAT_02",
+  "status": "적절",
+  "reason": "법령 검토 사유",
+  "citations": [
+    {
+      "legal_basis": "제7조제1항제2호",
+      "summary": "산업재해 예방 목적의 안전시설비에 해당"
+    }
+  ]
+}
+```
+
+항목별 `item_id`가 없고 카테고리 단위 결과만 있으면 같은 `category_code`의 항목에 fallback으로 적용합니다.
 
 ## 판정 기준
 
