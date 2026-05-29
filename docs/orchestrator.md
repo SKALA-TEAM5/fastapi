@@ -184,7 +184,7 @@ src/repositories/orchestrator_repository.py
 | `safety-doc` | 연결됨 | 사용내역서 세부항목별 `check_missing_evidence(item_id)` 실행 |
 | `link` | 연결됨 | 영수증/거래명세표/세금계산서 파일이 있을 때 `run_link_pipeline()` 실행 |
 | `vision` | 미구현 | 현장사진 파일이 있으면 실행 대상은 되지만, 실제 Vision Agent 구현체가 아직 없어 `fail/fail` 로그 기록 |
-| `legal` | 미구현 | 실행 조건 검사는 수행하지만, 실제 Legal Agent 구현체가 아직 없어 `fail/fail` 로그 기록 |
+| `legal` | 연결됨 | 기존 validator agent를 실행하고 `agent_logs.details.payload.results[]`에 report가 읽을 항목별 법령 판정 저장 |
 | `report` | 연결됨 | `ReportAgent`와 `build_report_context()`로 보고서 초안 생성 |
 
 ## 보완 TODO 연결
@@ -213,7 +213,36 @@ src/repositories/orchestrator_repository.py
 
 `requested_by_user_id`가 없으면 `agent_logs`는 기록하지만 `action_requests`는 생성하지 않는다.
 
+## legal -> report 데이터 계약
+
+`legal`은 실행 성공 시 `agent_logs`에 다음 형태로 결과를 남긴다.
+
+```json
+{
+  "event": "legal_completed",
+  "summary": "법령 검토 결과 보고서 반영 대상 2건",
+  "payload": {
+    "category_results": [],
+    "results": [
+      {
+        "item_id": 123,
+        "category_code": "CAT_02",
+        "status": "검토필요",
+        "reason": "판정 사유",
+        "citations": [
+          {
+            "legal_basis": "제7조제1항제2호",
+            "summary": "근거 요약"
+          }
+        ]
+      }
+    ]
+  }
+}
+```
+
+`report`는 `results[].item_id`를 우선 사용하고, 항목 ID가 없으면 `category_code` 기준 결과를 fallback으로 사용한다.
+
 ## 현재 TODO
 
 - `vision` Agent 구현체 추가 후 Orchestrator 연결
-- `legal` Agent 구현체 추가 후 Orchestrator 연결

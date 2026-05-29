@@ -16,10 +16,14 @@ from datetime import date
 from typing import Any
 from uuid import uuid4
 
+import psycopg2.extras
+
 from src.agents.report_agent.agent import ReportAgent
 from src.agents.report_agent.context_builder import build_report_context
 from src.agents.safety_doc_agent.agent import check_missing_evidence
 from src.agents.classifier_agent.agent import review_usage_statement
+from src.agents.validator_agent.agent import summarize_audit_response, validate_usage_statement
+from src.schemas.classifier import CATEGORIES
 from src.repositories.orchestrator_repository import (
     close_supplement_todos,
     create_supplement_todos,
@@ -393,16 +397,10 @@ def run_legal_review(
         reason="SHE 담당자가 legal 검토를 시작했습니다.",
         payload={"she_user_id": she_user_id},
     )
-    result = _mark_missing_agent(
-        project_id=project_id,
-        usage_statement_id=usage_statement_id,
-        agent_type_code="legal",
-        reason="legal Agent 구현체가 아직 FastAPI에 연결되어 있지 않습니다.",
-        payload={"she_user_id": she_user_id},
-    )
+    result = _run_legal_agent(project_id, usage_statement_id, she_user_id=she_user_id)
     return OrchestratorActionResponse(
-        status="fail",
-        message="legal 실행 조건은 통과했지만 실제 legal Agent 구현체가 아직 없습니다.",
+        status=result["status_code"],
+        message=result["reason"],
         usage_statement_id=usage_statement_id,
         target_agents=["legal"],
         result={"legal": result},
@@ -587,6 +585,70 @@ def _run_link_agent(project_id: int, usage_statement_id: int) -> dict[str, Any]:
         return _mark_agent_failed(project_id, usage_statement_id, "link", exc)
 
 
+def _run_legal_agent(
+    project_id: int,
+    usage_statement_id: int,
+    *,
+    she_user_id: int | None = None,
+) -> dict[str, Any]:
+    upsert_agent_log(
+        project_id=project_id,
+        usage_statement_id=usage_statement_id,
+        agent_type_code="legal",
+        status_code="running",
+        result_code=None,
+        reason="legal Agent를 실행 중입니다.",
+        details={"event": "agent_running", "payload": {"she_user_id": she_user_id}},
+        model_name="validator_agent",
+    )
+
+    try:
+        document, category_rows = _build_validator_document(project_id, usage_statement_id)
+        audit_response = validate_usage_statement(document=document)
+        summary_response = summarize_audit_response(
+            response=audit_response,
+            usage_statement_id=usage_statement_id,
+        )
+        item_results = _legal_item_results_from_audit(
+            audit_response=audit_response,
+            summary_response=summary_response,
+            category_rows=category_rows,
+        )
+        category_results = [
+            result.model_dump(mode="json", by_alias=False)
+            for result in summary_response.results
+        ]
+        review_count = sum(1 for row in item_results if row["status"] != "적절")
+        reason = "법령 검토 결과 특이사항 없음" if review_count == 0 else f"법령 검토 결과 보고서 반영 대상 {review_count}건"
+        upsert_agent_log(
+            project_id=project_id,
+            usage_statement_id=usage_statement_id,
+            agent_type_code="legal",
+            status_code="success",
+            result_code="success",
+            reason=reason,
+            details={
+                "event": "legal_completed",
+                "summary": reason,
+                "payload": {
+                    "she_user_id": she_user_id,
+                    "usage_statement_id": usage_statement_id,
+                    "category_results": category_results,
+                    "results": item_results,
+                },
+            },
+            model_name="validator_agent",
+        )
+        return {
+            "status_code": "success",
+            "result_code": "success",
+            "reason": reason,
+            "result_count": len(item_results),
+        }
+    except Exception as exc:
+        return _mark_agent_failed(project_id, usage_statement_id, "legal", exc)
+
+
 def _run_report_agent(
     project_id: int,
     usage_statement_id: int,
@@ -641,6 +703,147 @@ def _run_report_agent(
         return {"status_code": "success", "result_code": "success", "reason": "보고서 초안 생성 완료", "result": result}
     except Exception as exc:
         return _mark_agent_failed(project_id, usage_statement_id, "report", exc)
+
+
+def _build_validator_document(project_id: int, usage_statement_id: int) -> tuple[dict[str, Any], dict[str, list[dict[str, Any]]]]:
+    with get_connection() as conn:
+        with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+            cur.execute(
+                """
+                SELECT p.appropriated_amount,
+                       us.cumulative_progress_rate
+                FROM usage_statements us
+                JOIN projects p ON p.id = us.project_id
+                WHERE us.id = %(usage_statement_id)s
+                  AND us.project_id = %(project_id)s
+                """,
+                {"project_id": project_id, "usage_statement_id": usage_statement_id},
+            )
+            header = cur.fetchone()
+            if header is None:
+                raise KeyError(f"usage_statement not found: {usage_statement_id}")
+
+            cur.execute(
+                """
+                SELECT category_code, previous_amount, current_amount, cumulative_amount
+                FROM usage_statement_summaries
+                WHERE usage_statement_id = %(usage_statement_id)s
+                """,
+                {"usage_statement_id": usage_statement_id},
+            )
+            summaries = {row["category_code"]: row for row in cur.fetchall()}
+
+            cur.execute(
+                """
+                SELECT id, category_code, used_on, item_name, unit, quantity,
+                       unit_price, total_amount, remark
+                FROM usage_statement_items
+                WHERE usage_statement_id = %(usage_statement_id)s
+                ORDER BY category_code, id
+                """,
+                {"usage_statement_id": usage_statement_id},
+            )
+            items = [dict(row) for row in cur.fetchall()]
+
+    grouped: dict[str, list[dict[str, Any]]] = {}
+    for item in items:
+        grouped.setdefault(str(item["category_code"]), []).append(item)
+
+    categories = []
+    category_rows: dict[str, list[dict[str, Any]]] = {}
+    for category_code, rows in grouped.items():
+        summary = summaries.get(category_code) or {}
+        item_rows = [
+            {
+                "행ID": row["id"],
+                "사용일자": row["used_on"].isoformat() if row.get("used_on") else None,
+                "항목명": row["item_name"],
+                "단위": row.get("unit"),
+                "수량": _number_or_none(row.get("quantity")),
+                "단가": _number_or_none(row.get("unit_price")),
+                "금액": _number_or_none(row.get("total_amount")) or 0,
+                "비고": row.get("remark") or "",
+            }
+            for row in rows
+        ]
+        category_rows[category_code] = item_rows
+        categories.append(
+            {
+                "카테고리코드": category_code,
+                "집계정보": {
+                    "전회사용금액": _number_or_none(summary.get("previous_amount")) or 0,
+                    "금회사용금액": _number_or_none(summary.get("current_amount")) or 0,
+                    "누적사용금액": _number_or_none(summary.get("cumulative_amount")) or 0,
+                },
+                "항목목록": item_rows,
+            }
+        )
+
+    return (
+        {
+            "사용내역서ID": usage_statement_id,
+            "기본정보": {
+                "산안비총액": _number_or_none(header.get("appropriated_amount")) or 0,
+                "누계공정률": _number_or_none(header.get("cumulative_progress_rate")),
+            },
+            "카테고리별데이터": categories,
+        },
+        category_rows,
+    )
+
+
+def _legal_item_results_from_audit(
+    *,
+    audit_response,
+    summary_response,
+    category_rows: dict[str, list[dict[str, Any]]],
+) -> list[dict[str, Any]]:
+    summary_by_category = {summary.category_code: summary for summary in summary_response.results}
+    category_name_to_code = {name: code for code, name in CATEGORIES.items()}
+    results: list[dict[str, Any]] = []
+    for category_name, category_result in audit_response.categories.items():
+        category_code = category_name_to_code.get(category_name, category_name)
+        summary = summary_by_category.get(category_code)
+        source_citations = [
+            {"legal_basis": source.law, "summary": source.summary}
+            for source in (summary.sources if summary else [])
+        ]
+        item_rows = category_rows.get(category_code) or []
+        for raw_item, judgment in zip(item_rows, category_result.items):
+            status = _legal_status_from_judgment(judgment, summary.status if summary else category_result.status)
+            citations = (
+                [{"legal_basis": law, "summary": None} for law in judgment.referenced_laws]
+                or source_citations
+            )
+            results.append(
+                {
+                    "item_id": raw_item["행ID"],
+                    "category_code": category_code,
+                    "status": status,
+                    "reason": judgment.review_reason or judgment.reasoning or (summary.reason if summary else ""),
+                    "citations": citations,
+                }
+            )
+    return results
+
+
+def _legal_status_from_judgment(judgment, category_status: str) -> str:
+    if judgment.needs_human_review:
+        return "검토필요"
+    if not judgment.allowed:
+        return "부적절"
+    if category_status in {"부적절", "검토필요"}:
+        return category_status
+    return "적절"
+
+
+def _number_or_none(value: Any) -> float | None:
+    if value is None:
+        return None
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
 
 
 def _mark_missing_agent(

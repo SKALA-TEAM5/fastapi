@@ -81,11 +81,11 @@ class PostgresReportRepository(ReportRepository):
             """,
             {"usage_statement_id": usage_statement_id},
         )
-        classification_by_item, legal_by_item = self._list_agent_results_by_item(usage_statement_id)
+        classification_by_item, legal_by_item, legal_by_category = self._list_agent_results(usage_statement_id)
         for row in rows:
             item_id = row["id"]
             row["classification_result"] = classification_by_item.get(item_id)
-            row["legal_validation_result"] = legal_by_item.get(item_id)
+            row["legal_validation_result"] = legal_by_item.get(item_id) or legal_by_category.get(row["category_code"])
         return rows
 
     def list_evidence_files_by_item(self, usage_statement_id: int) -> dict[int, list[dict]]:
@@ -160,27 +160,30 @@ class PostgresReportRepository(ReportRepository):
             {"project_id": project_id, "usage_statement_id": usage_statement_id},
         )
 
-    def _list_agent_results_by_item(self, usage_statement_id: int) -> tuple[dict[int, dict], dict[int, dict]]:
+    def _list_agent_results(self, usage_statement_id: int) -> tuple[dict[int, dict], dict[int, dict], dict[str, dict]]:
         rows = self._fetch_all(
             """
             SELECT agent_type_code, details
             FROM agent_logs
             WHERE usage_statement_id = %(usage_statement_id)s
               AND agent_type_code IN ('classi', 'legal')
-              AND status_code = 'completed'
+              AND status_code = 'success'
             ORDER BY created_at, id
             """,
             {"usage_statement_id": usage_statement_id},
         )
         classification_by_item: dict[int, dict] = {}
         legal_by_item: dict[int, dict] = {}
+        legal_by_category: dict[str, dict] = {}
         for row in rows:
             details = _json_dict(row.get("details"))
             if row["agent_type_code"] == "classi":
                 classification_by_item.update(_extract_classification_results(details))
             elif row["agent_type_code"] == "legal":
-                legal_by_item.update(_extract_legal_results(details))
-        return classification_by_item, legal_by_item
+                item_results, category_results = _extract_legal_results(details)
+                legal_by_item.update(item_results)
+                legal_by_category.update(category_results)
+        return classification_by_item, legal_by_item, legal_by_category
 
     def _fetch_one(self, query: str, params: dict | None = None) -> dict | None:
         with self.conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
@@ -241,27 +244,41 @@ def _extract_classification_results(details: dict[str, Any]) -> dict[int, dict]:
     return results
 
 
-def _extract_legal_results(details: dict[str, Any]) -> dict[int, dict]:
-    results: dict[int, dict] = {}
+def _extract_legal_results(details: dict[str, Any]) -> tuple[dict[int, dict], dict[str, dict]]:
+    item_results: dict[int, dict] = {}
+    category_results: dict[str, dict] = {}
     for row in _iter_result_rows(details):
+        result = _legal_result_from_row(row)
+        category_code = result["category_code"]
         item_id = _item_id(row)
-        if item_id is None:
-            continue
-        citations = row.get("citations") or row.get("sources") or []
-        results[item_id] = {
-            "category_code": str(row.get("category_code") or ""),
-            "status": _legal_status(str(row.get("status") or row.get("result_code") or row.get("decision") or "")),
-            "reason": str(row.get("reason") or row.get("summary") or row.get("agent_conclusion") or ""),
-            "citations": [_legal_citation(source) for source in citations if isinstance(source, dict)],
-        }
-    return results
+        if item_id is not None:
+            item_results[item_id] = result
+        elif category_code:
+            category_results[category_code] = result
+    return item_results, category_results
 
 
 def _iter_result_rows(details: dict[str, Any]) -> list[dict[str, Any]]:
-    candidates = details.get("results") or details.get("items") or details.get("result") or []
-    if isinstance(candidates, dict):
-        candidates = candidates.get("results") or candidates.get("items") or []
-    return [row for row in candidates if isinstance(row, dict)]
+    payload = details.get("payload") if isinstance(details.get("payload"), dict) else {}
+    rows: list[dict[str, Any]] = []
+    for source in (details, payload):
+        for key in ("results", "items", "item_results", "category_results", "result"):
+            candidates = source.get(key)
+            if isinstance(candidates, dict):
+                candidates = candidates.get("results") or candidates.get("items") or candidates.get("item_results") or candidates.get("category_results")
+            if isinstance(candidates, list):
+                rows.extend(row for row in candidates if isinstance(row, dict))
+    return rows
+
+
+def _legal_result_from_row(row: dict[str, Any]) -> dict[str, Any]:
+    citations = row.get("citations") or row.get("sources") or row.get("출처") or []
+    return {
+        "category_code": str(row.get("category_code") or row.get("카테고리코드") or ""),
+        "status": _legal_status(str(row.get("status") or row.get("result_code") or row.get("decision") or row.get("판정상태") or "")),
+        "reason": str(row.get("reason") or row.get("summary") or row.get("agent_conclusion") or row.get("사유") or ""),
+        "citations": [_legal_citation(source) for source in citations if isinstance(source, dict)],
+    }
 
 
 def _item_id(row: dict[str, Any]) -> int | None:
