@@ -1,5 +1,25 @@
 # AI Workspace
 
+## 환경 설정 원칙
+
+- 로컬 개발은 `.env`를 사용합니다. 실제 `.env`는 커밋하지 않습니다.
+- 커밋되는 파일은 `.env.example`뿐이며, API key와 비밀번호는 placeholder로 둡니다.
+- Kubernetes 배포 시에는 ConfigMap/Secret으로 DB, Qdrant, OpenAI 설정을 주입합니다.
+- `main`에 머지되면 운영 반영 대상이 되므로, 통합 확인은 `develop`에서 먼저 진행합니다.
+
+로컬에서 공용 DB를 사용하려면 port-forward를 열고 `.env.example`을 복사합니다.
+
+```bash
+kubectl port-forward svc/team5-postgres 5433:5432 -n skala3-finalproj-class2-team5
+cp .env.example .env
+```
+
+Qdrant를 Kubernetes에 띄운 뒤 로컬에서 확인할 때는 별도 터미널에서 포워딩합니다.
+
+```bash
+kubectl port-forward svc/team5-qdrant 6333:6333 -n skala3-finalproj-class2-team5
+```
+
 주요 목적:
 
 - 문서 이해 및 분류용 AI agent 개발
