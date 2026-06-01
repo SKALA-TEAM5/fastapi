@@ -52,7 +52,7 @@ from src.schemas.orchestrator import (
     SupplementTodoSnapshot,
     UsageStatementClassifyRequest,
 )
-from src.services.s3_client import create_presigned_file_url
+from src.services.minio_client import create_presigned_file_url
 from src.services.usage_statement_pipeline_service import parse_usage_statement, run_link_pipeline
 
 
@@ -348,12 +348,17 @@ def run_report_draft(
         )
 
     result = _run_report_agent(project_id, usage_statement_id, she_user_id=she_user_id)
+    report_result = result.get("result") if isinstance(result.get("result"), dict) else {}
     return OrchestratorActionResponse(
-        status="success",
-        message="report Agent 실행을 완료했습니다.",
+        status=result.get("status_code", "fail"),
+        message=result.get("reason", "report Agent 실행을 완료했습니다."),
         usage_statement_id=usage_statement_id,
         target_agents=["report"],
-        result={"report": result},
+        result={
+            "report": result,
+            "reportDraft": report_result.get("reportDraft"),
+            "run_id": report_result.get("run_id"),
+        },
     )
 
 
@@ -741,7 +746,8 @@ def _run_report_agent(
                 report_period_label=f"{usage_statement['report_month']:%Y년 %m월}",
             )
         draft = ReportAgent().generate(context)
-        result = {"reportDraft": draft.model_dump(mode="json"), "run_id": str(uuid4())}
+        report_draft = draft.model_dump(mode="json")
+        result = {"reportDraft": report_draft, "run_id": str(uuid4())}
         upsert_agent_log(
             project_id=project_id,
             usage_statement_id=usage_statement_id,
@@ -756,11 +762,19 @@ def _run_report_agent(
                     "report_no": draft.report_no,
                     "site_name": draft.site_name,
                     "needs_human_review": draft.needs_human_review,
+                    "reportDraft": report_draft,
                 },
             },
             model_name="report_agent",
         )
-        return {"status_code": "success", "result_code": "success", "reason": "보고서 초안 생성 완료", "result": result}
+        return {
+            "agent_type_code": "report",
+            "status_code": "success",
+            "result_code": "success",
+            "reason": "보고서 초안 생성 완료",
+            "reportDraft": report_draft,
+            "result": result,
+        }
     except Exception as exc:
         return _mark_agent_failed(project_id, usage_statement_id, "report", exc)
 
@@ -929,31 +943,6 @@ def _build_status_todos(logs: dict[str, dict[str, Any]]) -> list[SupplementTodoS
                 )
             )
     return todos
-
-
-def _mark_missing_agent(
-    *,
-    project_id: int,
-    usage_statement_id: int,
-    agent_type_code: str,
-    reason: str,
-    payload: dict[str, Any] | None = None,
-) -> dict[str, Any]:
-    upsert_agent_log(
-        project_id=project_id,
-        usage_statement_id=usage_statement_id,
-        agent_type_code=agent_type_code,
-        status_code="fail",
-        result_code="fail",
-        reason=reason,
-        details={
-            "event": "agent_not_implemented",
-            "summary": reason,
-            "payload": payload or {},
-        },
-        model_name="not_connected",
-    )
-    return {"status_code": "fail", "result_code": "fail", "reason": reason}
 
 
 def _mark_agent_failed(
