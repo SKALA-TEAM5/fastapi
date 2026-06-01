@@ -209,24 +209,24 @@ src/repositories/orchestrator_repository.py
 
 역할:
 
-| 파일                                            | 역할                                                  |
-| ----------------------------------------------- | ----------------------------------------------------- |
-| `src/api/routers/orchestrator.py`             | FastAPI endpoint 정의                                 |
-| `src/schemas/orchestrator.py`                 | Request/Response DTO                                  |
-| `src/services/orchestrator_service.py`        | 업무 흐름 제어                                        |
-| `src/repositories/orchestrator_repository.py` | DB 상태 조회, `agent_logs` 저장                       |
-| `src/services/minio_client.py`                   | MinIO 파일 다운로드와 presigned URL 생성           |
+| 파일                                            | 역할                                     |
+| ----------------------------------------------- | ---------------------------------------- |
+| `src/api/routers/orchestrator.py`             | FastAPI endpoint 정의                    |
+| `src/schemas/orchestrator.py`                 | Request/Response DTO                     |
+| `src/services/orchestrator_service.py`        | 업무 흐름 제어                           |
+| `src/repositories/orchestrator_repository.py` | DB 상태 조회,`agent_logs` 저장         |
+| `src/services/minio_client.py`                | MinIO 파일 다운로드와 presigned URL 생성 |
 
 ## 실제 Agent 연결 상태
 
-| Agent | 연결 상태 | 설명 |
-|---|---|---|
-| `classi` | 연결됨 | 최초 업로드는 `parse_usage_statement()`로 OCR/Parse와 분류 실행, 세부항목 수정 후에는 Backend가 전달한 item payload 기준 재분류 |
-| `safety-doc` | 연결됨 | 사용내역서 세부항목별 `check_missing_evidence(item_id)` 실행 |
-| `link` | 연결됨 | 영수증/거래명세표/세금계산서 파일이 있을 때 `run_link_pipeline()` 실행, 결과 payload에 증빙 파일 URL 포함 |
-| `vision` | 연결됨 | 현장사진 파일이 있을 때 외부 Vision Agent의 `/vision/review` 호출 |
-| `legal` | 연결됨 | 기존 validator agent를 실행하고 `agent_logs.details.payload.results[]`에 report가 읽을 항목별 법령 판정 저장 |
-| `report` | 연결됨 | `ReportAgent`와 `build_report_context()`로 보고서 초안 생성 |
+| Agent          | 설명                                                                                                                              |
+| -------------- | --------------------------------------------------------------------------------------------------------------------------------- |
+| `classi`     | 최초 업로드는 `parse_usage_statement()`로 OCR/Parse와 분류 실행, 세부항목 수정 후에는 Backend가 전달한 item payload 기준 재분류 |
+| `safety-doc` | 사용내역서 세부항목별 `check_missing_evidence(item_id)` 실행                                                                    |
+| `link`       | 영수증/거래명세표/세금계산서 파일이 있을 때 `run_link_pipeline()` 실행, 결과 payload에 증빙 파일 URL 포함                       |
+| `vision`     | 현장사진 파일이 있을 때 외부 Vision Agent의 `/vision/review` 호출                                                               |
+| `legal`      | 기존 validator agent를 실행하고 `agent_logs.details.payload.results[]`에 report가 읽을 항목별 법령 판정 저장                    |
+| `report`     | `ReportAgent`와 `build_report_context()`로 보고서 초안 생성                                                                   |
 
 ## 보완 TODO 연결
 
@@ -269,7 +269,7 @@ status 응답 예시:
 }
 ```
 
-## 외부 Vision Agent 연결
+## Vision Agent 연결
 
 `vision`은 FastAPI 내부 구현체가 아니라 별도 Vision API를 HTTP로 호출한다.
 
@@ -299,11 +299,11 @@ POST {VISION_AGENT_BASE_URL}{VISION_AGENT_REVIEW_PATH}
 
 Vision Agent 응답은 다음 규칙으로 `agent_logs`에 저장된다.
 
-| Vision 응답 | Orchestrator 기록 |
-|---|---|
-| `status_code=success`, `result_code=success` | 현장사진 적정 |
-| `status_code=success`, `result_code=hil` | 보완 또는 검토 필요 |
-| `status_code=fail`, `result_code=fail` | 이미지 다운로드 실패, 모델 오류, 설정 오류 |
+| Vision 응답                                      | Orchestrator 기록                          |
+| ------------------------------------------------ | ------------------------------------------ |
+| `status_code=success`, `result_code=success` | 현장사진 적정                              |
+| `status_code=success`, `result_code=hil`     | 보완 또는 검토 필요                        |
+| `status_code=fail`, `result_code=fail`       | 이미지 다운로드 실패, 모델 오류, 설정 오류 |
 
 필수 환경변수:
 
@@ -316,7 +316,7 @@ S3_PUBLIC_ENDPOINT_URL=http://minio:9000
 
 `S3_PUBLIC_ENDPOINT_URL`은 Vision 컨테이너가 presigned URL을 열 수 있는 주소여야 한다. Docker 내부에서는 `localhost:9000`이 아니라 `http://minio:9000` 같은 compose 서비스명을 사용한다.
 
-## legal -> report 데이터 계약
+## legal → report 데이터 계약
 
 `legal`은 실행 성공 시 `agent_logs`에 다음 형태로 결과를 남긴다.
 
@@ -345,7 +345,3 @@ S3_PUBLIC_ENDPOINT_URL=http://minio:9000
 ```
 
 `report`는 `results[].item_id`를 우선 사용하고, 항목 ID가 없으면 `category_code` 기준 결과를 fallback으로 사용한다.
-
-## 현재 TODO
-
-- 실제 DB/파일/MinIO 데이터를 사용한 parse -> evidence -> legal -> report E2E 검증
