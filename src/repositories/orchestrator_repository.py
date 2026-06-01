@@ -68,7 +68,7 @@ class OrchestratorState:
     @property
     def report_ready(self) -> bool:
         log = self.logs.get("legal") or {}
-        return log.get("status_code") == "success" and log.get("result_code") == "success"
+        return log.get("status_code") == "success" and log.get("result_code") in {"success", "hil"}
 
 
 def scan_orchestrator_state(project_id: int, usage_statement_id: int) -> OrchestratorState:
