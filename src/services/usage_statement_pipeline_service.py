@@ -69,7 +69,7 @@ from src.services.matching_service_monthly import (
     THRESHOLD_REVIEW,
     match_all_usage_to_receipts,
 )
-from src.services.s3_client import create_presigned_file_url, fetch_file
+from src.services.minio_client import create_presigned_file_url, fetch_file
 
 # ─────────────────────────────────────────────────────────────
 # 내부 헬퍼
