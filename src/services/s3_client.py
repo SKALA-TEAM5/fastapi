@@ -7,6 +7,7 @@ storage_key 를 받아 S3 에서 파일 바이트를 반환한다.
 """
 
 import boto3
+from botocore.config import Config
 from botocore.exceptions import BotoCoreError, ClientError
 from fastapi import HTTPException, status
 
@@ -15,10 +16,13 @@ from src.core.config import (
     AWS_SECRET_ACCESS_KEY,
     AWS_REGION,
     S3_BUCKET,
+    S3_ENDPOINT_URL,
+    S3_PUBLIC_ENDPOINT_URL,
+    S3_PRESIGNED_URL_EXPIRE_SECONDS,
 )
 
 
-def _get_client():
+def _get_client(endpoint_url: str | None = None):
     """boto3 S3 클라이언트 생성 (환경변수 검증 포함)"""
     if not S3_BUCKET:
         raise HTTPException(
@@ -28,8 +32,10 @@ def _get_client():
     return boto3.client(
         "s3",
         region_name=AWS_REGION,
+        endpoint_url=endpoint_url or S3_ENDPOINT_URL or None,
         aws_access_key_id=AWS_ACCESS_KEY_ID or None,
         aws_secret_access_key=AWS_SECRET_ACCESS_KEY or None,
+        config=Config(signature_version="s3v4", s3={"addressing_style": "path"}),
     )
 
 
@@ -61,6 +67,49 @@ def fetch_file(storage_key: str) -> bytes:
         raise HTTPException(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
             detail=f"S3 오류: {e}",
+        )
+    except BotoCoreError as e:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail=f"AWS 연결 오류: {e}",
+        )
+
+
+def create_presigned_file_url(
+    storage_key: str,
+    expires_seconds: int = S3_PRESIGNED_URL_EXPIRE_SECONDS,
+) -> str:
+    """
+    S3/MinIO 오브젝트를 읽을 수 있는 presigned GET URL을 생성한다.
+
+    Args:
+        storage_key: S3/MinIO 오브젝트 키 (DB files.storage_key 값)
+        expires_seconds: URL 만료 시간(초)
+
+    Returns:
+        만료 시간이 포함된 임시 접근 URL
+
+    Raises:
+        HTTPException 422 — storage_key가 비어 있거나 URL 생성 실패
+        HTTPException 503 — S3/MinIO 설정 또는 자격증명 오류
+    """
+    if not storage_key:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail="storage_key가 비어 있습니다.",
+        )
+
+    client = _get_client(endpoint_url=S3_PUBLIC_ENDPOINT_URL or S3_ENDPOINT_URL or None)
+    try:
+        return client.generate_presigned_url(
+            "get_object",
+            Params={"Bucket": S3_BUCKET, "Key": storage_key},
+            ExpiresIn=expires_seconds,
+        )
+    except ClientError as e:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail=f"S3 presigned URL 생성 오류: {e}",
         )
     except BotoCoreError as e:
         raise HTTPException(
