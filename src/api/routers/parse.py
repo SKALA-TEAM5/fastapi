@@ -46,7 +46,7 @@ from src.ocr.parse_tax_invoice import (
     parse_tax_invoice,
 )
 from src.ocr.parse_usage_statement import parse_pdf as parse_usage_statement
-from src.services.s3_client import fetch_file
+from src.services.s3_client import create_presigned_file_url, fetch_file
 
 router = APIRouter(prefix="/ocr", tags=["OCR 파싱"])
 
@@ -298,6 +298,12 @@ async def parse(body: FileRecord) -> ParseResponse:
 
     # ── S3에서 파일 fetch ────────────────────────────────────────────
     file_bytes = fetch_file(body.storage_key)
+    file_input = {
+        "file_id": body.id,
+        "original_filename": body.original_filename,
+        "storage_key": body.storage_key,
+        "presigned_url": create_presigned_file_url(body.storage_key),
+    }
 
     evidence_code = body.uploaded_evidence_type_code
 
@@ -308,10 +314,12 @@ async def parse(body: FileRecord) -> ParseResponse:
             return ParseResponse(
                 success=True,
                 data={
+                    "file":              file_input,
                     "usage_statement": result.get("usage_statement"),
                     "summaries":       result.get("summaries", []),
                     "items":           result.get("items", []),
                 },
+                error=None,
                 message="사용내역서 파싱 성공",
             )
 
@@ -320,7 +328,8 @@ async def parse(body: FileRecord) -> ParseResponse:
             result = _parse_tax_invoice(file_bytes, suffix, body.original_filename)
             return ParseResponse(
                 success=True,
-                data={"ocr_result": result},
+                data={"file": file_input, "ocr_result": result},
+                error=None,
                 message="세금계산서 파싱 성공",
             )
 
@@ -335,7 +344,8 @@ async def parse(body: FileRecord) -> ParseResponse:
             )
             return ParseResponse(
                 success=True,
-                data={"ocr_result": result},
+                data={"file": file_input, "ocr_result": result},
+                error=None,
                 message="파싱 성공",
             )
 
@@ -350,6 +360,7 @@ async def parse(body: FileRecord) -> ParseResponse:
     except Exception as e:
         return ParseResponse(
             success=False,
+            data=None,
             error=ParseError(code="parse_error", message=str(e)),
             message="파싱 실패",
         )
