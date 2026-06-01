@@ -15,7 +15,7 @@ from datetime import date
 from decimal import Decimal
 from typing import Any
 
-from pydantic import BaseModel, Field
+from pydantic import AliasChoices, BaseModel, Field
 
 
 class UsageStatementParseRequest(BaseModel):
@@ -47,7 +47,7 @@ class OrchestratorActionResponse(BaseModel):
 
 class AgentLogSnapshot(BaseModel):
     agent_type_code: str
-    status_code: str
+    status_code: str | None = None
     result_code: str | None = None
     reason: str | None = None
     details: dict[str, Any] | None = None
@@ -64,7 +64,7 @@ class SupplementTodoSnapshot(BaseModel):
 
 class AgentDashboardSummary(BaseModel):
     agent_type_code: str
-    status_code: str
+    status_code: str | None = None
     result_code: str | None = None
     usage_statement_id: int | None = None
     token: int = 0
@@ -105,10 +105,18 @@ class EvidenceReviewRequest(BaseModel):
 class LegalReviewRequest(BaseModel):
     project_id: int
     usage_statement_id: int
-    she_user_id: int | None = Field(None, description="SHE 담당자 사용자 ID")
+    she_user_id: int | None = Field(
+        None,
+        validation_alias=AliasChoices("she_user_id", "triggered_by_user_id"),
+        description="SHE 담당자 사용자 ID",
+    )
 
 
 class ReportDraftRequest(BaseModel):
     project_id: int
     usage_statement_id: int
-    she_user_id: int | None = Field(None, description="SHE 담당자 사용자 ID")
+    she_user_id: int | None = Field(
+        None,
+        validation_alias=AliasChoices("she_user_id", "triggered_by_user_id"),
+        description="SHE 담당자 사용자 ID",
+    )
