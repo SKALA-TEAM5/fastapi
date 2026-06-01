@@ -46,7 +46,7 @@ from src.ocr.parse_tax_invoice import (
     parse_tax_invoice,
 )
 from src.ocr.parse_usage_statement import parse_pdf as parse_usage_statement
-from src.services.s3_client import create_presigned_file_url, fetch_file
+from src.services.minio_client import create_presigned_file_url, fetch_file
 
 router = APIRouter(prefix="/ocr", tags=["OCR 파싱"])
 
@@ -283,7 +283,7 @@ DB `files` 테이블 레코드를 JSON으로 전달하면 `storage_key`로 S3에
     """,
     responses={
         200: {"description": "파싱 성공 (success: true) 또는 비즈니스 실패 (success: false)"},
-        422: {"description": "지원하지 않는 파일 형식 또는 S3 파일 접근 불가"},
+        422: {"description": "지원하지 않는 파일 형식 또는 MinIO 파일 접근 불가"},
         503: {"description": "CLOVA OCR 또는 S3 연결 오류"},
     },
 )

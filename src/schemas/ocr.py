@@ -20,7 +20,7 @@ from pydantic import BaseModel, Field
 class FileRecord(BaseModel):
     """
     POST /ocr/parse 요청 — DB files 테이블 레코드를 그대로 전달
-    OCR 엔진은 storage_key 로 S3 에서 파일을 직접 가져온다.
+    OCR 엔진은 storage_key로 MinIO에서 파일을 직접 가져온다.
     """
     id: int = Field(..., description="files PK (BIGSERIAL)", examples=[1])
     project_id: Optional[int] = Field(None, description="프로젝트 ID (미사용)", examples=[10])
