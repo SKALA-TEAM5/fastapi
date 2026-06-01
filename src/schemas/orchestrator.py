@@ -11,6 +11,8 @@ Orchestrator API의 요청/응답 모델을 정의한다.
 
 from __future__ import annotations
 
+from datetime import date
+from decimal import Decimal
 from typing import Any
 
 from pydantic import BaseModel, Field
@@ -23,6 +25,15 @@ class UsageStatementParseRequest(BaseModel):
 class UsageStatementClassifyRequest(BaseModel):
     project_id: int
     usage_statement_id: int
+    item_name: str
+    used_on: date | None = None
+    unit: str | None = None
+    quantity: Decimal | None = None
+    unit_price: Decimal | None = None
+    total_amount: int | None = None
+    item_id: int | None = None
+    category_code: str | None = None
+    remark: str | None = None
 
 
 class OrchestratorActionResponse(BaseModel):
@@ -41,6 +52,14 @@ class AgentLogSnapshot(BaseModel):
     reason: str | None = None
     details: dict[str, Any] | None = None
     token: int | None = None
+
+
+class SupplementTodoSnapshot(BaseModel):
+    agent_type_code: str
+    usage_statement_item_id: int | None = None
+    file_id: int | None = None
+    reason: str
+    status_code: str = "open"
 
 
 class AgentDashboardSummary(BaseModel):
@@ -63,6 +82,7 @@ class OrchestratorStatusResponse(BaseModel):
     legal_ready: bool
     report_ready: bool
     logs: list[AgentLogSnapshot] = Field(default_factory=list)
+    todos: list[SupplementTodoSnapshot] = Field(default_factory=list)
 
 
 class OrchestratorDashboardResponse(BaseModel):

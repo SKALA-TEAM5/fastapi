@@ -59,7 +59,7 @@ async def parse_usage_statement(request: UsageStatementParseRequest) -> Orchestr
 )
 async def classify_usage_statement(request: UsageStatementClassifyRequest) -> OrchestratorActionResponse:
     try:
-        return classify_existing_usage_statement(request.project_id, request.usage_statement_id)
+        return classify_existing_usage_statement(request)
     except Exception as exc:
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,

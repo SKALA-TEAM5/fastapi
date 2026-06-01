@@ -29,7 +29,7 @@ Spring Backend가 프론트 요청을 받아 권한을 확인한 뒤 FastAPI Orc
 | Method   | FastAPI Path                                                                                | 역할                                                                             |
 | -------- | ------------------------------------------------------------------------------------------- | -------------------------------------------------------------------------------- |
 | `POST` | `/api/v1/orchestrator/usage-statements/parse`                                             | 사용내역서 업로드 후 OCR/Parse와 `classi` 실행                                 |
-| `POST` | `/api/v1/orchestrator/usage-statements/classify`                                          | 저장된 세부항목 수정 후 원본 파일 재파싱 없이 `classi` 재분류                  |
+| `POST` | `/api/v1/orchestrator/usage-statements/classify`                                          | Backend가 전달한 수정 세부항목 payload 기준으로 `classi` 재분류                |
 | `POST` | `/api/v1/orchestrator/usage-statements/evidence`                                          | 증빙 검증 버튼.`safety-doc`, 조건부 `link`, 조건부 `vision` 실행 대상 결정 |
 | `POST` | `/api/v1/orchestrator/usage-statements/legal`                                             | SHE 담당자 법령 검토 실행 조건 확인 및 `legal` 실행 대상 결정                  |
 | `POST` | `/api/v1/orchestrator/usage-statements/report`                                            | `legal` 성공 후 `report` 실행 대상 결정                                      |
@@ -50,6 +50,29 @@ Spring Backend가 프론트 요청을 받아 권한을 확인한 뒤 FastAPI Orc
 -> agent_logs에 classi 결과 저장
 -> UI는 이동 내역이 있으면 팝업 표시 후 세부내역 탭으로 이동
 ```
+
+### 1-1. 세부항목 수정 후 classi 재분류
+
+세부항목 수정 후 재분류는 FastAPI가 DB를 읽지 않는다. Backend가 수정된 세부항목 payload를 FastAPI에 전달하고, FastAPI는 classi 판단 결과만 반환한다.
+
+```http
+POST /api/v1/orchestrator/usage-statements/classify
+```
+
+```json
+{
+  "project_id": 1,
+  "usage_statement_id": 20,
+  "item_name": "안전모",
+  "used_on": "2026-04-15",
+  "unit": "개",
+  "quantity": 10,
+  "unit_price": 15000,
+  "total_amount": 150000
+}
+```
+
+FastAPI는 `usage_statement_items`를 조회하거나 업데이트하지 않는다. 응답의 `result.payload.changes`를 보고 Backend가 필요한 DB 업데이트와 로그 저장을 처리한다.
 
 classi 결과로 항목 이동이 발생하면 `agent_logs.details`는 아래 형태를 가져야 한다.
 
@@ -182,7 +205,7 @@ src/repositories/orchestrator_repository.py
 
 | Agent | 연결 상태 | 설명 |
 |---|---|---|
-| `classi` | 연결됨 | 최초 업로드는 `parse_usage_statement()`로 OCR/Parse와 분류 실행, 세부항목 수정 후에는 저장된 DB 항목 기준 재분류 |
+| `classi` | 연결됨 | 최초 업로드는 `parse_usage_statement()`로 OCR/Parse와 분류 실행, 세부항목 수정 후에는 Backend가 전달한 item payload 기준 재분류 |
 | `safety-doc` | 연결됨 | 사용내역서 세부항목별 `check_missing_evidence(item_id)` 실행 |
 | `link` | 연결됨 | 영수증/거래명세표/세금계산서 파일이 있을 때 `run_link_pipeline()` 실행 |
 | `vision` | 미구현 | 현장사진 파일이 있으면 실행 대상은 되지만, 실제 Vision Agent 구현체가 아직 없어 `fail/fail` 로그 기록 |

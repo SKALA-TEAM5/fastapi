@@ -7,7 +7,7 @@ Agent별 최신 실행 상태를 `agent_logs`에 기록한다.
 주요 책임:
   - 사용내역서 세부항목, 증빙 파일, Agent 로그 상태 스캔
   - 조건부 실행 대상 Agent 선택 보조
-  - Orchestrator/Agent 로그 upsert 및 보완 TODO 생성
+  - Orchestrator/Agent 로그 upsert
 """
 
 from __future__ import annotations
@@ -68,7 +68,7 @@ class OrchestratorState:
     @property
     def report_ready(self) -> bool:
         log = self.logs.get("legal") or {}
-        return log.get("status_code") == "success" and log.get("result_code") in {"success", "hil"}
+        return log.get("status_code") == "success" and log.get("result_code") == "success"
 
 
 def scan_orchestrator_state(project_id: int, usage_statement_id: int) -> OrchestratorState:
@@ -149,51 +149,6 @@ def list_usage_statement_item_ids(usage_statement_id: int) -> list[int]:
             return [int(row[0]) for row in cur.fetchall()]
 
 
-def list_usage_statement_items_for_classi(usage_statement_id: int) -> list[dict[str, Any]]:
-    with get_connection() as conn:
-        with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
-            cur.execute(
-                """
-                SELECT id, category_code, item_name, unit, quantity, unit_price,
-                       total_amount, remark, page_no, used_on
-                FROM usage_statement_items
-                WHERE usage_statement_id = %(usage_statement_id)s
-                ORDER BY id
-                """,
-                {"usage_statement_id": usage_statement_id},
-            )
-            return [dict(row) for row in cur.fetchall()]
-
-
-def update_usage_statement_item_categories(
-    *,
-    usage_statement_id: int,
-    changes: list[dict[str, Any]],
-) -> int:
-    if not changes:
-        return 0
-
-    with get_connection() as conn:
-        with conn.cursor() as cur:
-            updated_count = 0
-            for change in changes:
-                cur.execute(
-                    """
-                    UPDATE usage_statement_items
-                    SET category_code = %(category_code)s
-                    WHERE id = %(item_id)s
-                      AND usage_statement_id = %(usage_statement_id)s
-                    """,
-                    {
-                        "item_id": change["item_id"],
-                        "usage_statement_id": usage_statement_id,
-                        "category_code": change["category_code"],
-                    },
-                )
-                updated_count += int(cur.rowcount or 0)
-            return updated_count
-
-
 def list_evidence_file_ids_by_type(project_id: int) -> dict[str, list[int]]:
     with get_connection() as conn:
         with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
@@ -212,6 +167,39 @@ def list_evidence_file_ids_by_type(project_id: int) -> dict[str, list[int]]:
             for row in cur.fetchall():
                 grouped.setdefault(row["uploaded_evidence_type_code"], []).append(int(row["id"]))
             return grouped
+
+
+def list_evidence_files_by_type(
+    project_id: int,
+    evidence_type_codes: list[str] | tuple[str, ...] | set[str],
+) -> list[dict[str, Any]]:
+    if not evidence_type_codes:
+        return []
+
+    with get_connection() as conn:
+        with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+            cur.execute(
+                """
+                SELECT
+                    id,
+                    project_id,
+                    storage_key,
+                    original_filename,
+                    uploaded_evidence_type_code,
+                    mime_type,
+                    size_bytes
+                FROM files
+                WHERE project_id = %(project_id)s
+                  AND deleted_at IS NULL
+                  AND uploaded_evidence_type_code = ANY(%(evidence_type_codes)s)
+                ORDER BY id
+                """,
+                {
+                    "project_id": project_id,
+                    "evidence_type_codes": list(evidence_type_codes),
+                },
+            )
+            return [dict(row) for row in cur.fetchall()]
 
 
 def list_latest_agent_logs(
@@ -366,67 +354,3 @@ def mark_orchestrator(
         },
         model_name="fastapi_orchestrator",
     )
-
-
-def close_supplement_todos(
-    *,
-    project_id: int,
-    usage_statement_id: int,
-    agent_type_code: str,
-) -> int:
-    with get_connection() as conn:
-        with conn.cursor() as cur:
-            cur.execute(
-                """
-                UPDATE action_requests
-                SET status_code = 'closed',
-                    closed_at = now()
-                WHERE project_id = %(project_id)s
-                  AND usage_statement_id = %(usage_statement_id)s
-                  AND status_code IN ('open', 'in_progress')
-                  AND title LIKE %(title_prefix)s
-                """,
-                {
-                    "project_id": project_id,
-                    "usage_statement_id": usage_statement_id,
-                    "title_prefix": f"[{agent_type_code}]%",
-                },
-            )
-            return int(cur.rowcount or 0)
-
-
-def create_supplement_todos(
-    *,
-    project_id: int,
-    usage_statement_id: int,
-    requested_by_user_id: int | None,
-    agent_type_code: str,
-    todos: list[dict[str, Any]],
-) -> int:
-    if not requested_by_user_id or not todos:
-        return 0
-
-    with get_connection() as conn:
-        with conn.cursor() as cur:
-            created_count = 0
-            for todo in todos:
-                cur.execute(
-                    """
-                    INSERT INTO action_requests
-                        (project_id, usage_statement_id, usage_statement_item_id,
-                         requested_by_user_id, title, reason, status_code)
-                    VALUES
-                        (%(project_id)s, %(usage_statement_id)s, %(usage_statement_item_id)s,
-                         %(requested_by_user_id)s, %(title)s, %(reason)s, 'open')
-                    """,
-                    {
-                        "project_id": project_id,
-                        "usage_statement_id": usage_statement_id,
-                        "usage_statement_item_id": todo.get("usage_statement_item_id"),
-                        "requested_by_user_id": requested_by_user_id,
-                        "title": f"[{agent_type_code}] 보완 요청",
-                        "reason": todo.get("reason"),
-                    },
-                )
-                created_count += 1
-            return created_count
