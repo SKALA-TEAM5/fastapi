@@ -39,6 +39,9 @@ def health() -> dict:
     return {"status": "ok"}
 
 
+# Spring Backend의 현재 FastAPI client는 /api/v1 없이 /orchestrator 경로를 호출한다.
+# 외부 문서/테스트에서 쓰는 /api/v1/orchestrator 경로도 유지하기 위해 두 prefix를 함께 연다.
+app.include_router(orchestrator.router)
 app.include_router(orchestrator.router, prefix="/api/v1")
 app.include_router(validation.router,   prefix="/api/v1")
 app.include_router(report_agent.router, prefix="/api/v1")
