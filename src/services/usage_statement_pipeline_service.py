@@ -69,7 +69,7 @@ from src.services.matching_service_monthly import (
     THRESHOLD_REVIEW,
     match_all_usage_to_receipts,
 )
-from src.services.s3_client import fetch_file
+from src.services.minio_client import create_presigned_file_url, fetch_file
 
 # ─────────────────────────────────────────────────────────────
 # 내부 헬퍼
@@ -83,6 +83,16 @@ def _fetch_and_save_temp(storage_key: str, suffix: str) -> str:
     tmp.write(file_bytes)
     tmp.close()
     return tmp.name
+
+
+def _build_file_agent_input(file_info: dict[str, Any]) -> dict[str, Any]:
+    """Agent 입력/로그에 남길 파일 접근 정보를 만든다."""
+    return {
+        "file_id": file_info.get("id"),
+        "original_filename": file_info.get("original_filename"),
+        "storage_key": file_info.get("storage_key"),
+        "presigned_url": create_presigned_file_url(file_info["storage_key"]),
+    }
 
 
 def _cleanup(*paths: str) -> None:
@@ -308,6 +318,7 @@ def parse_usage_statement(usage_file_id: int) -> dict[str, Any]:
     usage_statement_id: int | None = None
     parsed_usage: dict[str, Any] | None = None
     classifier_details: dict[str, Any] | None = None
+    source_file_input: dict[str, Any] | None = None
     line_items: list[dict[str, Any]] = []
 
     try:
@@ -320,6 +331,7 @@ def parse_usage_statement(usage_file_id: int) -> dict[str, Any]:
                     f"사용내역서 파일을 찾을 수 없습니다 (file_id={usage_file_id})"
                 )
             project_id = usage_file["project_id"]
+            source_file_input = _build_file_agent_input(usage_file)
 
             # ── S3 fetch + 파싱 ────────────────────────────────────────────
             usage_suffix = Path(usage_file["original_filename"]).suffix.lower()
@@ -339,7 +351,10 @@ def parse_usage_statement(usage_file_id: int) -> dict[str, Any]:
                     classifier_log_conn,
                     project_id=project_id,
                     usage_statement_id=None,
-                    details={"source_file_id": usage_file_id},
+                    details={
+                        "source_file_id": usage_file_id,
+                        "source_file": source_file_input,
+                    },
                     agent_type_code="classi",
                     model_name="classifier_agent",
                 )
@@ -370,6 +385,7 @@ def parse_usage_statement(usage_file_id: int) -> dict[str, Any]:
                 classifier_details or {},
                 line_id_to_item_id,
             )
+            classifier_details.setdefault("payload", {})["source_file"] = source_file_input
 
             # ── 로그 completed ─────────────────────────────────────────────
             if classifier_log_id is not None:
@@ -405,6 +421,7 @@ def parse_usage_statement(usage_file_id: int) -> dict[str, Any]:
         "parse_status": (parsed_usage or {}).get("parse_status", "SUCCESS"),
         "item_count": len(line_items),
         "classifier_changed_count": classifier_changed_count,
+        "source_file": source_file_input,
         "elapsed_sec": elapsed,
     }
 
@@ -446,6 +463,7 @@ def run_link_pipeline(
     tax_invoice_file_ids = tax_invoice_file_ids or []
     start = time.time()
     tmp_paths: list[str] = []
+    evidence_file_inputs: list[dict[str, Any]] = []
 
     # ── 로그 시작 (별도 커넥션으로 즉시 커밋) ─────────────────────────
     # usage_statement → project_id 조회
@@ -476,6 +494,10 @@ def run_link_pipeline(
             # ── DB에서 파일 정보 일괄 조회 ────────────────────────────────
             all_ids = receipt_file_ids + tax_invoice_file_ids
             file_map = get_files_by_ids(conn, all_ids)
+            evidence_file_inputs = [
+                _build_file_agent_input(file_info)
+                for file_info in file_map.values()
+            ]
 
             # ── usage_statement items 조회 (매칭용) ───────────────────────
             # v_usage_statement_context 뷰 사용 (직접 테이블 조회 대신)
@@ -602,6 +624,8 @@ def run_link_pipeline(
                     "match_summary": summary,
                     "usage_statement_id": usage_statement_id,
                     "receipt_file_ids": receipt_file_ids,
+                    "tax_invoice_file_ids": tax_invoice_file_ids,
+                    "evidence_files": evidence_file_inputs,
                     "match_results": [
                         {
                             "line_id": r.get("line_id"),
@@ -628,5 +652,6 @@ def run_link_pipeline(
         "usage_statement_id": usage_statement_id,
         "summary": summary,
         "match_results": batch.get("results") or [],
+        "evidence_files": evidence_file_inputs,
         "elapsed_sec": elapsed,
     }
