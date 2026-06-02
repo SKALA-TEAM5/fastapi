@@ -1,0 +1,15 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: team5-fastapi
+  namespace: skala3-finalproj-class2-team5
+  labels:
+    app: team5-fastapi
+spec:
+  type: ClusterIP
+  selector:
+    app: team5-fastapi
+  ports:
+    - name: http
+      port: 8001
+      targetPort: http
