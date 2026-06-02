@@ -1,0 +1,53 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: team5-fastapi
+  namespace: skala3-finalproj-class2-team5
+  labels:
+    app: team5-fastapi
+spec:
+  replicas: 1
+  revisionHistoryLimit: 2
+  selector:
+    matchLabels:
+      app: team5-fastapi
+  template:
+    metadata:
+      labels:
+        app: team5-fastapi
+    spec:
+      imagePullSecrets:
+        - name: team5-harbor-secret
+      containers:
+        - name: fastapi
+          image: amdp-registry.skala-ai.com/skala26a-ai2/team5-fastapi:latest
+          imagePullPolicy: Always
+          ports:
+            - name: http
+              containerPort: 8001
+          envFrom:
+            - configMapRef:
+                name: team5-fastapi-config
+            - secretRef:
+                name: team5-fastapi-secret
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: http
+            initialDelaySeconds: 30
+            periodSeconds: 10
+            timeoutSeconds: 5
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: http
+            initialDelaySeconds: 60
+            periodSeconds: 20
+            timeoutSeconds: 5
+          resources:
+            requests:
+              cpu: 500m
+              memory: 1Gi
+            limits:
+              cpu: 2000m
+              memory: 4Gi
