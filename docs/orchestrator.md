@@ -30,7 +30,7 @@ Spring Backend가 프론트 요청을 받아 권한을 확인한 뒤 FastAPI Orc
 | -------- | ------------------------------------------------------------------------------------------- | -------------------------------------------------------------------------------- |
 | `POST` | `/api/v1/orchestrator/usage-statements/parse`                                             | 사용내역서 업로드 후 OCR/Parse와 `classi` 실행                                 |
 | `POST` | `/api/v1/orchestrator/usage-statements/classify`                                          | Backend가 전달한 수정 세부항목 payload 기준으로 `classi` 재분류                |
-| `POST` | `/api/v1/orchestrator/usage-statements/evidence`                                          | 증빙 검증 버튼.`safety-doc`, 조건부 `link`, 조건부 `vision` 실행 대상 결정 |
+| `POST` | `/api/v1/orchestrator/usage-statements/validate`                                          | 증빙 검증 버튼.`safety-doc`, 조건부 `link`, 조건부 `vision` 실행 대상 결정 |
 | `POST` | `/api/v1/orchestrator/usage-statements/legal`                                             | SHE 담당자 법령 검토 실행 조건 확인 및 `legal` 실행 대상 결정                  |
 | `POST` | `/api/v1/orchestrator/usage-statements/report`                                            | `legal` 성공 후 `report` 실행 대상 결정                                      |
 | `GET`  | `/api/v1/orchestrator/projects/{project_id}/usage-statements/{usage_statement_id}/status` | 화면 상태, 버튼 활성화 조건, Agent 로그 요약 조회                                |
