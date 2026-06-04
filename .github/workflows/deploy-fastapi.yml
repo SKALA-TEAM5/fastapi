@@ -7,11 +7,8 @@ on:
   workflow_dispatch:
 
 env:
-  AWS_REGION: ap-northeast-2
-  EKS_CLUSTER_NAME: skala-2025
-  K8S_NAMESPACE: skala3-finalproj-class2-team5
   IMAGE_NAME: team5-fastapi
-  IMAGE_TAG: latest
+  DEPLOY_MANIFEST: k8s/fastapi/fastapi-deployment.yaml
 
 jobs:
   deploy:
@@ -21,12 +18,13 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Configure AWS credentials
-        uses: aws-actions/configure-aws-credentials@v4
-        with:
-          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
-          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
-          aws-region: ${{ env.AWS_REGION }}
+      - name: Set image metadata
+        id: image
+        run: |
+          IMAGE_TAG="${GITHUB_SHA::7}"
+          IMAGE_URI="${{ secrets.HARBOR_REGISTRY }}/${{ secrets.HARBOR_PROJECT }}/${IMAGE_NAME}:${IMAGE_TAG}"
+          echo "image_tag=${IMAGE_TAG}" >> "${GITHUB_OUTPUT}"
+          echo "image_uri=${IMAGE_URI}" >> "${GITHUB_OUTPUT}"
 
       - name: Login to Harbor
         uses: docker/login-action@v3
@@ -45,19 +43,43 @@ jobs:
           file: ./Dockerfile
           platforms: linux/amd64
           push: true
-          tags: ${{ secrets.HARBOR_REGISTRY }}/${{ secrets.HARBOR_PROJECT }}/team5-fastapi:latest
+          tags: ${{ steps.image.outputs.image_uri }}
 
-      - name: Update kubeconfig
-        run: |
-          aws eks update-kubeconfig \
-            --region "${AWS_REGION}" \
-            --name "${EKS_CLUSTER_NAME}"
+      - name: Checkout deploy repository
+        uses: actions/checkout@v4
+        with:
+          repository: SKALA-TEAM5/deploy
+          ref: main
+          token: ${{ secrets.DEPLOY_REPO_TOKEN }}
+          path: deploy-repo
 
-      - name: Rollout fastapi deployment if present
+      - name: Update deploy image tag
+        working-directory: deploy-repo
+        env:
+          IMAGE_URI: ${{ steps.image.outputs.image_uri }}
+          DEPLOY_MANIFEST: ${{ env.DEPLOY_MANIFEST }}
         run: |
-          if kubectl get deployment/team5-fastapi -n "${K8S_NAMESPACE}"; then
-            kubectl rollout restart deployment/team5-fastapi -n "${K8S_NAMESPACE}"
-            kubectl rollout status deployment/team5-fastapi -n "${K8S_NAMESPACE}"
-          else
-            echo "team5-fastapi deployment is not created yet. Image build/push completed."
-          fi
+          python - <<'PY'
+          import os
+          from pathlib import Path
+
+          manifest = Path(os.environ["DEPLOY_MANIFEST"])
+          image_uri = os.environ["IMAGE_URI"]
+          text = manifest.read_text()
+          lines = [
+              f"{line.split('image:')[0]}image: {image_uri}" if "image:" in line and "team5-fastapi" in line else line
+              for line in text.splitlines()
+          ]
+          manifest.write_text("\n".join(lines) + "\n")
+          PY
+
+      - name: Create deploy pull request
+        uses: peter-evans/create-pull-request@v6
+        with:
+          token: ${{ secrets.DEPLOY_REPO_TOKEN }}
+          path: deploy-repo
+          branch: chore/update-fastapi-${{ steps.image.outputs.image_tag }}
+          title: "chore(deploy): update fastapi image to ${{ steps.image.outputs.image_tag }}"
+          commit-message: "chore(deploy): update fastapi image to ${{ steps.image.outputs.image_tag }}"
+          body: |
+            Update `team5-fastapi` image to `${{ steps.image.outputs.image_uri }}`.
