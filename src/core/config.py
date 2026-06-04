@@ -17,11 +17,35 @@ load_dotenv(_ROOT.parent / ".env")   # skala/.env fallback (override=False 기�
 
 
 # ══════════════════════════════════════════════
-# CLOVA OCR
+# OCR 엔진 선택
+# ══════════════════════════════════════════════
+# OCR_ENGINE=clova  → NAVER CLOVA OCR (인쇄 영수증, 저비용)
+# OCR_ENGINE=vlm    → Gemini / OpenAI VLM (수기 포함, 고품질) ← 기본값
+
+OCR_ENGINE: str = os.getenv("OCR_ENGINE", "vlm").lower()
+
+
+# ══════════════════════════════════════════════
+# CLOVA OCR (OCR_ENGINE=clova 시 사용)
 # ══════════════════════════════════════════════
 
 CLOVA_OCR_URL: str = os.getenv("CLOVA_OCR_URL", "")
 CLOVA_OCR_SECRET: str = os.getenv("CLOVA_OCR_SECRET", "")
+
+
+# ══════════════════════════════════════════════
+# VLM — Gemini / OpenAI (OCR_ENGINE=vlm 시 사용)
+# ══════════════════════════════════════════════
+
+VLM_PROVIDER: str          = os.getenv("VLM_PROVIDER", "gemini").lower()
+
+GEMINI_API_KEY: str        = os.getenv("GEMINI_API_KEY", "")
+GEMINI_MODEL: str          = os.getenv("GEMINI_MODEL", "gemini-3.1-flash-lite")
+GEMINI_MODEL_FALLBACK: str = os.getenv("GEMINI_MODEL_FALLBACK", "gemini-2.5-flash")
+
+OPENAI_API_KEY: str        = os.getenv("OPENAI_API_KEY", "")
+OPENAI_MODEL: str          = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
+OPENAI_MODEL_FALLBACK: str = os.getenv("OPENAI_MODEL_FALLBACK", "gpt-4o")
 
 
 # ══════════════════════════════════════════════

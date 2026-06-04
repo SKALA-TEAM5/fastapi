@@ -41,14 +41,7 @@ from typing import Any
 
 from src.agents.classifier_agent.agent import review_usage_statement
 from src.core.config import CLOVA_OCR_SECRET, CLOVA_OCR_URL
-from src.ocr.clova_ocr_receipt import (
-    SUPPORTED_EXTS,
-    call_clova_receipt,
-    parse_clova_response,
-)
-from src.ocr.clova_ocr_receipt import (
-    validate_result as validate_ocr_result,
-)
+from src.ocr.ocr_engine import parse_receipt as ocr_parse_receipt
 from src.ocr.parse_tax_invoice import ALL_EXTS as TAX_INVOICE_EXTS
 from src.ocr.parse_tax_invoice import parse_tax_invoice
 from src.ocr.parse_usage_statement import parse_pdf as parse_usage_pdf
@@ -534,21 +527,18 @@ def run_link_pipeline(
                     continue
 
                 suffix = Path(file_info["original_filename"]).suffix.lower()
-                if suffix not in SUPPORTED_EXTS:
+                _IMAGE_EXT = {".jpg", ".jpeg", ".png", ".tif", ".tiff"}
+                if suffix not in _IMAGE_EXT:
                     continue
 
                 tmp_path = _fetch_and_save_temp(file_info["storage_key"], suffix)
                 tmp_paths.append(tmp_path)
 
-                raw = call_clova_receipt(tmp_path, CLOVA_OCR_SECRET, CLOVA_OCR_URL)
-                ocr_result = parse_clova_response(raw)
-                ocr_result = validate_ocr_result(ocr_result)
+                ocr_result = ocr_parse_receipt(tmp_path)
                 ocr_result["source_file"] = file_info["original_filename"]
 
                 receipt_file_id_map[ocr_result.get("receipt_id", "")] = fid
                 receipt_ocr_results.append(ocr_result)
-
-                time.sleep(0.3)  # CLOVA API rate limit 방지
 
             # ── 세금계산서 파싱 ────────────────────────────────────────────
             for fid in tax_invoice_file_ids:
