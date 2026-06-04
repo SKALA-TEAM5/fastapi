@@ -26,6 +26,24 @@ import pdfplumber
 # 0. 상수 정의
 # ══════════════════════════════════════════════════════════
 
+# ── 사용내역서 판별 키워드 ────────────────────────────────
+# 키워드 중 MIN_KEYWORD_MATCH개 이상 발견되면 사용내역서로 판별
+# 실제 사용내역서를 확인하면서 키워드 추가/제거 가능
+USAGE_STATEMENT_KEYWORDS = [
+    "사용내역서",
+    "산업안전보건관리비",
+    "소재지",
+    "대표자",
+    "공사금액",
+    "공사기간",
+    "발주자",
+    "공정률",
+    "공정율",
+    "안전관리비",
+]
+MIN_KEYWORD_MATCH = 6  # 최소 매칭 키워드 수
+
+
 # 공식 서식(별지 제1호): 페이지 번호 → DB 카테고리 코드 (V4__seed_types.sql 기준)
 PAGE_CATEGORY_MAP = {
     1: None,  # 요약 페이지
@@ -178,6 +196,27 @@ STANDARD_EXTRA_FIELDS = {"unit", "qty", "unit_price"}
 # ══════════════════════════════════════════════════════════
 # 1. 유틸리티
 # ══════════════════════════════════════════════════════════
+
+
+def is_usage_statement(file_bytes: bytes) -> bool:
+    """
+    PDF 바이트를 읽어 사용내역서 여부를 판별한다.
+
+    첫 페이지에서 텍스트를 빠르게 추출 후 USAGE_STATEMENT_KEYWORDS 중
+    MIN_KEYWORD_MATCH개 이상 발견되면 사용내역서로 판단한다.
+
+    파싱(parse_pdf) 전에 호출해 잘못된 파일 업로드를 조기에 차단한다.
+
+    키워드 조정: parse_usage_statement.py 상단 USAGE_STATEMENT_KEYWORDS 수정
+    """
+    import io
+    try:
+        with pdfplumber.open(io.BytesIO(file_bytes)) as pdf:
+            text = pdf.pages[0].extract_text() or "" if pdf.pages else ""
+        matched = sum(1 for kw in USAGE_STATEMENT_KEYWORDS if kw in text)
+        return matched >= MIN_KEYWORD_MATCH
+    except Exception:
+        return False
 
 
 def clean(v) -> str:
