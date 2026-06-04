@@ -26,7 +26,7 @@ log = logging.getLogger(__name__)
 
 DEFAULT_TTL = 7 * 24 * 3600
 DEFAULT_DIR = Path(".cache")
-DEFAULT_EMBED_MODEL = "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2"
+DEFAULT_EMBED_MODEL = "jhgan/ko-sroberta-multitask"
 DEFAULT_QDRANT_URL = "http://localhost:6333"
 DEFAULT_COLLECTION = "legal_documents"
 
@@ -132,7 +132,6 @@ def load_collection_documents(
     collection_name: str,
     *,
     qdrant_url: str | None = None,
-    source_exclude: str | None = None,
 ) -> list[Document]:
     collection = _sanitize_name(collection_name)
     url = _get_qdrant_url(qdrant_url)
@@ -162,8 +161,6 @@ def load_collection_documents(
                         break
                     offset = next_offset
                 _collection_docs_cache[cache_key] = docs
-    if source_exclude:
-        return [doc for doc in docs if doc.metadata.get("source") != source_exclude]
     return docs
 
 
