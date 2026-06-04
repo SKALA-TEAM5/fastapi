@@ -41,7 +41,7 @@ from src.ocr.parse_tax_invoice import (
     parse_from_pdf,
     parse_tax_invoice,
 )
-from src.ocr.parse_usage_statement import parse_pdf as parse_usage_statement
+from src.ocr.parse_usage_statement import parse_pdf as parse_usage_statement, is_usage_statement
 from src.services.minio_client import create_presigned_file_url, fetch_file
 
 router = APIRouter(prefix="/ocr", tags=["OCR 파싱"])
@@ -103,6 +103,15 @@ def _parse_usage_statement(file_bytes: bytes, suffix: str, filename: str) -> dic
         raise HTTPException(
             status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
             detail="사용내역서는 PDF 형식만 지원합니다.",
+        )
+    # ── 사용내역서 형식 사전 판별 ─────────────────────────
+    if not is_usage_statement(file_bytes):
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail=(
+                "업로드된 파일이 사용내역서 형식이 아닙니다. "
+                "산업안전보건관리비 사용내역서 PDF를 업로드해 주세요."
+            ),
         )
     with tempfile.NamedTemporaryFile(suffix=".pdf", delete=False) as tmp:
         tmp.write(file_bytes)
