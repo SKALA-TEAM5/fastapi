@@ -34,6 +34,7 @@ _kiwi = Kiwi()
 _RERANK_MODEL = "BAAI/bge-reranker-v2-m3"
 _TOP_N = 5
 _BATCH_SIZE = 8
+_PDF_SOURCE_TYPES = {"law_notice", "commentary", "appendix_disallowed"}
 
 
 class _RetrieverCache(NamedTuple):
@@ -43,6 +44,7 @@ class _RetrieverCache(NamedTuple):
 
 
 _retriever_cache: _RetrieverCache | None = None
+_retriever_cache_lock = Lock()
 _rerank_model: HuggingFaceCrossEncoder | None = None
 _rerank_model_lock = Lock()
 
@@ -61,39 +63,42 @@ def _tokenize(text: str) -> list[str]:
     return [token.form for token in _kiwi.tokenize(text)]
 
 
+def _is_pdf_source_doc(doc: Document) -> bool:
+    return doc.metadata.get("source_type") in _PDF_SOURCE_TYPES
+
+
 def _get_corpus_and_bm25(
-    vectorstore,
     collection_name: str,
-    use_pdf_only: bool,
     k: int,
-) -> tuple[list[Document], BM25Retriever]:
+) -> tuple[list[Document], BM25Retriever, bool]:
     global _retriever_cache
 
-    corpus = load_collection_documents(
-        collection_name,
-        source_exclude="web_법령" if use_pdf_only else None,
-    )
-    fingerprint = (collection_name, use_pdf_only, len(corpus))
+    with _retriever_cache_lock:
+        full_corpus = load_collection_documents(collection_name)
+        use_pdf_only = any(_is_pdf_source_doc(doc) for doc in full_corpus)
+        corpus = (
+            [doc for doc in full_corpus if _is_pdf_source_doc(doc)]
+            if use_pdf_only
+            else full_corpus
+        )
+        fingerprint = (collection_name, use_pdf_only, len(corpus))
 
-    if _retriever_cache and _retriever_cache.fingerprint == fingerprint:
-        log.info("Retriever 캐시 적중 — corpus/BM25 재구축 스킵")
-        _retriever_cache.bm25.k = k
-        return _retriever_cache.corpus, _retriever_cache.bm25
+        if _retriever_cache and _retriever_cache.fingerprint == fingerprint:
+            log.info("Retriever 캐시 적중 — corpus/BM25 재구축 스킵")
+            _retriever_cache.bm25.k = k
+            return _retriever_cache.corpus, _retriever_cache.bm25, use_pdf_only
 
-    log.info(f"BM25 인덱스 구축 중 (문서 {len(corpus)}개)")
-    bm25 = BM25Retriever.from_documents(corpus, preprocess_func=_tokenize, k=k)
-    _retriever_cache = _RetrieverCache(fingerprint=fingerprint, corpus=corpus, bm25=bm25)
-    return corpus, bm25
+        log.info(f"BM25 인덱스 구축 중 (문서 {len(corpus)}개)")
+        bm25 = BM25Retriever.from_documents(corpus, preprocess_func=_tokenize, k=k)
+        _retriever_cache = _RetrieverCache(fingerprint=fingerprint, corpus=corpus, bm25=bm25)
+        return corpus, bm25, use_pdf_only
 
 
 def build_retriever(vectorstore, collection_name: str, k: int = 8) -> EnsembleRetriever:
-    pdf_corpus = load_collection_documents(collection_name, source_exclude="web_법령")
-    use_pdf_only = len(pdf_corpus) > 0
-
-    _, bm25_retriever = _get_corpus_and_bm25(vectorstore, collection_name, use_pdf_only, k)
+    corpus, bm25_retriever, use_pdf_only = _get_corpus_and_bm25(collection_name, k)
 
     if use_pdf_only:
-        log.info(f"PDF 청크 {len(pdf_corpus)}개로 Ensemble 구성")
+        log.info(f"PDF 청크 {len(corpus)}개로 Ensemble 구성")
         vector_retriever = vectorstore.as_retriever(search_kwargs={"k": k})
     else:
         log.info("PDF 청크 없음 — 웹 전체로 Ensemble 구성")
