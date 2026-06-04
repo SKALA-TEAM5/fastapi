@@ -99,7 +99,11 @@ class OrchestratorDashboardResponse(BaseModel):
 class EvidenceReviewRequest(BaseModel):
     project_id: int
     usage_statement_id: int
-    requested_by_user_id: int | None = Field(None, description="보완 TODO 요청자 사용자 ID")
+    requested_by_user_id: int | None = Field(
+        None,
+        validation_alias=AliasChoices("requested_by_user_id", "triggered_by_user_id"),
+        description="보완 TODO 요청자 사용자 ID",
+    )
 
 
 class LegalReviewRequest(BaseModel):
