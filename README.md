@@ -4,7 +4,8 @@
 
 - 로컬 개발은 `.env`를 사용합니다. 실제 `.env`는 커밋하지 않습니다.
 - 커밋되는 파일은 `.env.example`뿐이며, API key와 비밀번호는 placeholder로 둡니다.
-- Kubernetes 배포 시에는 ConfigMap/Secret으로 DB, Qdrant, OpenAI 설정을 주입합니다.
+- Kubernetes manifest는 `SKALA-TEAM5/deploy` 레포의 `k8s/fastapi`에서 관리하고, 배포 시 ConfigMap/Secret으로 DB, Qdrant, OpenAI 설정을 주입합니다.
+- 이 레포의 workflow는 Docker 이미지를 빌드/푸시한 뒤 기존 `team5-fastapi` Deployment만 재시작합니다.
 - `main`에 머지되면 운영 반영 대상이 되므로, 통합 확인은 `develop`에서 먼저 진행합니다.
 
 로컬에서 공용 DB를 사용하려면 port-forward를 열고 `.env.example`을 복사합니다.

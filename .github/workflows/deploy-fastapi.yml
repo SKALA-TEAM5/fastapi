@@ -53,16 +53,11 @@ jobs:
             --region "${AWS_REGION}" \
             --name "${EKS_CLUSTER_NAME}"
 
-      - name: Apply Kubernetes manifests
+      - name: Rollout fastapi deployment if present
         run: |
-          kubectl apply -f k8s/fastapi-configmap.yaml
-          kubectl apply -f k8s/fastapi-service.yaml
-          kubectl apply -f k8s/fastapi-deployment.yaml
-
-      - name: Restart fastapi deployment
-        run: |
-          kubectl rollout restart deployment/team5-fastapi -n "${K8S_NAMESPACE}"
-
-      - name: Wait for rollout
-        run: |
-          kubectl rollout status deployment/team5-fastapi -n "${K8S_NAMESPACE}"
+          if kubectl get deployment/team5-fastapi -n "${K8S_NAMESPACE}"; then
+            kubectl rollout restart deployment/team5-fastapi -n "${K8S_NAMESPACE}"
+            kubectl rollout status deployment/team5-fastapi -n "${K8S_NAMESPACE}"
+          else
+            echo "team5-fastapi deployment is not created yet. Image build/push completed."
+          fi
