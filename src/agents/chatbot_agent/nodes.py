@@ -4,7 +4,7 @@
 #
 # [ 주요 함수 정의 ]
 #
-# 1. classify_intent()   : 사용자 질문을 4가지 intent로 분류 (Node 1)
+# 1. classify_intent()   : 사용자 질문을 6가지 intent로 분류 (Node 1)
 # 2. retrieve_docs()     : Qdrant BM25+Vector Ensemble 검색 (Node 2)
 # 3. fallback()          : 범위 외 질문에 고정 안내 메시지 반환 (Node 3)
 # 4. grade_docs()        : 검색 문서 관련성 LLM 평가 및 필터링 (Node 4)
@@ -39,6 +39,7 @@ from src.agents.chatbot_agent.prompts import (
     CHATBOT_REWRITE_PROMPT,
     DOC_GRADE_PROMPT,
     FALLBACK_MESSAGE,
+    NO_DOCS_FALLBACK_MESSAGE,
     INTENT_PROMPT,
 )
 from src.agents.chatbot_agent.state import ChatbotState
@@ -48,6 +49,7 @@ from src.core.storage import DEFAULT_COLLECTION, load_vectorstore
 log = logging.getLogger(__name__)
 
 MAX_RETRY = 3
+MAX_MESSAGES = 20  # 메모리 누적 방지: 이 수를 초과하면 오래된 메시지부터 제거
 
 # ── 답변 생성용 고성능 모델 (환경변수 우선, 없으면 gpt-4.1) ─────────────────
 _ANSWER_MODEL = os.getenv("OPENAI_REPORT_MODEL", "gpt-4.1")
@@ -55,7 +57,7 @@ _ANSWER_MODEL = os.getenv("OPENAI_REPORT_MODEL", "gpt-4.1")
 
 # ── structured_output 스키마 ─────────────────────────────────────────────────
 class _IntentOutput(BaseModel):
-    intent: str  # "카테고리판단" | "법령한도" | "적법성판단" | "기타"
+    intent: str  # "카테고리판단" | "법령한도" | "적법성판단" | "계상기준" | "도급귀속" | "기타"
 
 
 class _GradeOutput(BaseModel):
@@ -122,10 +124,10 @@ def _extract_sources(docs) -> list[str]:
 # ══════════════════════════════════════════════════════════════════════════════
 
 def classify_intent(state: ChatbotState) -> dict:
-    """사용자 질문을 4가지 intent로 분류한다.
+    """사용자 질문을 6가지 intent로 분류한다.
 
     Returns:
-        intent: "카테고리판단" | "법령한도" | "적법성판단" | "기타"
+        intent: "카테고리판단" | "법령한도" | "적법성판단" | "계상기준" | "도급귀속" | "기타"
         messages: 사용자 메시지 추가
     """
     question = state["question"]
@@ -135,14 +137,19 @@ def classify_intent(state: ChatbotState) -> dict:
     structured_llm = llm.with_structured_output(_IntentOutput)
     chain = INTENT_PROMPT | structured_llm
 
+    chat_history = _format_chat_history(state.get("messages", []))
+
     try:
-        result: _IntentOutput = chain.invoke({"question": question})
+        result: _IntentOutput = chain.invoke({
+            "question": question,
+            "chat_history": chat_history,
+        })
         intent = result.intent
     except Exception as e:
         log.warning(f"[intent_classifier] structured_output 실패 ({e}), 기타로 처리")
         intent = "기타"
 
-    valid = {"카테고리판단", "법령한도", "적법성판단", "기타"}
+    valid = {"카테고리판단", "법령한도", "적법성판단", "계상기준", "도급귀속", "기타"}
     if intent not in valid:
         intent = "기타"
 
@@ -179,20 +186,32 @@ def retrieve_docs(state: ChatbotState) -> dict:
 # ══════════════════════════════════════════════════════════════════════════════
 
 def fallback(state: ChatbotState) -> dict:
-    """산안비와 무관한 질문에 안내 메시지를 반환한다.
+    """범위 외 질문이거나 근거 문서를 찾지 못한 경우 안내 메시지를 반환한다.
 
-    RAG 검색 없이 고정 메시지를 answer에 설정한다.
+    - intent == "기타"              → 산안비 무관 질문 안내
+    - graded_docs 비어있고 재시도 소진 → 근거 문서 없음 안내
 
     Returns:
         answer: 안내 메시지
         sources: 빈 리스트
         messages: AI 응답 메시지 추가
     """
-    log.info("[fallback] 범위 외 질문 처리")
+    graded = state.get("graded_docs", [])
+    retry  = state.get("retry_count", 0)
+    intent = state.get("intent", "기타")
+
+    # 재시도 소진 후 근거 문서 없음 → 별도 메시지
+    if intent != "기타" and not graded and retry >= MAX_RETRY:
+        log.info("[fallback] 근거 문서 없음 — 생성 차단")
+        message = NO_DOCS_FALLBACK_MESSAGE
+    else:
+        log.info("[fallback] 범위 외 질문 처리")
+        message = FALLBACK_MESSAGE
+
     return {
-        "answer": FALLBACK_MESSAGE,
+        "answer": message,
         "sources": [],
-        "messages": [AIMessage(content=FALLBACK_MESSAGE)],
+        "messages": [AIMessage(content=message)],
     }
 
 
@@ -281,6 +300,11 @@ async def generate_answer(state: ChatbotState) -> dict:
     graded_docs = state.get("graded_docs", [])
     messages = state.get("messages", [])
 
+    # 대화 길이 누적 방지: MAX_MESSAGES 초과 시 오래된 메시지 제거
+    if len(messages) > MAX_MESSAGES:
+        messages = messages[-MAX_MESSAGES:]
+        log.info(f"[answer_generator] 메시지 트리밍: {MAX_MESSAGES}개로 축소")
+
     context = _format_docs(graded_docs)
     chat_history = _format_chat_history(messages)
     sources = _extract_sources(graded_docs)
@@ -336,11 +360,12 @@ def route_by_intent(
 
 def route_after_grading(
     state: ChatbotState,
-) -> Literal["rewrite_query", "generate_answer"]:
+) -> Literal["rewrite_query", "generate_answer", "fallback"]:
     """doc_grader 이후 분기.
 
     - graded_docs 비어있고 retry < MAX_RETRY → rewrite_query
-    - 그 외 → generate_answer
+    - graded_docs 비어있고 retry >= MAX_RETRY → fallback (근거 없는 답변 생성 차단)
+    - graded_docs 있음 → generate_answer
     """
     graded = state.get("graded_docs", [])
     retry = state.get("retry_count", 0)
@@ -348,6 +373,10 @@ def route_after_grading(
     if not graded and retry < MAX_RETRY:
         log.info(f"[route] 관련 문서 없음 → rewrite_query (retry={retry})")
         return "rewrite_query"
+
+    if not graded and retry >= MAX_RETRY:
+        log.info(f"[route] 재시도 {MAX_RETRY}회 소진, 근거 문서 없음 → fallback")
+        return "fallback"
 
     log.info(f"[route] 문서 {len(graded)}건 확보 → generate_answer")
     return "generate_answer"
