@@ -517,7 +517,7 @@ def run_link_pipeline(
                             evidence_type_code=evidence_type,
                         )
 
-                    update_file_status(conn, file_id_for_receipt, "matched")
+                    update_file_status(conn, file_id_for_receipt, "success")
 
                 elif (
                     status in ("unmatched", "rejected")
@@ -525,7 +525,7 @@ def run_link_pipeline(
                     and receipt_id in receipt_file_id_map
                 ):
                     file_id_for_receipt = receipt_file_id_map[receipt_id]
-                    update_file_status(conn, file_id_for_receipt, "unmatched")
+                    update_file_status(conn, file_id_for_receipt, "fail")
 
             summary = batch.get("summary") or {}
 

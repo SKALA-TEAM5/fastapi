@@ -96,6 +96,7 @@ def scan_orchestrator_state(project_id: int, usage_statement_id: int) -> Orchest
                 FROM files
                 WHERE project_id = %(project_id)s
                   AND deleted_at IS NULL
+                  AND status_code IN ('draft', 'fail')
                 GROUP BY uploaded_evidence_type_code
                 """,
                 {"project_id": project_id},
@@ -164,6 +165,7 @@ def list_evidence_file_ids_by_type(project_id: int) -> dict[str, list[int]]:
                 FROM files
                 WHERE project_id = %(project_id)s
                   AND deleted_at IS NULL
+                  AND status_code IN ('draft', 'fail')
                   AND uploaded_evidence_type_code IS NOT NULL
                 ORDER BY id
                 """,
@@ -197,6 +199,7 @@ def list_evidence_files_by_type(
                 FROM files
                 WHERE project_id = %(project_id)s
                   AND deleted_at IS NULL
+                  AND status_code IN ('draft', 'fail')
                   AND uploaded_evidence_type_code = ANY(%(evidence_type_codes)s)
                 ORDER BY id
                 """,
@@ -206,6 +209,33 @@ def list_evidence_files_by_type(
                 },
             )
             return [dict(row) for row in cur.fetchall()]
+
+
+def update_file_statuses(
+    *,
+    project_id: int,
+    file_ids: list[int],
+    status_code: str,
+) -> None:
+    if not file_ids:
+        return
+
+    with get_connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                UPDATE files
+                SET status_code = %(status_code)s
+                WHERE project_id = %(project_id)s
+                  AND id = ANY(%(file_ids)s)
+                  AND deleted_at IS NULL
+                """,
+                {
+                    "project_id": project_id,
+                    "file_ids": file_ids,
+                    "status_code": status_code,
+                },
+            )
 
 
 def list_latest_agent_logs(

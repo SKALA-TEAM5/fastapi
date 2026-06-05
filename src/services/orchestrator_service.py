@@ -39,6 +39,7 @@ from src.repositories.orchestrator_repository import (
     mark_orchestrator,
     scan_orchestrator_state,
     select_evidence_agents,
+    update_file_statuses,
     upsert_agent_log,
 )
 from src.repositories.db import get_connection
@@ -565,6 +566,7 @@ def _run_link_agent(project_id: int, usage_statement_id: int) -> dict[str, Any]:
         for file_id in grouped_files.get(evidence_type, [])
     ]
     tax_invoice_file_ids = grouped_files.get("tax_invoice", [])
+    target_file_ids = receipt_file_ids + tax_invoice_file_ids
 
     if not receipt_file_ids and not tax_invoice_file_ids:
         return {"status_code": "skipped", "result_code": None, "reason": "영수증/세금계산서 파일 없음"}
@@ -599,6 +601,11 @@ def _run_link_agent(project_id: int, usage_statement_id: int) -> dict[str, Any]:
         )
         result_code = "hil" if issue_count else "success"
         reason = f"매칭 검토 필요 {issue_count}건" if issue_count else "증빙 파일 매칭 적정"
+        update_file_statuses(
+            project_id=project_id,
+            file_ids=target_file_ids,
+            status_code="success" if result_code == "success" else "fail",
+        )
         todos = [
             {
                 "usage_statement_item_id": int(row.get("line_id")),
@@ -629,6 +636,7 @@ def _run_link_agent(project_id: int, usage_statement_id: int) -> dict[str, Any]:
             "todos": todos,
         }
     except Exception as exc:
+        update_file_statuses(project_id=project_id, file_ids=target_file_ids, status_code="fail")
         return _mark_agent_failed(project_id, usage_statement_id, "link", exc)
 
 
@@ -675,6 +683,7 @@ def _run_vision_agent(project_id: int, usage_statement_id: int) -> dict[str, Any
     photo_files = list_evidence_files_by_type(project_id, SITE_PHOTO_TYPES)
     if not photo_files:
         return {"status_code": "skipped", "result_code": None, "reason": "현장사진 파일 없음"}
+    photo_file_ids = [int(file_info["id"]) for file_info in photo_files if file_info.get("id") is not None]
 
     photos = [
         {
@@ -708,6 +717,7 @@ def _run_vision_agent(project_id: int, usage_statement_id: int) -> dict[str, Any
 
     if not VISION_AGENT_BASE_URL:
         reason = "VISION_AGENT_BASE_URL 환경변수가 설정되지 않아 vision Agent를 호출할 수 없습니다."
+        update_file_statuses(project_id=project_id, file_ids=photo_file_ids, status_code="fail")
         upsert_agent_log(
             project_id=project_id,
             usage_statement_id=usage_statement_id,
@@ -749,6 +759,11 @@ def _run_vision_agent(project_id: int, usage_statement_id: int) -> dict[str, Any
             body.get("reason")
             or ("현장사진 검토 보완 필요" if result_code == "hil" else "현장사진 검토 적정")
         )
+        update_file_statuses(
+            project_id=project_id,
+            file_ids=photo_file_ids,
+            status_code="success" if result_code == "success" else "fail",
+        )
         token = _int_or_none(body.get("token") or body.get("token_usage"))
         source_details = body.get("details")
         details = dict(source_details) if isinstance(source_details, dict) else {}
@@ -788,6 +803,7 @@ def _run_vision_agent(project_id: int, usage_statement_id: int) -> dict[str, Any
             "details": details,
         }
     except Exception as exc:
+        update_file_statuses(project_id=project_id, file_ids=photo_file_ids, status_code="fail")
         return _mark_agent_failed(project_id, usage_statement_id, "vision", exc)
 
 
