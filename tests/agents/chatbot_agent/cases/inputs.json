@@ -68,5 +68,47 @@
     "question": "위험성평가를 외부 업체에 용역 의뢰한 비용이 산안비로 가능한가요?",
     "expected_intent": "적법성판단",
     "expected_keywords": ["CAT_09", "위험성평가"]
+  },
+  {
+    "id": "chat_11",
+    "description": "계상기준 — 산안비 총액 계산 방법",
+    "question": "산안비 총액은 어떻게 계산하나요?",
+    "expected_intent": "계상기준",
+    "expected_keywords": ["대상액", "비율"]
+  },
+  {
+    "id": "chat_12",
+    "description": "계상기준 — 공사 규모별 요율 (경계: 법령한도)",
+    "question": "대상액이 5억 원 미만인 경우 산안비 요율이 어떻게 되나요?",
+    "expected_intent": "계상기준",
+    "expected_keywords": ["별표", "비율"]
+  },
+  {
+    "id": "chat_13",
+    "description": "계상기준 — 설계변경 시 재계상 의무",
+    "question": "공사 중 설계변경으로 대상액이 바뀌면 산안비를 다시 계상해야 하나요?",
+    "expected_intent": "계상기준",
+    "expected_keywords": ["조정 계상", "대상액"]
+  },
+  {
+    "id": "chat_14",
+    "description": "도급귀속 — 하청업체 집행 가능 여부",
+    "question": "하청업체가 산안비를 직접 사용할 수 있나요?",
+    "expected_intent": "도급귀속",
+    "expected_keywords": ["도급인", "수급인"]
+  },
+  {
+    "id": "chat_15",
+    "description": "도급귀속 — 공동도급 현장 귀속 (경계: 적법성판단)",
+    "question": "공동도급 현장에서 산안비는 어떻게 귀속되나요?",
+    "expected_intent": "도급귀속",
+    "expected_keywords": ["도급인"]
+  },
+  {
+    "id": "chat_16",
+    "description": "경계 케이스 — 계상기준 (총액 산정 방식)",
+    "question": "산안비 총액은 공사 규모에 따라 어떻게 산정되나요?",
+    "expected_intent": "계상기준",
+    "expected_keywords": ["대상액", "비율"]
   }
 ]
