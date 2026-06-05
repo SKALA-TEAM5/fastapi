@@ -18,12 +18,12 @@ from pathlib import Path
 import psycopg
 from psycopg.rows import dict_row
 
-from src.core.config import DATABASE_URL
+from src.core.config import LEGAL_DATABASE_URL
 from src.schemas.classifier import CATEGORIES
 
 DEFAULT_RULES_PATH = Path("artifacts/legal_rules_payload.json")
 DEFAULT_RULE_CONFIG_PATH = Path("scripts/seed_legal_rule_profiles.json")
-DEFAULT_DATABASE_URL = DATABASE_URL
+DEFAULT_DATABASE_URL = LEGAL_DATABASE_URL
 
 
 def _load_static_rule_config(rule_config_path: Path = DEFAULT_RULE_CONFIG_PATH) -> dict:

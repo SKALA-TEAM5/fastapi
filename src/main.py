@@ -3,7 +3,6 @@
 # 작성일   : 2026-06-02
 #
 # FastAPI 애플리케이션 진입점
-# - 모든 라우터를 /api/v1 prefix로 등록
 # - Spring Backend와의 통신을 위한 CORS 설정
 # - 포트 8001 (k8s: team5-fastapi:8001)
 # --------------------------------------------------------------------------
@@ -13,7 +12,15 @@ import uvicorn
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
-from src.api.routers import matching, orchestrator, parse, receipts, report_agent, tax_invoices, validation
+from src.api.routers import (
+    matching,
+    orchestrator,
+    parse,
+    receipts,
+    report_agent,
+    tax_invoices,
+    validation,
+)
 
 logging.basicConfig(
     level=logging.INFO,
@@ -39,16 +46,13 @@ def health() -> dict:
     return {"status": "ok"}
 
 
-# Spring Backend의 현재 FastAPI client는 /api/v1 없이 /orchestrator 경로를 호출한다.
-# 외부 문서/테스트에서 쓰는 /api/v1/orchestrator 경로도 유지하기 위해 두 prefix를 함께 연다.
 app.include_router(orchestrator.router)
-app.include_router(orchestrator.router, prefix="/api/v1")
-app.include_router(validation.router,   prefix="/api/v1")
-app.include_router(report_agent.router, prefix="/api/v1")
-app.include_router(parse.router,        prefix="/api/v1")
-app.include_router(matching.router,     prefix="/api/v1")
-app.include_router(receipts.router,     prefix="/api/v1")
-app.include_router(tax_invoices.router, prefix="/api/v1")
+app.include_router(validation.router)
+app.include_router(report_agent.router)
+app.include_router(parse.router)
+app.include_router(matching.router)
+app.include_router(receipts.router)
+app.include_router(tax_invoices.router)
 
 
 if __name__ == "__main__":

@@ -66,10 +66,18 @@ DB_NAME: str = os.getenv("POSTGRES_DB", "safety")
 DB_USER: str = os.getenv("SERVICE_APP_USER", "safety_user")
 DB_PASSWORD: str = os.getenv("SERVICE_APP_PASSWORD", "safety_password")
 DB_SCHEMA: str = "service"
+LAW_DB_USER: str = os.getenv("LAW_APP_USER", "safety_law_app")
+LAW_DB_PASSWORD: str = os.getenv("LAW_APP_PASSWORD", "safety_law_password")
+LAW_DB_SCHEMA: str = "legal_rag"
 
 DATABASE_URL: str = (
     f"postgresql://{DB_USER}:{DB_PASSWORD}@{DB_HOST}:{DB_PORT}/{DB_NAME}"
     f"?options=-csearch_path%3D{DB_SCHEMA}"
+)
+
+LEGAL_DATABASE_URL: str = (
+    f"postgresql://{LAW_DB_USER}:{LAW_DB_PASSWORD}@{DB_HOST}:{DB_PORT}/{DB_NAME}"
+    f"?options=-csearch_path%3D{LAW_DB_SCHEMA}"
 )
 
 
