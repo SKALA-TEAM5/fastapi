@@ -237,7 +237,9 @@ def parse_amount(value) -> int | None:
 
 
 def parse_number(value) -> float | None:
-    """문자열 숫자 → float 변환 (quantity, unit_price용)"""
+    """문자열 숫자 → float 변환 (quantity, unit_price용)
+    BUG FIX: "30개", "15롤", "20켤레" 등 단위 포함 값에서 앞 숫자만 추출
+    """
     s = clean(value).replace(",", "").replace("원", "").replace(" ", "")
     if not s or s in ["-", "─", "—"]:
         return None
@@ -245,6 +247,13 @@ def parse_number(value) -> float | None:
         v = float(s)
         return v if v > 0 else None
     except ValueError:
+        m = re.match(r"^([\d.]+)", s)
+        if m:
+            try:
+                v = float(m.group(1))
+                return v if v > 0 else None
+            except ValueError:
+                pass
         return None
 
 
@@ -281,6 +290,18 @@ def find_col(row: list, keywords: list) -> int | None:
         for kw in keywords:
             if kw.replace(" ", "") in cell_clean:
                 return i
+    return None
+
+
+def recalc_total(unit_price: float | None, quantity: float | None, parsed_amount: int | None) -> int | None:
+    """
+    total_amount 결정 — 문서 기재 금액 우선, 없을 때만 단가×수량으로 보완
+    BUG FIX: 단가×수량을 항상 우선하면 부가세 포함 금액을 잃어버리는 문제 방지
+    """
+    if parsed_amount is not None:
+        return parsed_amount
+    if unit_price and quantity:
+        return round(unit_price * quantity)
     return None
 
 
@@ -341,26 +362,59 @@ def parse_header_page(page) -> dict:
                 header[key] = m.group(1).strip()
                 break
 
+    # category_summaries용: 0원도 포함해야 하므로 parse_amount 대신 직접 파싱
+    def _parse_amount_or_zero(v) -> int | None:
+        s = clean(v).replace(",", "").replace("원", "").replace(" ", "")
+        if not s or s in ["-", "─", "—"]:
+            return None
+        try:
+            return max(0, int(float(s)))
+        except ValueError:
+            return None
+
+    # 행 번호(1~9) → 카테고리 코드
+    NUMBER_TO_CATEGORY = {str(i): f"CAT_0{i}" for i in range(1, 10)}
+
     summaries = []
     tables = page.extract_tables()
     for table in tables:
-        for row in table:
-            row_text = " ".join(clean(c) for c in row if c)
-            for code, name in CATEGORY_NAME_MAP.items():
-                short = name.split("·")[0].split(" ")[0].replace("등", "").strip()
-                if short in row_text:
-                    amounts = [parse_amount(c) for c in row if parse_amount(c)]
-                    if len(amounts) >= 2:
-                        summaries.append(
-                            {
-                                "항목코드": code,
-                                "항목명": name,
-                                "전회금액": amounts[-3] if len(amounts) >= 3 else 0,
-                                "금회금액": amounts[-2],
-                                "누계금액": amounts[-1],
-                            }
-                        )
-                    break
+        if not table or not table[0]:
+            continue
+
+        # BUG FIX: "항 목" 헤더를 가진 요약 테이블만 처리 (상위 2행에서 확인)
+        header_text = "".join(
+            clean(c) for row in table[:2] if row for c in row if c
+        ).replace(" ", "")
+        if "항목" not in header_text:
+            continue
+
+        for row in table[1:]:
+            if not row or is_skip_row(row):
+                continue
+
+            # 첫 번째 셀의 번호(예: "1.", "2.") → 카테고리 코드
+            first_cell = clean(row[0]) if row[0] else ""
+            m = re.match(r"^(\d+)[.\s]", first_cell.strip())
+            if not m:
+                continue
+
+            cat_code = NUMBER_TO_CATEGORY.get(m.group(1))
+            if not cat_code:
+                continue
+
+            # BUG FIX: 0원 항목도 포함 (CAT_08, CAT_09 등)
+            amounts = [_parse_amount_or_zero(c) for c in row]
+            amounts = [a for a in amounts if a is not None]
+            if len(amounts) >= 2:
+                summaries.append(
+                    {
+                        "항목코드": cat_code,
+                        "항목명": CATEGORY_NAME_MAP.get(cat_code, ""),
+                        "전회금액": amounts[-3] if len(amounts) >= 3 else 0,
+                        "금회금액": amounts[-2],
+                        "누계금액": amounts[-1],
+                    }
+                )
 
     header["category_summaries"] = summaries
     return header
@@ -428,6 +482,9 @@ def parse_category_page(page, category_code: str, page_no: int) -> list:
                 if col_idx is not None and col_idx < len(row_c) and row_c[col_idx]:
                     extra_data[field] = row_c[col_idx]
 
+            unit_price = parse_number(extra_data.get("unit_price"))
+            quantity   = parse_number(extra_data.get("qty"))
+
             item = {
                 "line_id": str(uuid.uuid4()),
                 "category_code": category_code,
@@ -438,9 +495,9 @@ def parse_category_page(page, category_code: str, page_no: int) -> list:
                 if desc_col is not None and row_c[desc_col]
                 else None,
                 "unit": extra_data.get("unit"),
-                "quantity": parse_number(extra_data.get("qty")),
-                "unit_price": parse_number(extra_data.get("unit_price")),
-                "total_amount": amount,
+                "quantity": quantity,
+                "unit_price": unit_price,
+                "total_amount": recalc_total(unit_price, quantity, amount),
                 "remark": build_remark(extra_data),
                 "page_no": page_no,
                 "line_no": line_no,
@@ -461,7 +518,12 @@ def parse_simple_format(pdf) -> tuple[dict, list]:
     all_text = ""
     items = []
 
-    for page_num, page in enumerate(pdf.pages, 1):
+    # BUG FIX: page 1은 parse_header_page()로 처리해 category_summaries 추출
+    header_data = parse_header_page(pdf.pages[0])
+    all_text += (pdf.pages[0].extract_text() or "") + "\n"
+
+    # BUG FIX: page 2부터 line_items 파싱 (page 1 요약 테이블 line_items 유입 방지)
+    for page_num, page in enumerate(pdf.pages[1:], 2):
         page_text = page.extract_text() or ""
         all_text += page_text + "\n"
 
@@ -470,6 +532,13 @@ def parse_simple_format(pdf) -> tuple[dict, list]:
 
         for table in tables:
             if not table:
+                continue
+
+            # BUG FIX: 요약 테이블 감지 → 스킵 ("전월까지사용금액" 등 헤더 존재 시)
+            top2_text = " ".join(
+                clean(c) for row in table[:2] if row for c in row if c
+            ).replace(" ", "")
+            if any(kw in top2_text for kw in ["전월까지", "금월사용", "누계사용", "전월까지사용"]):
                 continue
 
             # 헤더 행 탐색
@@ -487,6 +556,9 @@ def parse_simple_format(pdf) -> tuple[dict, list]:
 
             if header_row is None:
                 continue
+
+            # BUG FIX: 카테고리 carry-forward (항목 첫 행에만 카테고리명 있는 경우 대응)
+            last_cat_code = None
 
             for row in table[header_idx + 1 :]:
                 if not row or is_skip_row(row):
@@ -508,7 +580,16 @@ def parse_simple_format(pdf) -> tuple[dict, list]:
                     if col_map.get("category") is not None
                     else None
                 )
-                cat_code = _infer_category_code(category_raw or "")
+                if category_raw:
+                    inferred = _infer_category_code(category_raw)
+                    if inferred:
+                        last_cat_code = inferred
+                    cat_code = inferred or last_cat_code
+                else:
+                    cat_code = last_cat_code
+
+                unit_price = parse_number(row_c[col_map["unit_price"]]) if col_map.get("unit_price") is not None else None
+                quantity   = parse_number(row_c[col_map["qty"]]) if col_map.get("qty") is not None else None
 
                 items.append(
                     {
@@ -523,13 +604,9 @@ def parse_simple_format(pdf) -> tuple[dict, list]:
                         "unit": row_c[col_map["unit"]]
                         if col_map.get("unit") is not None
                         else None,
-                        "quantity": parse_number(row_c[col_map["qty"]])
-                        if col_map.get("qty") is not None
-                        else None,
-                        "unit_price": parse_number(row_c[col_map["unit_price"]])
-                        if col_map.get("unit_price") is not None
-                        else None,
-                        "total_amount": amount,
+                        "quantity": quantity,
+                        "unit_price": unit_price,
+                        "total_amount": recalc_total(unit_price, quantity, amount),
                         "remark": row_c[col_map["note"]]
                         if col_map.get("note") is not None
                         else None,
@@ -538,19 +615,33 @@ def parse_simple_format(pdf) -> tuple[dict, list]:
                     }
                 )
 
-    header = _extract_meta_from_text(all_text)
-    return header, items
+    # 헤더 메타 보완 (텍스트 기반 추출이 더 정확한 필드만 덮어씀)
+    text_header = _extract_meta_from_text(all_text)
+    for k, v in text_header.items():
+        if k == "category_summaries":
+            continue
+        if header_data.get(k) is None and v is not None:
+            header_data[k] = v
+
+    return header_data, items
 
 
 def _infer_category_code(text: str) -> str | None:
     """카테고리 텍스트에서 코드 추론"""
-    for code, name in CATEGORY_NAME_MAP.items():
-        keywords = name.replace("등", "").replace("·", "").split()
-        if any(kw in text for kw in keywords if len(kw) > 1):
+    # BUG FIX 1: 숫자 번호(예: "1.", "7.") 기반 직접 매핑 — 텍스트 키워드보다 먼저 시도
+    NUMBER_TO_CAT = {str(i): f"CAT_0{i}" for i in range(1, 10)}
+    m = re.match(r"^(\d)[.\s]", text.strip())
+    if m:
+        code = NUMBER_TO_CAT.get(m.group(1))
+        if code:
             return code
-    m = re.match(r"^(\d)\.", text.strip())
-    if m and m.group(1) in CATEGORY_NAME_MAP:
-        return m.group(1)
+
+    # BUG FIX 2: 공백 제거 후 키워드 비교 (예: "기술 지도비" vs "기술지도비")
+    text_nospace = text.replace(" ", "")
+    for code, name in CATEGORY_NAME_MAP.items():
+        keywords = name.replace("등", "").replace("·", "").replace(" ", "").split()
+        if any(kw in text_nospace for kw in keywords if len(kw) > 1):
+            return code
     return None
 
 
@@ -617,6 +708,7 @@ def parse_pdf(pdf_path: str) -> dict:
 
             else:
                 header, items = parse_simple_format(pdf)
+                result["category_summaries"] = header.pop("category_summaries", [])
                 result["header"] = header
                 result["line_items"] = items
 
