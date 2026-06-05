@@ -13,7 +13,7 @@ from __future__ import annotations
 
 from collections import Counter
 from datetime import date
-from typing import Any
+from typing import Any, cast
 from uuid import uuid4
 
 import psycopg2.extras
@@ -71,12 +71,13 @@ def classify_existing_usage_statement(
     request: UsageStatementClassifyRequest,
 ) -> OrchestratorActionResponse:
     try:
+        submitted_category = request.category_code or ""
         review_response = review_usage_statement(
             usage_statement_id=request.usage_statement_id,
             rows=[
                 {
                     "row_id": 1,
-                    "given_category_code": request.category_code,
+                    "given_category_code": submitted_category,
                     "item_name": request.item_name,
                 }
             ],
@@ -86,24 +87,24 @@ def classify_existing_usage_statement(
         review = review_map.get(1)
 
         if review is None:
-            updated_category = request.category_code
+            updated_category = submitted_category
             status = "appropriate"
             reason = "classifier result was missing, so the submitted category was kept."
             item_name = request.item_name
         else:
-            updated_category = review.final_category_code or request.category_code
+            updated_category = review.final_category_code or submitted_category
             status = "appropriate" if review.decision_status == "유지" else "inappropriate"
             reason = review.reason
             item_name = review.item_name
 
         changes: list[dict[str, Any]] = []
-        if updated_category != request.category_code:
+        if updated_category != submitted_category:
             changes.append(
                 {
                     "row_id": 1,
                     "item_id": request.item_id,
                     "item_name": item_name,
-                    "before": {"category_code": request.category_code},
+                    "before": {"category_code": submitted_category},
                     "after": {"category_code": updated_category},
                     "reason": reason,
                 }
@@ -127,7 +128,7 @@ def classify_existing_usage_statement(
                         "row_id": 1,
                         "item_id": request.item_id,
                         "item_name": item_name,
-                        "original_category_code": request.category_code,
+                        "original_category_code": submitted_category,
                         "final_category_code": updated_category,
                         "status": status,
                         "reason": reason,
@@ -135,6 +136,16 @@ def classify_existing_usage_statement(
                 ],
             },
         }
+        upsert_agent_log(
+            project_id=request.project_id,
+            usage_statement_id=request.usage_statement_id,
+            agent_type_code="classi",
+            status_code="success",
+            result_code="success",
+            reason=summary,
+            details=details,
+            model_name="classifier_agent",
+        )
         return OrchestratorActionResponse(
             status="success",
             message=summary,
@@ -144,6 +155,20 @@ def classify_existing_usage_statement(
         )
     except Exception as exc:
         reason = f"classi Agent 실행 실패: {type(exc).__name__}: {exc}"
+        upsert_agent_log(
+            project_id=request.project_id,
+            usage_statement_id=request.usage_statement_id,
+            agent_type_code="classi",
+            status_code="fail",
+            result_code="fail",
+            reason=reason,
+            details={
+                "event": "classification_failed",
+                "summary": reason,
+                "payload": {"error_type": type(exc).__name__, "error": str(exc)},
+            },
+            model_name="classifier_agent",
+        )
         return OrchestratorActionResponse(
             status="fail",
             message=reason,
@@ -212,7 +237,7 @@ def get_orchestrator_dashboard(
         hil_agents=hil_agents,
         agents=[
             AgentDashboardSummary(
-                agent_type_code=log.get("agent_type_code"),
+                agent_type_code=str(log.get("agent_type_code") or ""),
                 status_code=log.get("status_code"),
                 result_code=log.get("result_code"),
                 usage_statement_id=log.get("usage_statement_id"),
@@ -285,19 +310,19 @@ def run_legal_review(
     she_user_id: int | None = None,
 ) -> OrchestratorActionResponse:
     state = scan_orchestrator_state(project_id, usage_statement_id)
-    if not state.evidence_review_ready:
+    if not state.legal_ready:
         mark_orchestrator(
             project_id=project_id,
             usage_statement_id=usage_statement_id,
             event="legal_review_blocked",
             status_code="fail",
             result_code="fail",
-            reason="증빙 검증 Agent가 모두 success/success 상태가 아니어서 legal을 실행할 수 없습니다.",
+            reason="safety-doc 로그가 없어 legal을 실행할 수 없습니다.",
             payload={"hil_exists": state.evidence_has_hil},
         )
         return OrchestratorActionResponse(
             status="blocked",
-            message="증빙 검증이 모두 성공한 뒤 SHE 담당자가 legal을 실행할 수 있습니다.",
+            message="validate를 먼저 실행해야 legal을 실행할 수 있습니다.",
             usage_statement_id=usage_statement_id,
             hil_agents=[
                 agent
@@ -348,7 +373,7 @@ def run_report_draft(
         )
 
     result = _run_report_agent(project_id, usage_statement_id, she_user_id=she_user_id)
-    report_result = result.get("result") if isinstance(result.get("result"), dict) else {}
+    report_result = cast(dict[str, Any], result.get("result")) if isinstance(result.get("result"), dict) else {}
     return OrchestratorActionResponse(
         status=result.get("status_code", "fail"),
         message=result.get("reason", "report Agent 실행을 완료했습니다."),
@@ -376,14 +401,14 @@ def _run_safety_doc_agent(project_id: int, usage_statement_id: int) -> dict[str,
     )
 
     try:
-        item_results = [
+        item_results: list[dict[str, Any]] = [
             {"item_id": item_id, "result": check_missing_evidence(item_id)}
             for item_id in item_ids
         ]
         hil_item_ids = [
             row["item_id"]
             for row in item_results
-            if ((row["result"].get("evidence_status") or {}).get("missing_evidences") or [])
+            if ((_dict_or_empty(row.get("result")).get("evidence_status") or {}).get("missing_evidences") or [])
         ]
         result_code = "hil" if hil_item_ids else "success"
         reason = (
@@ -392,17 +417,17 @@ def _run_safety_doc_agent(project_id: int, usage_statement_id: int) -> dict[str,
             else "필수 증빙 누락 없음"
         )
         token = sum(
-            int(((row["result"].get("ai_response") or {}).get("usage") or {}).get("total_tokens") or 0)
+            int(((_dict_or_empty(_dict_or_empty(row.get("result")).get("ai_response")).get("usage") or {}).get("total_tokens")) or 0)
             for row in item_results
         )
         todos = [
             {
                 "usage_statement_item_id": row["item_id"],
                 "reason": "필수 증빙 누락: "
-                + ", ".join((row["result"].get("evidence_status") or {}).get("missing_evidences") or []),
+                + ", ".join((_dict_or_empty(row.get("result")).get("evidence_status") or {}).get("missing_evidences") or []),
             }
             for row in item_results
-            if ((row["result"].get("evidence_status") or {}).get("missing_evidences") or [])
+            if ((_dict_or_empty(row.get("result")).get("evidence_status") or {}).get("missing_evidences") or [])
         ]
         upsert_agent_log(
             project_id=project_id,
@@ -526,6 +551,10 @@ def _int_or_none(value: Any) -> int | None:
         return None
 
 
+def _dict_or_empty(value: Any) -> dict[str, Any]:
+    return value if isinstance(value, dict) else {}
+
+
 def _run_vision_agent(project_id: int, usage_statement_id: int) -> dict[str, Any]:
     photo_files = list_evidence_files_by_type(project_id, SITE_PHOTO_TYPES)
     if not photo_files:
@@ -613,6 +642,7 @@ def _run_vision_agent(project_id: int, usage_statement_id: int) -> dict[str, Any
             {
                 "photos": photos,
                 "vision_response": body,
+                "todos": todos,
             }
         )
 
@@ -876,7 +906,8 @@ def _legal_item_results_from_audit(
     category_name_to_code = {name: code for code, name in CATEGORIES.items()}
     results: list[dict[str, Any]] = []
     for category_name, category_result in audit_response.categories.items():
-        category_code = category_name_to_code.get(category_name, category_name)
+        category_name_text = str(category_name or "")
+        category_code = category_name_to_code.get(category_name_text, category_name_text)
         summary = summary_by_category.get(category_code)
         source_citations = [
             {"legal_basis": source.law, "summary": source.summary}

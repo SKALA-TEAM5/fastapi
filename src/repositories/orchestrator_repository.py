@@ -63,7 +63,7 @@ class OrchestratorState:
 
     @property
     def legal_ready(self) -> bool:
-        return self.evidence_review_ready
+        return "safety-doc" in self.logs
 
     @property
     def report_ready(self) -> bool:
