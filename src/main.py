@@ -13,7 +13,7 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
 from src.api.routers import (
-    matching,
+    link,
     orchestrator,
     parse,
     receipts,
@@ -50,7 +50,7 @@ app.include_router(orchestrator.router)
 app.include_router(validation.router)
 app.include_router(report_agent.router)
 app.include_router(parse.router)
-app.include_router(matching.router)
+app.include_router(link.router)
 app.include_router(receipts.router)
 app.include_router(tax_invoices.router)
 
