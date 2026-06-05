@@ -14,8 +14,6 @@ from openai import OpenAI
 from qdrant_client import QdrantClient
 from qdrant_client.models import Distance, PointStruct, VectorParams
 
-from src.core.storage import DEFAULT_EMBED_MODEL, load_vectorstore
-
 
 SECTION_RE = re.compile(r"^\*\*(\d+(?:-\d+)?)(?:\\)?\.\s*(.+?)\*\*$")
 
@@ -146,25 +144,19 @@ def build_reference_vector_db(source_path: str | Path, collection_name: str) -> 
 
 
 def search_reference_vector_db(query: str, collection_name: str, top_k: int) -> list[dict[str, Any]]:
-    embed_model = os.getenv("SAFETY_DOC_EMBEDDING_MODEL", DEFAULT_EMBED_MODEL).strip()
-    vectorstore = load_vectorstore(
-        collection_name,
-        qdrant_url=os.getenv("SAFETY_DOC_QDRANT_URL", os.getenv("QDRANT_URL", "")).strip() or None,
-        embed_model=embed_model,
+    settings = load_settings()
+    openai_client = OpenAI(api_key=settings.openai_api_key)
+    qdrant = _get_qdrant_client(settings)
+    query_embedding = _embed_texts(openai_client, settings.embedding_model, [query])[0]
+    results = qdrant.query_points(
+        collection_name=collection_name,
+        query=query_embedding,
+        limit=top_k,
+        with_payload=True,
     )
-    results = vectorstore.similarity_search_with_score(query, k=top_k)
     return [
-        {
-            "id": str(document.metadata.get("_id") or document.metadata.get("id") or ""),
-            "score": score,
-            "payload": {
-                "text": document.page_content,
-                "source": document.metadata.get("source"),
-                "section": document.metadata.get("section_title"),
-                "metadata": document.metadata,
-            },
-        }
-        for document, score in results
+        {"id": str(point.id), "score": point.score, "payload": point.payload or {}}
+        for point in results.points
     ]
 
 

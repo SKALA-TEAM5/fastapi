@@ -1,22 +1,10 @@
 # AI Workspace
 
-## 저장소 구성
-
-이 저장소는 FastAPI Orchestrator와 내부 Vision 서비스의 코드 및 이미지 빌드를 함께 관리합니다.
-같은 저장소에 있지만 의존성, Docker 이미지, Kubernetes Deployment는 분리되어 있습니다.
-
-- FastAPI 이미지: 루트 `Dockerfile` → `team5-fastapi`
-- Vision 이미지: `vision/Dockerfile` → `team5-vision`
-- Kubernetes manifest: `SKALA-TEAM5/deploy` 저장소
-
-`main`에서 일반 FastAPI 코드가 변경되면 FastAPI 이미지를 빌드하고, `vision/**`가 변경되면 Vision 이미지를 별도로 빌드합니다. 각 workflow는 새 이미지 태그를 적용하는 deploy 저장소 PR을 생성합니다.
-
 ## 환경 설정 원칙
 
 - 로컬 개발은 `.env`를 사용합니다. 실제 `.env`는 커밋하지 않습니다.
 - 커밋되는 파일은 `.env.example`뿐이며, API key와 비밀번호는 placeholder로 둡니다.
-- Kubernetes manifest는 `SKALA-TEAM5/deploy` 레포의 `k8s/fastapi`에서 관리하고, 배포 시 ConfigMap/Secret으로 DB, Qdrant, OpenAI 설정을 주입합니다.
-- 이 레포의 workflow는 FastAPI와 Vision 이미지를 각각 빌드/푸시하고 deploy 저장소에 이미지 업데이트 PR을 생성합니다.
+- Kubernetes 배포 시에는 ConfigMap/Secret으로 DB, Qdrant, OpenAI 설정을 주입합니다.
 - `main`에 머지되면 운영 반영 대상이 되므로, 통합 확인은 `develop`에서 먼저 진행합니다.
 
 로컬에서 공용 DB를 사용하려면 port-forward를 열고 `.env.example`을 복사합니다.

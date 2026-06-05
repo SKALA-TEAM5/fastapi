@@ -1,6 +1,0 @@
-fastapi==0.115.12
-uvicorn[standard]==0.34.2
-python-multipart==0.0.20
-pillow==11.2.1
-ultralytics==8.3.129
-bentoml>=1.4.0,<2.0.0

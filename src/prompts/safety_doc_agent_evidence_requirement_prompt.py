@@ -59,7 +59,6 @@ def build_user_prompt(payload: AIEvidenceRequirementInput) -> str:
             }
             for evidence_type in payload.evidence_type_definitions
         ],
-        "safety_guide_reference_contexts": payload.reference_contexts,
         "output_schema": {
             "required_evidences": ["evidence_type_code"],
             "confidence": 0.0,

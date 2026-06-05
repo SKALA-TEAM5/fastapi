@@ -18,7 +18,6 @@ def check_missing_evidence(
     item_id: int,
     *,
     dry_run: bool = False,
-    persist_log: bool = True,
     settings: Settings | None = None,
     repository: EvidenceRepository | None = None,
     openai_client: OpenAI | None = None,
@@ -58,25 +57,24 @@ def check_missing_evidence(
             for row in repository.list_active_requirements(item_id)
         ]
         missing_codes = evidence_status["missing_evidences"]
-        if persist_log:
-            repository.append_agent_log(
-                project_id=item_context.project_id,
-                usage_statement_id=item_context.usage_statement_id,
-                usage_statement_item_id=item_context.item_id,
-                status_code="success",
-                result_code="hil" if missing_codes else "success",
-                reason=missing_evidence_reason(missing_codes),
-                details={
-                    "check_type": "missing_evidence",
-                    "item_context": asdict(item_context),
-                    "ai_response": asdict(ai_output),
-                    "saved_requirements": saved_requirements,
-                    "requirements_after_save": requirements_after_save,
-                    "evidence_status": evidence_status,
-                },
-                model_name=settings.chat_model,
-                token=total_tokens(ai_output.usage),
-            )
+        repository.append_agent_log(
+            project_id=item_context.project_id,
+            usage_statement_id=item_context.usage_statement_id,
+            usage_statement_item_id=item_context.item_id,
+            status_code="success",
+            result_code="hil" if missing_codes else "success",
+            reason=missing_evidence_reason(missing_codes),
+            details={
+                "check_type": "missing_evidence",
+                "item_context": asdict(item_context),
+                "ai_response": asdict(ai_output),
+                "saved_requirements": saved_requirements,
+                "requirements_after_save": requirements_after_save,
+                "evidence_status": evidence_status,
+            },
+            model_name=settings.chat_model,
+            token=total_tokens(ai_output.usage),
+        )
 
     return {
         "db_target": {
