@@ -11,15 +11,18 @@
 3. [시스템 아키텍처](#3-시스템-아키텍처)
 4. [Agent 그래프 상세](#4-agent-그래프-상세)
 5. [API 명세](#5-api-명세)
-6. [MemorySaver — 대화 연속성](#6-memorysaver--대화-연속성)
-7. [Qdrant 접속 구조](#7-qdrant-접속-구조)
-8. [파일 구조](#8-파일-구조)
-9. [환경변수](#9-환경변수)
-10. [의존성](#10-의존성)
-11. [k8s 배포](#11-k8s-배포)
-12. [로컬 개발 환경 세팅](#12-로컬-개발-환경-세팅)
-13. [테스트](#13-테스트)
-14. [평가 결과](#14-평가-결과)
+6. [SSE 스트리밍 구조](#6-sse-스트리밍-구조)
+7. [Spring 연동 구조](#7-spring-연동-구조)
+8. [LangSmith 모니터링](#8-langsmith-모니터링)
+9. [MemorySaver — 대화 연속성](#9-memorysaver--대화-연속성)
+10. [Qdrant 접속 구조](#10-qdrant-접속-구조)
+11. [파일 구조](#11-파일-구조)
+12. [환경변수](#12-환경변수)
+13. [의존성](#13-의존성)
+14. [k8s 배포](#14-k8s-배포)
+15. [로컬 개발 환경 세팅](#15-로컬-개발-환경-세팅)
+16. [테스트](#16-테스트)
+17. [평가 결과](#17-평가-결과)
 
 ---
 
@@ -251,9 +254,11 @@ data: [DONE]
 | 이벤트 타입 | 시점 | 설명 |
 |---|---|---|
 | `session_id` | 최초 | 세션 ID 확정 (신규 생성 또는 그대로 반환) |
+| `status` | 각 노드 진입 직전 | 현재 처리 단계 안내 문자열 (스피너 표시용) |
 | `intent` | 분류 완료 후 | 질문 의도 분류 결과 |
 | `token` | 답변 생성 중 | LLM 토큰 단위 스트리밍 (`answer_generator` 노드에서만 발생) |
 | `sources` | 답변 완료 후 | 참조한 법령/문서 목록 |
+| `error` | 오류 발생 시 | 오류 안내 메시지 |
 | `[DONE]` | 종료 | 스트리밍 완료 신호 |
 
 #### 오류 응답
@@ -267,7 +272,246 @@ data: [DONE]
 
 ---
 
-## 6. MemorySaver — 대화 연속성
+## 6. SSE 스트리밍 구조
+
+### HTTP 통신 방식 비교
+
+일반 REST API는 요청과 응답이 한 쌍으로 끝나요. 서버가 처리를 완료한 뒤 응답을 한 번에 보내고 연결이 끊겨요.
+
+```
+클라이언트 → 요청
+서버       → (10초 처리) → 응답 전체 한 번에 반환 → 연결 종료
+```
+
+LLM 답변처럼 생성에 시간이 걸리는 경우, 사용자는 10초 동안 아무것도 볼 수 없어요.
+
+SSE(Server-Sent Events)는 연결을 열어둔 채로 데이터를 조금씩 흘려보내는 방식이에요.
+
+```
+클라이언트 → 요청 (연결 유지)
+서버       → "안" → "전" → "모" → "는" → ... → [DONE] → 연결 종료
+```
+
+생성하는 즉시 보내기 때문에 체감 속도가 훨씬 빨라요.
+
+### SSE 포맷
+
+SSE는 HTTP 위에서 동작하는 표준 포맷이에요. 규칙은 두 가지예요.
+
+- `data:` 로 시작
+- 이벤트 끝에 빈 줄 두 개 (`\n\n`) 로 구분
+
+```
+data: {"type": "token", "value": "안"}\n\n
+data: {"type": "token", "value": "전"}\n\n
+data: [DONE]\n\n
+```
+
+브라우저는 `EventSource` API로 이 포맷을 natively 지원해요.
+
+### 이벤트 흐름과 타이밍
+
+각 이벤트가 언제 발생하는지 노드 흐름과 함께 보면 이래요.
+
+```
+사용자: "안전모는 몇 번 카테고리?"
+
+→ data: {"type": "session_id", "value": "uuid"}
+
+[intent_classifier 노드 진입]
+→ data: {"type": "status",  "value": "질문 유형 분석 중..."}   ← on_chain_start
+
+[intent_classifier 노드 완료]
+→ data: {"type": "intent",  "value": "카테고리판단"}            ← on_chain_end
+
+[retriever 노드 진입]
+→ data: {"type": "status",  "value": "관련 법령 검색 중..."}    ← on_chain_start
+
+[doc_grader 노드 진입]
+→ data: {"type": "status",  "value": "문서 관련성 검토 중..."}  ← on_chain_start
+
+[answer_generator 노드 진입]
+→ data: {"type": "status",  "value": "답변 생성 중..."}         ← on_chain_start
+
+[LLM 토큰 생성]
+→ data: {"type": "token",   "value": "CAT_03"}
+→ data: {"type": "token",   "value": "(보호구)에"}
+→ data: {"type": "token",   "value": " 해당합니다."}
+...
+
+[answer_generator 노드 완료]
+→ data: {"type": "sources", "value": ["산업안전보건법 제72조"]}
+
+→ data: [DONE]
+```
+
+`status`는 `on_chain_start` (노드 진입 직전) 에 발생해요. 실제 작업보다 항상 먼저 도착하기 때문에 프론트에서 스피너를 표시하기 적합해요.
+
+### 프론트엔드 처리 전략
+
+```
+status  수신 → 스피너 ON + 텍스트 변경 ("관련 법령 검색 중...")
+token   수신 (첫 번째) → 스피너 OFF, 타이핑 시작
+token   수신 (이후) → 화면에 계속 붙이기
+sources 수신 → 출처 목록 표시
+[DONE]  수신 → 연결 종료
+```
+
+### `chatbot_service.py` 이벤트 변환 규칙
+
+| LangGraph 이벤트 | 조건 | SSE 이벤트 |
+|---|---|---|
+| `on_chain_start` | `ev_name in _NODE_STATUS` | `{"type": "status", "value": "...중..."}` |
+| `on_chain_end` | `ev_name == "intent_classifier"` | `{"type": "intent", "value": intent}` |
+| `on_chat_model_stream` | `langgraph_node == "answer_generator"` | `{"type": "token", "value": chunk}` |
+| `on_chain_end` | `ev_name == "answer_generator"` | `{"type": "sources", "value": [...]}` |
+| `on_chain_end` | `ev_name == "fallback_handler"` | `{"type": "token", "value": message}` |
+
+> **구현 노트:** `on_chat_model_stream`은 intent_classifier, doc_grader의 structured_output 내부에서도 발생해요. `langgraph_node == "answer_generator"` 조건으로 필터링하지 않으면 의도치 않은 토큰이 프론트로 새어 나와요.
+
+---
+
+## 7. Spring 연동 구조
+
+### 배포 환경에서의 접근 제한
+
+k8s Ingress 설정상 FastAPI는 외부에 노출되지 않아요.
+
+```yaml
+# 외부 접근 가능
+team5-iveri.skala25a.project.skala-ai.com      → frontend :3000
+api-team5-iveri.skala25a.project.skala-ai.com  → backend  :8000
+
+# 외부 접근 불가 (클러스터 내부 전용)
+team5-fastapi:8001                              → FastAPI
+```
+
+프론트에서 FastAPI에 직접 요청할 수 없어요. Spring이 반드시 중간에서 프록시해야 해요.
+
+### Spring 연동 흐름
+
+```
+[Frontend]
+  POST /chat { question, session_id }
+  쿠키: access_token=xxx
+      ↓
+[Spring MVC — JwtAuthenticationFilter]
+  쿠키에서 JWT 파싱 → AuthenticatedUser 주입
+  (기존 필터가 /chat도 자동으로 인증 처리)
+      ↓
+[ChatbotController.java]
+  SseEmitter 생성 (timeout: 5분)
+  ChatbotClient.stream() 호출
+      ↓
+[ChatbotClient.java — WebClient]
+  POST http://team5-fastapi:8001/api/v1/chat
+  응답을 Flux<String>으로 비동기 수신
+      ↓
+[FastAPI]
+  LangGraph 실행 → SSE 이벤트 생성
+      ↓
+[ChatbotClient.java]
+  이벤트 한 줄 올 때마다 → SseEmitter.send()
+      ↓
+[Frontend]
+  EventSource로 수신 → 화면에 렌더링
+```
+
+### 왜 WebClient + SseEmitter 조합이냐
+
+Spring MVC는 기본적으로 동기/블로킹 방식이에요. 기존 `FastApiAgentClient`가 쓰는 `RestClient`로 SSE를 받으면 전체 응답이 끝날 때까지 스레드가 블로킹돼요. 30~60초짜리 SSE 응답 동안 스레드가 묶이면 동시 요청 처리가 거의 불가능해요.
+
+`WebClient`는 비동기/논블로킹이에요. FastAPI에서 토큰 하나가 올 때마다 이벤트 루프가 깨어나서 처리하고 다시 대기 상태로 돌아가요. 스레드가 묶이지 않아요.
+
+```
+RestClient  → 스레드 블로킹 → SSE에 부적합
+WebClient   → 논블로킹     → SSE에 적합
+SseEmitter  → Spring MVC에서 프론트로 SSE 중계하는 도구
+```
+
+`spring-boot-starter-webflux` 의존성을 추가하는데, 이건 WebFlux를 web framework로 쓰는 게 아니라 WebClient만 가져오는 거예요. 기존 MVC 동작에 영향 없어요.
+
+### Spring 담당자 작업 범위
+
+FastAPI 코드는 변경 없어요. Spring 담당자가 추가할 파일은 아래 세 가지예요.
+
+| 파일 | 역할 |
+|---|---|
+| `build.gradle` | `spring-boot-starter-webflux` 의존성 추가 |
+| `ChatbotClient.java` | WebClient로 FastAPI SSE 구독 |
+| `ChatbotController.java` | SseEmitter로 프론트에 중계 |
+
+SecurityConfig 변경 불필요. `/chat` 엔드포인트는 기존 `anyRequest().authenticated()` 룰이 자동 적용돼요.
+
+### FastAPI 측 제공 스펙
+
+Spring 담당자에게 전달할 인터페이스 명세예요.
+
+```
+엔드포인트: POST http://team5-fastapi:8001/api/v1/chat
+Content-Type: application/json
+
+요청 바디:
+{
+  "question": "string (필수, 최소 1자)",
+  "session_id": "string | null"
+}
+
+응답: text/event-stream
+data: {"type": "session_id", "value": "uuid"}
+data: {"type": "status",     "value": "질문 유형 분석 중..."}
+data: {"type": "intent",     "value": "카테고리판단"}
+data: {"type": "status",     "value": "관련 법령 검색 중..."}
+data: {"type": "token",      "value": "토큰"}
+data: {"type": "sources",    "value": ["법령1", "법령2"]}
+data: {"type": "error",      "value": "오류 메시지"}
+data: [DONE]
+```
+
+---
+
+## 8. LangSmith 모니터링
+
+### 개요
+
+LangSmith는 LangGraph 실행을 추적하는 모니터링 도구예요. 코드 변경 없이 환경변수만 추가하면 자동으로 트레이싱이 활성화돼요.
+
+### 연동 방법
+
+`.env` (로컬) 또는 k8s Secret (운영) 에 추가:
+
+```bash
+LANGCHAIN_TRACING_V2=true
+LANGCHAIN_API_KEY=ls__xxxxxxxx      # LangSmith API 키
+LANGCHAIN_PROJECT=sananbi-chatbot   # 프로젝트 이름
+```
+
+`LANGCHAIN_API_KEY`는 민감한 값이므로 k8s ConfigMap이 아닌 **Secret으로 분리**할 것.
+
+### API 키 발급
+
+[smith.langchain.com](https://smith.langchain.com) → Settings → API Keys → Create API Key
+
+무료 플랜 기준 월 5,000 트레이스까지 지원해요.
+
+### 트레이싱에서 볼 수 있는 것
+
+```
+Run: stream_chat
+├── intent_classifier     → 입력/출력, 토큰 수, 응답 시간
+├── retriever             → 검색된 문서 목록
+├── doc_grader            → 문서별 관련성 점수
+│   └── (재시도 시)
+│       ├── rewrite_query → 재작성된 질문
+│       └── retriever     → 재검색 결과
+└── answer_generator      → LLM 입출력, 토큰 수, 비용
+```
+
+노드별 토큰 사용량, 지연 시간, LLM 프롬프트/응답 전문이 자동으로 기록돼요.
+
+---
+
+## 9. MemorySaver — 대화 연속성
 
 ### 구조
 
@@ -321,7 +565,7 @@ A: "방진마스크도 CAT_03(보호구)에 해당합니다. ..."
 
 ---
 
-## 7. Qdrant 접속 구조
+## 10. Qdrant 접속 구조
 
 기존 `core/storage.py`의 `load_vectorstore()`를 그대로 재사용한다. **새로 추가할 코드 없음.**
 
@@ -344,7 +588,7 @@ retriever   = build_retriever(vectorstore, DEFAULT_COLLECTION, k=8)
 
 ---
 
-## 8. 파일 구조
+## 11. 파일 구조
 
 ### 새로 생성한 파일
 
@@ -397,7 +641,7 @@ src/main.py   ← chatbot router import + include_router 2줄 추가
 
 ---
 
-## 9. 환경변수
+## 12. 환경변수
 
 챗봇 기능을 위한 **추가 환경변수 없음.** 기존 `.env`를 그대로 사용한다.
 
@@ -407,10 +651,13 @@ src/main.py   ← chatbot router import + include_router 2줄 추가
 | `OPENAI_MODEL` | intent 분류 · doc grading 모델 | `gpt-4.1-mini` |
 | `OPENAI_REPORT_MODEL` | 답변 생성 모델 | `gpt-4.1` |
 | `QDRANT_URL` | Qdrant 서버 주소 | `http://localhost:6333` |
+| `LANGCHAIN_TRACING_V2` | LangSmith 트레이싱 활성화 | `false` |
+| `LANGCHAIN_API_KEY` | LangSmith API 키 | 없음 (k8s Secret 권장) |
+| `LANGCHAIN_PROJECT` | LangSmith 프로젝트 이름 | `sananbi-chatbot` |
 
 ---
 
-## 10. 의존성
+## 13. 의존성
 
 `MemorySaver`는 `langgraph` 패키지에 내장되어 있어 **추가 의존성 없음.**
 
@@ -418,7 +665,7 @@ src/main.py   ← chatbot router import + include_router 2줄 추가
 
 ---
 
-## 11. k8s 배포
+## 14. k8s 배포
 
 **추가 yaml 없음.** MemorySaver는 서버 프로세스 내에서만 동작하므로 별도 인프라가 필요하지 않다.
 
@@ -428,7 +675,7 @@ src/main.py   ← chatbot router import + include_router 2줄 추가
 
 ---
 
-## 12. 로컬 개발 환경 세팅
+## 15. 로컬 개발 환경 세팅
 
 ### Qdrant port-forward
 
@@ -457,18 +704,22 @@ curl -X POST http://localhost:8001/api/v1/chat \
 
 ```
 data: {"type": "session_id", "value": "xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx"}
-data: {"type": "intent", "value": "카테고리판단"}
-data: {"type": "token", "value": "CAT_03"}
-data: {"type": "token", "value": "(보호구)에"}
-data: {"type": "token", "value": " 해당합니다."}
+data: {"type": "status",     "value": "질문 유형 분석 중..."}
+data: {"type": "intent",     "value": "카테고리판단"}
+data: {"type": "status",     "value": "관련 법령 검색 중..."}
+data: {"type": "status",     "value": "문서 관련성 검토 중..."}
+data: {"type": "status",     "value": "답변 생성 중..."}
+data: {"type": "token",      "value": "CAT_03"}
+data: {"type": "token",      "value": "(보호구)에"}
+data: {"type": "token",      "value": " 해당합니다."}
 ...
-data: {"type": "sources", "value": ["건설업 산업안전 보건관리비 해설 및 질의회시집(최종)"]}
+data: {"type": "sources",    "value": ["건설업 산업안전 보건관리비 해설 및 질의회시집(최종)"]}
 data: [DONE]
 ```
 
 ---
 
-## 13. 테스트
+## 16. 테스트
 
 ### 실행 방법
 
@@ -506,7 +757,7 @@ python -m tests.agents.chatbot_agent.test_chatbot_agent --no-check
 
 ---
 
-## 14. 평가 결과
+## 17. 평가 결과
 
 2026-06-04 기준 10개 케이스 평가 결과:
 
