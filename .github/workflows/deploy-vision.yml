@@ -1,18 +1,17 @@
-name: Deploy FastAPI
+name: Deploy Vision
 
 on:
   push:
     branches:
       - main
-    paths-ignore:
+    paths:
       - "vision/**"
-      - "docs/**"
-      - "**/*.md"
+      - ".github/workflows/deploy-vision.yml"
   workflow_dispatch:
 
 env:
-  IMAGE_NAME: team5-fastapi
-  DEPLOY_MANIFEST: k8s/fastapi/fastapi-deployment.yaml
+  IMAGE_NAME: team5-vision
+  DEPLOY_MANIFEST: k8s/vision/vision-deployment.yaml
 
 jobs:
   deploy:
@@ -43,8 +42,8 @@ jobs:
       - name: Build and push image
         uses: docker/build-push-action@v6
         with:
-          context: .
-          file: ./Dockerfile
+          context: ./vision
+          file: ./vision/Dockerfile
           platforms: linux/amd64
           push: true
           tags: ${{ steps.image.outputs.image_uri }}
@@ -71,7 +70,7 @@ jobs:
           image_uri = os.environ["IMAGE_URI"]
           text = manifest.read_text()
           lines = [
-              f"{line.split('image:')[0]}image: {image_uri}" if "image:" in line and "team5-fastapi" in line else line
+              f"{line.split('image:')[0]}image: {image_uri}" if "image:" in line and "team5-vision" in line else line
               for line in text.splitlines()
           ]
           manifest.write_text("\n".join(lines) + "\n")
@@ -82,8 +81,8 @@ jobs:
         with:
           token: ${{ secrets.DEPLOY_REPO_TOKEN }}
           path: deploy-repo
-          branch: chore/update-fastapi-${{ steps.image.outputs.image_tag }}
-          title: "chore(deploy): update fastapi image to ${{ steps.image.outputs.image_tag }}"
-          commit-message: "chore(deploy): update fastapi image to ${{ steps.image.outputs.image_tag }}"
+          branch: chore/update-vision-${{ steps.image.outputs.image_tag }}
+          title: "chore(deploy): update vision image to ${{ steps.image.outputs.image_tag }}"
+          commit-message: "chore(deploy): update vision image to ${{ steps.image.outputs.image_tag }}"
           body: |
-            Update `team5-fastapi` image to `${{ steps.image.outputs.image_uri }}`.
+            Update `team5-vision` image to `${{ steps.image.outputs.image_uri }}`.

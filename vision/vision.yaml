@@ -1,0 +1,888 @@
+openapi: 3.0.3
+info:
+  title: Safety Vision API
+  version: 0.1.0
+  description: |
+    건설 현장 이미지를 입력받아 보호구 착용 상태와 안전망 설치 상태를 판단하는 Vision API입니다.
+
+    DB에는 원본 이미지 경로, Vision API의 JSON 결과, 안전망 결과 이미지 경로 또는 URL을 저장합니다.
+    보호구는 원본 이미지와 JSON bbox를 프론트에서 조합해 표시합니다.
+    안전망 결과 이미지는 설치/미설치/판단 어려움 배너가 그려진 이미지입니다.
+
+    ## 백엔드 연동 흐름
+
+    ```
+    Backend
+      1. DB에서 원본 이미지 주소 조회
+      2. 점검 항목에 따라 POST /detect/ppe/source 또는 /detect/safety-net/source 로 source_uri 전달
+         또는 Orchestrator에서 POST /vision/review 로 여러 presigned_url 전달
+      3. Vision API JSON 응답 수신
+      4. DB 로그 테이블에 Vision JSON과 필요한 이미지 URL 저장
+
+    Frontend
+      1. DB에서 원본 이미지 URL, 결과 이미지 URL, Vision JSON 조회
+      2. PPE는 원본 이미지 위에 JSON bbox를 렌더링
+      3. 안전망은 결과 이미지 URL을 표시
+    ```
+
+servers:
+  - url: http://localhost:8002
+    description: Local vision service
+
+tags:
+  - name: Vision
+    description: 이미지 안전 판정 API
+
+paths:
+  /health:
+    get:
+      tags:
+        - Vision
+      summary: Vision API 상태 확인
+      operationId: getVisionHealth
+      responses:
+        "200":
+          description: 서버와 모델 파일 상태
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/HealthResponse"
+
+  /labels:
+    get:
+      tags:
+        - Vision
+      summary: PPE 탐지 클래스 코드 조회
+      operationId: getVisionLabels
+      responses:
+        "200":
+          description: YOLO class id와 안전 점검 class code 매핑
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties:
+                  type: string
+              example:
+                "0": "01"
+                "1": "02"
+                "2": "05"
+                "3": "06"
+                "4": "07"
+                "5": "08"
+
+  /detect:
+    post:
+      tags:
+        - Vision
+      summary: 이미지 파일 업로드 안전 상태 판정
+      deprecated: true
+      description: |
+        이미지를 multipart/form-data로 업로드하면 보호구 bbox 탐지 결과와 안전망 분류 결과를 JSON으로 반환합니다.
+
+        이 엔드포인트는 보호구 모델과 안전망 모델을 모두 실행하는 호환용 엔드포인트입니다.
+        실제 운영 흐름에서는 점검 항목에 따라 `/detect/ppe/source` 또는 `/detect/safety-net/source` 사용을 권장합니다.
+
+        응답의 `annotated_image_path`, `annotated_image_url`은 생성된 결과 이미지 위치입니다.
+      operationId: detectSafetyVision
+      requestBody:
+        required: true
+        content:
+          multipart/form-data:
+            schema:
+              type: object
+              required:
+                - file
+              properties:
+                file:
+                  type: string
+                  format: binary
+                  description: 판정할 원본 이미지 파일
+      responses:
+        "200":
+          description: 안전 상태 판정 결과
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/DetectionResponse"
+              example:
+                model_name: ppe-detector
+                image_width: 1920
+                image_height: 1080
+                overall_status: not_appropriate
+                is_appropriate: false
+                message: 안전망 미설치 상태로 판단되어 부적정입니다.
+                ppe_status: needs_review
+                ppe_is_appropriate: null
+                ppe_message: 안전화 항목은 검토가 필요합니다.
+                safety_net_review:
+                  model_name: safety-net-classifier
+                  status: missing
+                  is_appropriate: false
+                  confidence: 0.8252
+                  reason: 안전망 미설치 상태로 판단되어 부적정입니다.
+                  raw_label: missing
+                annotated_image_path: null
+                annotated_image_url: null
+                reviews:
+                  - equipment: safety_helmet
+                    equipment_label: 안전모
+                    status: wearing
+                    is_appropriate: true
+                    confidence: 0.7454
+                    reason: 안전모 착용 탐지 결과를 기준으로 판단했습니다.
+                  - equipment: safety_shoes
+                    equipment_label: 안전화
+                    status: needs_review
+                    is_appropriate: null
+                    confidence: 0.3883
+                    reason: 안전화 착용 confidence가 0.50 미만이라 검토가 필요합니다.
+                detections:
+                  - class_id: 4
+                    class_code: "07"
+                    equipment: safety_helmet
+                    label: 안전모 착용
+                    is_wearing: true
+                    needs_review: false
+                    box_color: blue
+                    confidence: 0.7454
+                    bbox_xyxy:
+                      - 1070.35
+                      - 714.64
+                      - 1147.99
+                      - 808.47
+        "400":
+          description: 이미지 파일이 아니거나 읽을 수 없는 파일
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+        "503":
+          description: 모델 파일을 찾을 수 없음
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+
+  /detect/source:
+    post:
+      tags:
+        - Vision
+      summary: 원본 이미지 주소 기반 안전 상태 판정
+      deprecated: true
+      description: |
+        백엔드가 DB에서 조회한 원본 이미지 주소를 JSON으로 전달하면 Vision API가 해당 이미지를 읽어 판정합니다.
+
+        이 엔드포인트는 보호구 모델과 안전망 모델을 모두 실행하는 호환용 엔드포인트입니다.
+        실제 운영 흐름에서는 점검 항목에 따라 `/detect/ppe/source` 또는 `/detect/safety-net/source` 사용을 권장합니다.
+
+        `source_uri`는 Vision 컨테이너에서 접근 가능한 로컬 파일 경로 또는 HTTP(S) URL이어야 합니다.
+        로컬 파일 경로를 사용할 경우 백엔드와 Vision 컨테이너가 같은 파일 저장소를 volume mount로 공유해야 합니다.
+
+        이 엔드포인트는 결과 이미지를 생성하고 JSON에 `annotated_image_url`을 포함합니다.
+        백엔드는 응답 JSON과 결과 이미지 URL을 DB 로그 테이블에 저장합니다.
+      operationId: detectSafetyVisionFromSource
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/SourceDetectionRequest"
+            examples:
+              localFile:
+                summary: 공유 volume 파일 경로
+                value:
+                  source_id: image_12345
+                  source_uri: /data/files/site-photo-001.jpg
+              imageUrl:
+                summary: 이미지 URL
+                value:
+                  source_id: image_12345
+                  source_uri: https://example.com/files/site-photo-001.jpg
+      responses:
+        "200":
+          description: 안전 상태 판정 결과
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/DetectionResponse"
+        "400":
+          description: 이미지 주소가 잘못되었거나 이미지를 읽을 수 없음
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+        "503":
+          description: 모델 파일을 찾을 수 없음
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+
+  /detect/ppe/source:
+    post:
+      tags:
+        - Vision
+      summary: 보호구 사진 주소 기반 판정
+      description: |
+        안전모, 안전화, 안전벨트 점검 사진의 원본 이미지 주소를 전달하면 PPE detector만 실행합니다.
+
+        결과 이미지는 `annotated_image_url`로 반환됩니다.
+        백엔드는 이 URL 또는 path를 DB 로그 테이블에 저장하고, 프론트는 결과 이미지를 그대로 표시할 수 있습니다.
+      operationId: detectPpeFromSource
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/SourceDetectionRequest"
+            example:
+              source_id: image_12345
+              source_uri: /data/files/ppe-photo-001.jpg
+      responses:
+        "200":
+          description: 보호구 착용 판정 결과
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/PpeDetectionResponse"
+        "400":
+          description: 이미지 주소가 잘못되었거나 이미지를 읽을 수 없음
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+        "503":
+          description: 모델 파일을 찾을 수 없음
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+
+  /detect/safety-net/source:
+    post:
+      tags:
+        - Vision
+      summary: 안전망 사진 주소 기반 판정
+      description: |
+        안전망 설치 점검 사진의 원본 이미지 주소를 전달하면 safety-net classifier만 실행합니다.
+
+        안전망 모델은 bbox를 반환하지 않습니다.
+        결과 이미지는 안전망 상태 배너가 그려진 이미지이며 `annotated_image_url`로 반환됩니다.
+        백엔드는 이 URL 또는 path를 DB 로그 테이블에 저장하고, 프론트는 결과 이미지를 그대로 표시할 수 있습니다.
+      operationId: detectSafetyNetFromSource
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/SourceDetectionRequest"
+            example:
+              source_id: image_67890
+              source_uri: /data/files/safety-net-photo-001.jpg
+      responses:
+        "200":
+          description: 안전망 설치 판정 결과
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/SafetyNetDetectionResponse"
+        "400":
+          description: 이미지 주소가 잘못되었거나 이미지를 읽을 수 없음
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+        "503":
+          description: 모델 파일을 찾을 수 없음
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+
+  /vision/review:
+    post:
+      tags:
+        - Vision
+      summary: Orchestrator 전용 현장사진 검토
+      description: |
+        FastAPI Orchestrator가 여러 현장사진의 presigned URL을 전달하면 Vision Agent가 사진별 PPE/안전망 검토를 수행하고 Orchestrator용 결과를 반환합니다.
+
+        `presigned_url`은 Vision 컨테이너가 즉시 다운로드할 수 있는 주소여야 합니다.
+        Docker 내부 MinIO 주소는 `localhost:9000`이 아니라 `http://minio:9000` 같은 서비스명을 사용해야 합니다.
+
+        `annotated_image_url`은 `VISION_PUBLIC_BASE_URL`이 설정된 경우 프론트가 접근할 수 있는 절대 URL로 반환됩니다.
+
+        `evidence_type_code`, `storage_key`, `original_filename`에 `ppe` 또는 `안전망/safety-net` 힌트가 있으면 해당 모델만 실행합니다.
+        힌트가 없으면 호환용으로 PPE detector와 안전망 classifier를 함께 실행합니다.
+
+        판정 결과가 부적정, 검토 필요, 판단 불가인 경우 `status_code=success`, `result_code=hil`로 반환합니다.
+        이미지 다운로드 실패 또는 모델 오류 같은 시스템 오류만 `status_code=fail`, `result_code=fail`로 반환합니다.
+      operationId: reviewVisionForOrchestrator
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/VisionReviewRequest"
+            example:
+              project_id: 1
+              usage_statement_id: 123
+              photos:
+                - file_id: 10
+                  original_filename: 현장사진.jpg
+                  storage_key: projects/1/site-photo/a.jpg
+                  evidence_type_code: site_photo
+                  mime_type: image/jpeg
+                  size_bytes: 12345
+                  presigned_url: http://minio/bucket/projects/1/site-photo/a.jpg?signature=...
+      responses:
+        "200":
+          description: Orchestrator용 Vision 검토 결과
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/VisionReviewResponse"
+              example:
+                status_code: success
+                result_code: hil
+                reason: 현장사진 2건 중 1건 보완 필요
+                token: 0
+                model_name: ppe-detector,safety-net-classifier
+                todos:
+                  - file_id: 10
+                    reason: 안전모 항목이 확인되지 않았습니다.
+                details:
+                  summary: 현장사진 검토 완료
+                  project_id: 1
+                  usage_statement_id: 123
+                  results:
+                    - file_id: 10
+                      original_filename: 현장사진.jpg
+                      storage_key: projects/1/site-photo/a.jpg
+                      evidence_type_code: site_photo
+                      review_type: combined
+                      status: needs_review
+                      is_appropriate: null
+                      message: 안전모 항목이 확인되지 않았습니다.
+                      model_name: ppe-detector
+                      source_image_url: http://minio/bucket/projects/1/site-photo/a.jpg?signature=...
+                      annotated_image_url: null
+
+components:
+  schemas:
+    VisionReviewRequest:
+      type: object
+      required:
+        - project_id
+        - usage_statement_id
+        - photos
+      properties:
+        project_id:
+          type: integer
+          example: 1
+        usage_statement_id:
+          type: integer
+          example: 123
+        photos:
+          type: array
+          items:
+            $ref: "#/components/schemas/VisionReviewPhoto"
+
+    VisionReviewPhoto:
+      type: object
+      required:
+        - file_id
+        - original_filename
+        - storage_key
+        - presigned_url
+      properties:
+        file_id:
+          type: integer
+          example: 10
+        original_filename:
+          type: string
+          example: 현장사진.jpg
+        storage_key:
+          type: string
+          example: projects/1/site-photo/a.jpg
+        evidence_type_code:
+          type: string
+          nullable: true
+          example: site_photo
+        mime_type:
+          type: string
+          nullable: true
+          example: image/jpeg
+        size_bytes:
+          type: integer
+          nullable: true
+          example: 12345
+        presigned_url:
+          type: string
+          description: Vision API가 직접 다운로드할 수 있는 presigned URL
+          example: http://minio/bucket/projects/1/site-photo/a.jpg?signature=...
+
+    VisionReviewTodo:
+      type: object
+      required:
+        - file_id
+        - reason
+      properties:
+        file_id:
+          type: integer
+          example: 10
+        reason:
+          type: string
+          example: 안전모 항목이 확인되지 않았습니다.
+
+    VisionReviewResponse:
+      type: object
+      required:
+        - status_code
+        - result_code
+        - reason
+        - token
+        - model_name
+        - todos
+        - details
+      properties:
+        status_code:
+          type: string
+          enum:
+            - success
+            - fail
+        result_code:
+          type: string
+          enum:
+            - success
+            - hil
+            - fail
+          description: hil은 보완 필요, 부적정, 판단 불가를 의미합니다.
+        reason:
+          type: string
+          example: 현장사진 2건 중 1건 보완 필요
+        token:
+          type: integer
+          example: 0
+        model_name:
+          type: string
+          example: ppe-detector,safety-net-classifier
+        todos:
+          type: array
+          items:
+            $ref: "#/components/schemas/VisionReviewTodo"
+        details:
+          type: object
+          additionalProperties: true
+
+    SourceDetectionRequest:
+      type: object
+      required:
+        - source_uri
+      properties:
+        source_id:
+          type: string
+          nullable: true
+          description: 백엔드 DB의 이미지 ID 또는 파일 ID. Vision API는 이 값을 그대로 응답에 echo합니다.
+          example: image_12345
+        source_uri:
+          type: string
+          description: Vision API가 읽을 수 있는 원본 이미지 경로 또는 HTTP(S) URL
+          example: /data/files/site-photo-001.jpg
+
+    HealthResponse:
+      type: object
+      required:
+        - status
+        - model_name
+        - model_path
+        - model_exists
+        - model_is_file
+        - safety_net_model_name
+        - safety_net_model_path
+        - safety_net_model_exists
+        - safety_net_model_is_file
+        - device
+        - public_base_url
+      properties:
+        status:
+          type: string
+          example: ok
+        model_name:
+          type: string
+          example: ppe-detector
+        model_path:
+          type: string
+          example: /models/ppe-detector.pt
+        model_exists:
+          type: boolean
+          example: true
+        model_is_file:
+          type: boolean
+          example: true
+        safety_net_model_name:
+          type: string
+          example: safety-net-classifier
+        safety_net_model_path:
+          type: string
+          example: /models/safety-net-classifier.pt
+        safety_net_model_exists:
+          type: boolean
+          example: true
+        safety_net_model_is_file:
+          type: boolean
+          example: true
+        device:
+          type: string
+          example: auto
+        public_base_url:
+          type: string
+          nullable: true
+          description: annotated_image_url 절대 URL 생성에 사용하는 기준 URL
+          example: http://localhost:8002
+
+    PpeDetectionResponse:
+      type: object
+      required:
+        - model_name
+        - image_width
+        - image_height
+        - status
+        - is_appropriate
+        - message
+        - reviews
+        - detections
+      properties:
+        source_id:
+          type: string
+          nullable: true
+          description: 요청에서 전달한 이미지 ID 또는 파일 ID
+          example: image_12345
+        source_uri:
+          type: string
+          nullable: true
+          description: 요청에서 전달한 원본 이미지 주소
+          example: /data/files/ppe-photo-001.jpg
+        model_name:
+          type: string
+          example: ppe-detector
+        image_width:
+          type: integer
+          example: 1920
+        image_height:
+          type: integer
+          example: 1080
+        status:
+          $ref: "#/components/schemas/ReviewStatus"
+        is_appropriate:
+          type: boolean
+          nullable: true
+          description: 보호구 적정 여부. 검토 필요 상태면 null입니다.
+        message:
+          type: string
+          example: 안전모, 안전화, 안전벨트가 모두 적정으로 판단되었습니다.
+        annotated_image_path:
+          type: string
+          nullable: true
+          description: PPE는 프론트에서 원본 이미지와 bbox JSON을 조합하므로 기본적으로 null입니다.
+        annotated_image_url:
+          type: string
+          nullable: true
+          description: PPE는 프론트에서 원본 이미지와 bbox JSON을 조합하므로 기본적으로 null입니다.
+        reviews:
+          type: array
+          description: 안전모, 안전화, 안전벨트 장비별 요약 판정
+          items:
+            $ref: "#/components/schemas/EquipmentReview"
+        detections:
+          type: array
+          description: 프론트에서 박스 렌더링에 사용하는 bbox 탐지 결과
+          items:
+            $ref: "#/components/schemas/Detection"
+
+    SafetyNetDetectionResponse:
+      type: object
+      required:
+        - model_name
+        - image_width
+        - image_height
+        - status
+        - is_appropriate
+        - message
+        - safety_net_review
+      properties:
+        source_id:
+          type: string
+          nullable: true
+          description: 요청에서 전달한 이미지 ID 또는 파일 ID
+          example: image_67890
+        source_uri:
+          type: string
+          nullable: true
+          description: 요청에서 전달한 원본 이미지 주소
+          example: /data/files/safety-net-photo-001.jpg
+        model_name:
+          type: string
+          example: safety-net-classifier
+        image_width:
+          type: integer
+          example: 1920
+        image_height:
+          type: integer
+          example: 1080
+        status:
+          type: string
+          enum:
+            - installed
+            - missing
+            - unclear
+        is_appropriate:
+          type: boolean
+          nullable: true
+          description: 안전망 적정 여부. unclear면 null입니다.
+        message:
+          type: string
+          example: 안전망 설치 상태로 판단되었습니다.
+        annotated_image_path:
+          type: string
+          nullable: true
+          description: 안전망 상태 배너가 그려진 결과 이미지 파일 경로
+          example: /data/vision_results/annotated/image_67890.safety-net.annotated.jpg
+        annotated_image_url:
+          type: string
+          nullable: true
+          description: 안전망 상태 배너가 그려진 결과 이미지 URL. VISION_PUBLIC_BASE_URL이 있으면 절대 URL입니다.
+          example: http://localhost:8002/vision-results/annotated/image_67890.safety-net.annotated.jpg
+        safety_net_review:
+          $ref: "#/components/schemas/SafetyNetReview"
+
+    DetectionResponse:
+      type: object
+      required:
+        - model_name
+        - image_width
+        - image_height
+        - overall_status
+        - is_appropriate
+        - message
+        - ppe_status
+        - ppe_is_appropriate
+        - ppe_message
+        - safety_net_review
+        - reviews
+        - detections
+      properties:
+        source_id:
+          type: string
+          nullable: true
+          description: 요청에서 전달한 이미지 ID 또는 파일 ID
+          example: image_12345
+        source_uri:
+          type: string
+          nullable: true
+          description: 요청에서 전달한 원본 이미지 주소
+          example: /data/files/site-photo-001.jpg
+        model_name:
+          type: string
+          example: ppe-detector
+        image_width:
+          type: integer
+          example: 1920
+        image_height:
+          type: integer
+          example: 1080
+        overall_status:
+          $ref: "#/components/schemas/ReviewStatus"
+        is_appropriate:
+          type: boolean
+          nullable: true
+          description: 전체 적정 여부. 검토 필요 상태면 null입니다.
+        message:
+          type: string
+          description: 사용자에게 표시할 전체 판정 메시지
+        ppe_status:
+          $ref: "#/components/schemas/ReviewStatus"
+        ppe_is_appropriate:
+          type: boolean
+          nullable: true
+          description: 보호구 적정 여부. 검토 필요 상태면 null입니다.
+        ppe_message:
+          type: string
+          description: 보호구 판정 메시지
+        safety_net_review:
+          $ref: "#/components/schemas/SafetyNetReview"
+        annotated_image_path:
+          type: string
+          nullable: true
+          description: 결과 이미지 파일 경로
+        annotated_image_url:
+          type: string
+          nullable: true
+          description: 결과 이미지 URL. VISION_PUBLIC_BASE_URL이 있으면 절대 URL입니다.
+        reviews:
+          type: array
+          description: 장비별 요약 판정
+          items:
+            $ref: "#/components/schemas/EquipmentReview"
+        detections:
+          type: array
+          description: 프론트에서 박스 렌더링에 사용하는 bbox 탐지 결과
+          items:
+            $ref: "#/components/schemas/Detection"
+
+    SafetyNetReview:
+      type: object
+      required:
+        - model_name
+        - status
+        - is_appropriate
+        - confidence
+        - reason
+      properties:
+        model_name:
+          type: string
+          example: safety-net-classifier
+        status:
+          type: string
+          enum:
+            - installed
+            - missing
+            - unclear
+          description: 안전망 설치됨, 미설치, 판단 어려움
+        is_appropriate:
+          type: boolean
+          nullable: true
+          description: 안전망 적정 여부. unclear면 null입니다.
+        confidence:
+          type: number
+          format: float
+          nullable: true
+          minimum: 0
+          maximum: 1
+          example: 0.8252
+        reason:
+          type: string
+          example: 안전망 미설치 상태로 판단되어 부적정입니다.
+        raw_label:
+          type: string
+          nullable: true
+          example: missing
+
+    EquipmentReview:
+      type: object
+      required:
+        - equipment
+        - equipment_label
+        - status
+        - is_appropriate
+        - confidence
+        - reason
+      properties:
+        equipment:
+          $ref: "#/components/schemas/Equipment"
+        equipment_label:
+          type: string
+          example: 안전모
+        status:
+          type: string
+          enum:
+            - wearing
+            - not_wearing
+            - needs_review
+            - unknown
+        is_appropriate:
+          type: boolean
+          nullable: true
+          description: 해당 장비 적정 여부. 검토 필요 또는 미탐지면 null입니다.
+        confidence:
+          type: number
+          format: float
+          nullable: true
+          minimum: 0
+          maximum: 1
+          example: 0.7454
+        reason:
+          type: string
+          example: 안전모 착용 탐지 결과를 기준으로 판단했습니다.
+
+    Detection:
+      type: object
+      required:
+        - class_id
+        - class_code
+        - box_color
+        - confidence
+        - bbox_xyxy
+      properties:
+        class_id:
+          type: integer
+          example: 4
+        class_code:
+          type: string
+          description: 안전 점검 class code
+          example: "07"
+        equipment:
+          allOf:
+            - $ref: "#/components/schemas/Equipment"
+          nullable: true
+        label:
+          type: string
+          nullable: true
+          example: 안전모 착용
+        is_wearing:
+          type: boolean
+          nullable: true
+          description: 착용 탐지면 true, 미착용 탐지면 false
+        needs_review:
+          type: boolean
+          example: false
+        box_color:
+          type: string
+          enum:
+            - blue
+            - red
+            - yellow
+          description: 프론트 박스 렌더링 색상. blue=적정, red=부적정, yellow=검토 필요
+        confidence:
+          type: number
+          format: float
+          minimum: 0
+          maximum: 1
+          example: 0.7454
+        bbox_xyxy:
+          type: array
+          minItems: 4
+          maxItems: 4
+          description: 원본 이미지 기준 [x1, y1, x2, y2] 좌표
+          items:
+            type: number
+            format: float
+          example:
+            - 1070.35
+            - 714.64
+            - 1147.99
+            - 808.47
+
+    Equipment:
+      type: string
+      enum:
+        - safety_helmet
+        - safety_shoes
+        - safety_belt
+
+    ReviewStatus:
+      type: string
+      enum:
+        - appropriate
+        - not_appropriate
+        - needs_review
+
+    ErrorResponse:
+      type: object
+      required:
+        - detail
+      properties:
+        detail:
+          type: string
+          example: file must be an image

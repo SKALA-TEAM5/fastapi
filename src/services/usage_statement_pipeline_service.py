@@ -12,7 +12,6 @@ POST /ocr/parse
   - 적재 : usage_statements INSERT
            usage_statement_summaries INSERT
            usage_statement_items INSERT
-           agent_logs INSERT (classi, 파이프라인 단위 1행)
 
 POST /link/run
   - 설명 : classi + safety-doc 완료 후 Spring이 호출
@@ -24,12 +23,6 @@ POST /link/run
             }
   - 호출 : run_link_pipeline(usage_statement_id, receipt_file_ids, tax_invoice_file_ids)
   - 적재 : evidence_file_links INSERT (매칭 성공 항목)
-           agent_logs INSERT (link, 파이프라인 단위 1행)
-
-[ 로그 커넥션 설계 ]
-  - insert_agent_log                 : 별도 커넥션으로 즉시 커밋 (메인 트랜잭션 롤백과 무관)
-  - update_agent_log_status('success'): 메인 커넥션 마지막에 호출
-  - update_agent_log_status('failed') : except 절에서 별도 커넥션으로 호출
 """
 
 from __future__ import annotations
@@ -49,12 +42,10 @@ from src.repositories.db import get_connection
 from src.repositories.usage_statement_pipeline_repository import (
     _from_category_code,
     get_files_by_ids,
-    insert_agent_log,
     insert_evidence_file_link,
     insert_usage_statement,
     insert_usage_statement_items,
     insert_usage_statement_summaries,
-    update_agent_log_status,
     update_file_status,
 )
 from src.services.matching_service_monthly import (
@@ -79,7 +70,7 @@ def _fetch_and_save_temp(storage_key: str, suffix: str) -> str:
 
 
 def _build_file_agent_input(file_info: dict[str, Any]) -> dict[str, Any]:
-    """Agent 입력/로그에 남길 파일 접근 정보를 만든다."""
+    """Agent 입력에 사용할 파일 접근 정보를 만든다."""
     return {
         "file_id": file_info.get("id"),
         "original_filename": file_info.get("original_filename"),
@@ -111,7 +102,7 @@ def _classify_usage_statement(
 ) -> tuple[dict[str, Any], dict[str, Any]]:
     """
     OCR 파싱된 사용내역서를 classifier에 태워 카테고리를 보정하고,
-    agent_logs.details에 저장할 classifier JSON도 함께 만든다.
+    오케스트레이터가 기록할 classifier details도 함께 만든다.
     """
     line_items = parsed_usage.get("line_items") or []
     if not line_items:
@@ -252,34 +243,6 @@ def _attach_classifier_item_ids(
     return {**classifier_details, "results": updated_results}
 
 
-def _complete_classifier_log(
-    conn,
-    *,
-    log_id: int,
-    usage_statement_id: int,
-    details: dict[str, Any],
-) -> None:
-    """Mark classifier log complete and bind it to the persisted usage_statement."""
-    import json as _json
-
-    with conn.cursor() as cur:
-        cur.execute(
-            """
-            UPDATE agent_logs
-            SET usage_statement_id = %(usage_statement_id)s,
-                status_code = 'success',
-                result_code = 'success',
-                details = %(details)s::jsonb
-            WHERE id = %(log_id)s
-            """,
-            {
-                "log_id": log_id,
-                "usage_statement_id": usage_statement_id,
-                "details": _json.dumps(details, ensure_ascii=False),
-            },
-        )
-
-
 # ─────────────────────────────────────────────────────────────
 # 엔드포인트 1: 사용내역서 파싱 (/ocr/parse)
 # ─────────────────────────────────────────────────────────────
@@ -307,7 +270,6 @@ def parse_usage_statement(usage_file_id: int) -> dict[str, Any]:
     """
     start = time.time()
     tmp_paths: list[str] = []
-    classifier_log_id: int | None = None
     usage_statement_id: int | None = None
     parsed_usage: dict[str, Any] | None = None
     classifier_details: dict[str, Any] | None = None
@@ -339,19 +301,6 @@ def parse_usage_statement(usage_file_id: int) -> dict[str, Any]:
             if parsed_usage.get("parse_status") == "FAILED":
                 raise RuntimeError("사용내역서 파싱 실패 (FAILED)")
 
-            with get_connection() as classifier_log_conn:
-                classifier_log_id = insert_agent_log(
-                    classifier_log_conn,
-                    project_id=project_id,
-                    usage_statement_id=None,
-                    details={
-                        "source_file_id": usage_file_id,
-                        "source_file": source_file_input,
-                    },
-                    agent_type_code="classi",
-                    model_name="classifier_agent",
-                )
-
             parsed_usage, classifier_details = _classify_usage_statement(
                 usage_file_id=usage_file_id,
                 parsed_usage=parsed_usage,
@@ -380,23 +329,6 @@ def parse_usage_statement(usage_file_id: int) -> dict[str, Any]:
             )
             classifier_details.setdefault("payload", {})["source_file"] = source_file_input
 
-            # ── 로그 completed ─────────────────────────────────────────────
-            if classifier_log_id is not None:
-                _complete_classifier_log(
-                    conn,
-                    log_id=classifier_log_id,
-                    usage_statement_id=usage_statement_id,
-                    details=classifier_details or {},
-                )
-
-    except Exception:
-        with get_connection() as err_conn:
-            if classifier_log_id is not None:
-                update_agent_log_status(
-                    err_conn, log_id=classifier_log_id, status_code="failed"
-                )
-        raise
-
     finally:
         _cleanup(*tmp_paths)
 
@@ -410,10 +342,12 @@ def parse_usage_statement(usage_file_id: int) -> dict[str, Any]:
     )
 
     return {
+        "project_id": project_id,
         "usage_statement_id": usage_statement_id,
         "parse_status": (parsed_usage or {}).get("parse_status", "SUCCESS"),
         "item_count": len(line_items),
         "classifier_changed_count": classifier_changed_count,
+        "classifier_details": classifier_details or {},
         "source_file": source_file_input,
         "elapsed_sec": elapsed,
     }
@@ -600,7 +534,7 @@ def run_link_pipeline(
                             evidence_type_code=evidence_type,
                         )
 
-                    update_file_status(conn, file_id_for_receipt, "matched")
+                    update_file_status(conn, file_id_for_receipt, "success")
 
                 elif (
                     status in ("unmatched", "rejected")
@@ -608,35 +542,11 @@ def run_link_pipeline(
                     and receipt_id in receipt_file_id_map
                 ):
                     file_id_for_receipt = receipt_file_id_map[receipt_id]
-                    update_file_status(conn, file_id_for_receipt, "unmatched")
+                    update_file_status(conn, file_id_for_receipt, "fail")
 
-            # ── 로그 completed ─────────────────────────────────────────────
             summary = batch.get("summary") or {}
-            update_agent_log_status(
-                conn,
-                log_id=log_id,
-                status_code="completed",
-                details={
-                    "match_summary": summary,
-                    "usage_statement_id": usage_statement_id,
-                    "receipt_file_ids": receipt_file_ids,
-                    "tax_invoice_file_ids": tax_invoice_file_ids,
-                    "evidence_files": evidence_file_inputs,
-                    "match_results": [
-                        {
-                            "line_id": r.get("line_id"),
-                            "match_status": r.get("match_status"),
-                            "score": r.get("score"),
-                            "gate_failed": r.get("gate_failed"),
-                        }
-                        for r in (batch.get("results") or [])
-                    ],
-                },
-            )
 
     except Exception:
-        with get_connection() as err_conn:
-            update_agent_log_status(err_conn, log_id=log_id, status_code="failed")
         raise
 
     finally:

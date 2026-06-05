@@ -39,6 +39,7 @@ from src.repositories.orchestrator_repository import (
     mark_orchestrator,
     scan_orchestrator_state,
     select_evidence_agents,
+    update_file_statuses,
     upsert_agent_log,
 )
 from src.repositories.db import get_connection
@@ -58,10 +59,39 @@ from src.services.usage_statement_pipeline_service import parse_usage_statement,
 
 def parse_and_classify_usage_statement(file_id: int) -> OrchestratorActionResponse:
     result = parse_usage_statement(file_id)
+    usage_statement_id = _int_or_none(result.get("usage_statement_id"))
+    project_id = _int_or_none(result.get("project_id"))
+    if project_id is not None and usage_statement_id is not None:
+        classifier_details = result.get("classifier_details") if isinstance(result.get("classifier_details"), dict) else {}
+        classifier_changed_count = int(result.get("classifier_changed_count") or 0)
+        summary = (
+            f"세부내역 {classifier_changed_count}건을 올바른 항목으로 이동했습니다."
+            if classifier_changed_count
+            else "세부내역 분류 이동 없음"
+        )
+        upsert_agent_log(
+            project_id=project_id,
+            usage_statement_id=usage_statement_id,
+            agent_type_code="classi",
+            status_code="success",
+            result_code="success",
+            reason=summary,
+            details=classifier_details,
+            model_name="classifier_agent",
+        )
+        mark_orchestrator(
+            project_id=project_id,
+            usage_statement_id=usage_statement_id,
+            event="classi_completed",
+            status_code="success",
+            result_code="success",
+            reason=summary,
+            payload={"file_id": file_id, "result": result},
+        )
     return OrchestratorActionResponse(
         status="success",
         message="사용내역서 파싱 및 classi 실행 요청이 완료되었습니다.",
-        usage_statement_id=result.get("usage_statement_id"),
+        usage_statement_id=usage_statement_id,
         target_agents=["classi"],
         result=result,
     )
@@ -71,6 +101,15 @@ def classify_existing_usage_statement(
     request: UsageStatementClassifyRequest,
 ) -> OrchestratorActionResponse:
     try:
+        mark_orchestrator(
+            project_id=request.project_id,
+            usage_statement_id=request.usage_statement_id,
+            event="classi_started",
+            status_code="running",
+            result_code=None,
+            reason="classi 재분류를 시작했습니다.",
+            payload={"item_id": request.item_id, "item_name": request.item_name},
+        )
         submitted_category = request.category_code or ""
         review_response = review_usage_statement(
             usage_statement_id=request.usage_statement_id,
@@ -146,6 +185,15 @@ def classify_existing_usage_statement(
             details=details,
             model_name="classifier_agent",
         )
+        mark_orchestrator(
+            project_id=request.project_id,
+            usage_statement_id=request.usage_statement_id,
+            event="classi_completed",
+            status_code="success",
+            result_code="success",
+            reason=summary,
+            payload={"item_id": request.item_id, "details": details},
+        )
         return OrchestratorActionResponse(
             status="success",
             message=summary,
@@ -168,6 +216,19 @@ def classify_existing_usage_statement(
                 "payload": {"error_type": type(exc).__name__, "error": str(exc)},
             },
             model_name="classifier_agent",
+        )
+        mark_orchestrator(
+            project_id=request.project_id,
+            usage_statement_id=request.usage_statement_id,
+            event="classi_failed",
+            status_code="fail",
+            result_code="fail",
+            reason=reason,
+            payload={
+                "item_id": request.item_id,
+                "error_type": type(exc).__name__,
+                "error": str(exc),
+            },
         )
         return OrchestratorActionResponse(
             status="fail",
@@ -290,6 +351,17 @@ def run_evidence_review(
         elif agent == "vision":
             results[agent] = _run_vision_agent(project_id, usage_statement_id)
 
+    result_code = _aggregate_orchestrator_result_code(results)
+    mark_orchestrator(
+        project_id=project_id,
+        usage_statement_id=usage_statement_id,
+        event="evidence_review_completed",
+        status_code="success" if result_code != "fail" else "fail",
+        result_code=result_code,
+        reason="증빙 검증 대상 Agent 실행을 완료했습니다.",
+        payload={"target_agents": target_agents, "results": results},
+    )
+
     return OrchestratorActionResponse(
         status="success",
         message="증빙 검증 대상 Agent 실행을 완료했습니다.",
@@ -341,6 +413,15 @@ def run_legal_review(
         payload={"she_user_id": she_user_id},
     )
     result = _run_legal_agent(project_id, usage_statement_id, she_user_id=she_user_id)
+    mark_orchestrator(
+        project_id=project_id,
+        usage_statement_id=usage_statement_id,
+        event="legal_review_completed",
+        status_code=result.get("status_code", "fail"),
+        result_code=result.get("result_code", "fail"),
+        reason=result.get("reason", "legal Agent 실행을 완료했습니다."),
+        payload={"she_user_id": she_user_id, "result": result},
+    )
     return OrchestratorActionResponse(
         status=result["status_code"],
         message=result["reason"],
@@ -372,8 +453,26 @@ def run_report_draft(
             hil_agents=[],
         )
 
+    mark_orchestrator(
+        project_id=project_id,
+        usage_statement_id=usage_statement_id,
+        event="report_draft_started",
+        status_code="running",
+        result_code=None,
+        reason="report 초안 생성을 시작했습니다.",
+        payload={"she_user_id": she_user_id},
+    )
     result = _run_report_agent(project_id, usage_statement_id, she_user_id=she_user_id)
     report_result = cast(dict[str, Any], result.get("result")) if isinstance(result.get("result"), dict) else {}
+    mark_orchestrator(
+        project_id=project_id,
+        usage_statement_id=usage_statement_id,
+        event="report_draft_completed",
+        status_code=result.get("status_code", "fail"),
+        result_code=result.get("result_code", "fail"),
+        reason=result.get("reason", "report Agent 실행을 완료했습니다."),
+        payload={"she_user_id": she_user_id, "result": result},
+    )
     return OrchestratorActionResponse(
         status=result.get("status_code", "fail"),
         message=result.get("reason", "report Agent 실행을 완료했습니다."),
@@ -402,7 +501,7 @@ def _run_safety_doc_agent(project_id: int, usage_statement_id: int) -> dict[str,
 
     try:
         item_results: list[dict[str, Any]] = [
-            {"item_id": item_id, "result": check_missing_evidence(item_id)}
+            {"item_id": item_id, "result": check_missing_evidence(item_id, persist_log=False)}
             for item_id in item_ids
         ]
         hil_item_ids = [
@@ -467,6 +566,7 @@ def _run_link_agent(project_id: int, usage_statement_id: int) -> dict[str, Any]:
         for file_id in grouped_files.get(evidence_type, [])
     ]
     tax_invoice_file_ids = grouped_files.get("tax_invoice", [])
+    target_file_ids = receipt_file_ids + tax_invoice_file_ids
 
     if not receipt_file_ids and not tax_invoice_file_ids:
         return {"status_code": "skipped", "result_code": None, "reason": "영수증/세금계산서 파일 없음"}
@@ -501,6 +601,11 @@ def _run_link_agent(project_id: int, usage_statement_id: int) -> dict[str, Any]:
         )
         result_code = "hil" if issue_count else "success"
         reason = f"매칭 검토 필요 {issue_count}건" if issue_count else "증빙 파일 매칭 적정"
+        update_file_statuses(
+            project_id=project_id,
+            file_ids=target_file_ids,
+            status_code="success" if result_code == "success" else "fail",
+        )
         todos = [
             {
                 "usage_statement_item_id": int(row.get("line_id")),
@@ -531,6 +636,7 @@ def _run_link_agent(project_id: int, usage_statement_id: int) -> dict[str, Any]:
             "todos": todos,
         }
     except Exception as exc:
+        update_file_statuses(project_id=project_id, file_ids=target_file_ids, status_code="fail")
         return _mark_agent_failed(project_id, usage_statement_id, "link", exc)
 
 
@@ -555,10 +661,29 @@ def _dict_or_empty(value: Any) -> dict[str, Any]:
     return value if isinstance(value, dict) else {}
 
 
+def _aggregate_orchestrator_result_code(results: dict[str, Any]) -> str:
+    result_codes = [
+        str(result.get("result_code") or "")
+        for result in results.values()
+        if isinstance(result, dict)
+    ]
+    status_codes = [
+        str(result.get("status_code") or "")
+        for result in results.values()
+        if isinstance(result, dict)
+    ]
+    if "fail" in result_codes or "fail" in status_codes:
+        return "fail"
+    if "hil" in result_codes:
+        return "hil"
+    return "success"
+
+
 def _run_vision_agent(project_id: int, usage_statement_id: int) -> dict[str, Any]:
     photo_files = list_evidence_files_by_type(project_id, SITE_PHOTO_TYPES)
     if not photo_files:
         return {"status_code": "skipped", "result_code": None, "reason": "현장사진 파일 없음"}
+    photo_file_ids = [int(file_info["id"]) for file_info in photo_files if file_info.get("id") is not None]
 
     photos = [
         {
@@ -592,6 +717,7 @@ def _run_vision_agent(project_id: int, usage_statement_id: int) -> dict[str, Any
 
     if not VISION_AGENT_BASE_URL:
         reason = "VISION_AGENT_BASE_URL 환경변수가 설정되지 않아 vision Agent를 호출할 수 없습니다."
+        update_file_statuses(project_id=project_id, file_ids=photo_file_ids, status_code="fail")
         upsert_agent_log(
             project_id=project_id,
             usage_statement_id=usage_statement_id,
@@ -633,15 +759,26 @@ def _run_vision_agent(project_id: int, usage_statement_id: int) -> dict[str, Any
             body.get("reason")
             or ("현장사진 검토 보완 필요" if result_code == "hil" else "현장사진 검토 적정")
         )
+        update_file_statuses(
+            project_id=project_id,
+            file_ids=photo_file_ids,
+            status_code="success" if result_code == "success" else "fail",
+        )
         token = _int_or_none(body.get("token") or body.get("token_usage"))
-        details = body.get("details") if isinstance(body.get("details"), dict) else {}
+        source_details = body.get("details")
+        details = dict(source_details) if isinstance(source_details, dict) else {}
         details.setdefault("event", "vision_completed")
         details.setdefault("summary", reason)
-        details.setdefault("payload", {})
+        details["payload"] = dict(details.get("payload") or {})
+        vision_response = {
+            key: value
+            for key, value in body.items()
+            if key != "details"
+        }
         details["payload"].update(
             {
                 "photos": photos,
-                "vision_response": body,
+                "vision_response": vision_response,
                 "todos": todos,
             }
         )
@@ -666,6 +803,7 @@ def _run_vision_agent(project_id: int, usage_statement_id: int) -> dict[str, Any
             "details": details,
         }
     except Exception as exc:
+        update_file_statuses(project_id=project_id, file_ids=photo_file_ids, status_code="fail")
         return _mark_agent_failed(project_id, usage_statement_id, "vision", exc)
 
 
