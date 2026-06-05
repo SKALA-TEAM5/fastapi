@@ -48,6 +48,8 @@ jobs:
           platforms: linux/amd64
           push: true
           tags: ${{ steps.image.outputs.image_uri }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
 
       - name: Checkout deploy repository
         uses: actions/checkout@v4
