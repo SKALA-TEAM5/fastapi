@@ -500,7 +500,7 @@ def _run_safety_doc_agent(project_id: int, usage_statement_id: int) -> dict[str,
 
     try:
         item_results: list[dict[str, Any]] = [
-            {"item_id": item_id, "result": check_missing_evidence(item_id)}
+            {"item_id": item_id, "result": check_missing_evidence(item_id, persist_log=False)}
             for item_id in item_ids
         ]
         hil_item_ids = [

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import re
 from dataclasses import asdict
 
@@ -14,6 +15,10 @@ from src.schemas.safety_doc_agent_evidence import (
     AIEvidenceRequirementInput,
     AIEvidenceRequirementOutput,
 )
+from src.tools.safety_doc_reference_vector import search_reference_vector_db
+
+
+log = logging.getLogger(__name__)
 
 
 class EvidenceRequirementService:
@@ -35,12 +40,54 @@ class EvidenceRequirementService:
         item_context = self.repository.get_item_context(item_id)
         evidence_types = self.repository.list_evidence_types()
         linked_files = self.repository.list_linked_file_contexts(item_id)
+        reference_contexts = self._search_reference_contexts(item_context)
         return AIEvidenceRequirementInput(
             item_context=item_context,
             linked_files=linked_files,
             available_evidence_types=[evidence_type.code for evidence_type in evidence_types],
             evidence_type_definitions=evidence_types,
+            reference_contexts=reference_contexts,
         )
+
+    def _search_reference_contexts(self, item_context) -> list[dict]:
+        query = " ".join(
+            str(part or "").strip()
+            for part in (
+                item_context.category_name,
+                item_context.item_name,
+                item_context.remark,
+            )
+            if str(part or "").strip()
+        )
+        if not query or self.settings.reference_top_k <= 0:
+            return []
+
+        try:
+            hits = search_reference_vector_db(
+                query=query,
+                collection_name=self.settings.reference_collection,
+                top_k=self.settings.reference_top_k,
+            )
+        except Exception as exc:
+            log.warning(
+                "safety-doc reference search skipped: collection=%s error=%s",
+                self.settings.reference_collection,
+                exc,
+            )
+            return []
+
+        contexts: list[dict] = []
+        for hit in hits:
+            payload = hit.get("payload") or {}
+            contexts.append(
+                {
+                    "score": hit.get("score"),
+                    "title": payload.get("title") or payload.get("section") or payload.get("source"),
+                    "text": payload.get("text") or payload.get("content") or payload.get("body"),
+                    "metadata": payload.get("metadata") or {},
+                }
+            )
+        return contexts
 
     @traceable(name="evidence_requirement_inference", run_type="chain")
     def infer_required_evidences(self, item_id: int) -> AIEvidenceRequirementOutput:
