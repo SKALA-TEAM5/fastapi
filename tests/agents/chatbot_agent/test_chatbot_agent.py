@@ -248,6 +248,150 @@ async def run_evaluation(
 
 
 # ══════════════════════════════════════════════════════════════════════════════
+# 멀티턴 테스트
+# ══════════════════════════════════════════════════════════════════════════════
+
+_MULTITURN_CASES = [
+    {
+        "id": "multi_01",
+        "description": "멀티턴 — 후속 질문 맥락 추적",
+        "turns": [
+            {
+                "question": "안전모는 몇 번 카테고리인가요?",
+                "expected_intent": "카테고리판단",
+                "expected_keywords": ["CAT_03"],
+            },
+            {
+                "question": "그러면 방진마스크는요?",
+                "expected_intent": "카테고리판단",  # 이전 맥락 기반 분류
+                "expected_keywords": ["CAT_03"],
+            },
+        ],
+    },
+    {
+        "id": "multi_02",
+        "description": "멀티턴 — '방금 질문 다시 해줘' 맥락 복원",
+        "turns": [
+            {
+                "question": "CAT_02 안전시설비 한도율이 얼마인가요?",
+                "expected_intent": "법령한도",
+                "expected_keywords": ["20%"],
+            },
+            {
+                "question": "방금 질문한 거 다시 한 번 설명해줘",
+                "expected_intent": "법령한도",  # 기타로 빠지면 실패
+                "expected_keywords": ["한도"],
+            },
+        ],
+    },
+]
+
+
+async def run_multiturn(case: dict, check: bool = True) -> dict:
+    """멀티턴 케이스를 순서대로 실행하고 결과를 반환한다."""
+    session_id = None
+    turn_results = []
+
+    for i, turn in enumerate(case["turns"], 1):
+        intent  = ""
+        tokens  = []
+        sources = []
+
+        async for raw in stream_chat(question=turn["question"], session_id=session_id):
+            raw = raw.strip()
+            if not raw or raw == "data: [DONE]":
+                continue
+            if not raw.startswith("data: "):
+                continue
+            try:
+                payload = json.loads(raw[6:])
+            except json.JSONDecodeError:
+                continue
+
+            t = payload.get("type", "")
+            v = payload.get("value", "")
+
+            if t == "session_id" and session_id is None:
+                session_id = v
+            elif t == "intent":
+                intent = v
+            elif t == "token":
+                tokens.append(v)
+            elif t == "sources":
+                sources = v if isinstance(v, list) else [v]
+
+        answer = "".join(tokens)
+        expected_intent = turn.get("expected_intent", "")
+        expected_kws    = turn.get("expected_keywords", [])
+        missing_kws     = [kw for kw in expected_kws if check and kw not in answer]
+
+        turn_results.append({
+            "turn":             i,
+            "question":         turn["question"],
+            "expected_intent":  expected_intent,
+            "intent":           intent,
+            "answer":           answer,
+            "sources":          sources,
+            "intent_ok":        intent == expected_intent,
+            "keywords_ok":      len(missing_kws) == 0,
+            "missing_keywords": missing_kws,
+        })
+
+    all_intent_ok  = all(t["intent_ok"]   for t in turn_results)
+    all_keyword_ok = all(t["keywords_ok"] for t in turn_results)
+
+    return {
+        "id":          case["id"],
+        "description": case["description"],
+        "turns":       turn_results,
+        "intent_ok":   all_intent_ok,
+        "keywords_ok": all_keyword_ok,
+    }
+
+
+async def run_multiturn_evaluation(check: bool = True) -> None:
+    """멀티턴 케이스 전체 실행."""
+    cases  = _MULTITURN_CASES
+    total  = len(cases)
+
+    print(f"\n{'=' * _W}")
+    print(f"  멀티턴 평가  |  총 {total}케이스")
+    print(f"{'=' * _W}")
+
+    results = []
+    for i, case in enumerate(cases, 1):
+        print(f"\n  실행 중 [{i:02d}/{total}] {case['id']} — {case['description']} ...", end="", flush=True)
+        try:
+            result = await run_multiturn(case, check=check)
+            results.append(result)
+            print(" 완료")
+
+            for turn in result["turns"]:
+                im = "O" if turn["intent_ok"]   else "X"
+                km = "O" if turn["keywords_ok"] else "X"
+                print(f"\n  ── Turn {turn['turn']} {'─' * (_W - 12)}")
+                print(f"  Q      : {turn['question']}")
+                print(f"  intent : {turn['intent']}  (기대: {turn['expected_intent']})  [{im}]" + (f"  keyword [{km}]" if check else ""))
+                print(f"  답변   : {turn['answer'][:120]}{'...' if len(turn['answer']) > 120 else ''}")
+                if check and turn["missing_keywords"]:
+                    print(f"  ⚠ 누락 키워드: {turn['missing_keywords']}")
+        except Exception as e:
+            print(f" 오류: {e}")
+            results.append({"id": case["id"], "description": case["description"], "error": str(e), "intent_ok": False, "keywords_ok": False})
+
+    intent_correct = sum(1 for r in results if r.get("intent_ok", False))
+    keyword_pass   = sum(1 for r in results if r.get("keywords_ok", False))
+
+    print(f"\n{'=' * _W}")
+    print("  멀티턴 평가 요약")
+    print(f"{'=' * _W}")
+    print(f"  Intent 정확도 (전 턴 통과): {intent_correct}/{total}")
+    if check:
+        print(f"  키워드 통과율 (전 턴 통과): {keyword_pass}/{total}")
+    print(f"{'=' * _W}\n")
+
+
+# ══════════════════════════════════════════════════════════════════════════════
 # 진입점
 # ══════════════════════════════════════════════════════════════════════════════
 
@@ -269,13 +413,20 @@ if __name__ == "__main__":
         "--no-check", dest="check", action="store_false",
         help="키워드 검증 비활성화 (답변만 확인)",
     )
+    parser.add_argument(
+        "--multiturn", action="store_true",
+        help="멀티턴 케이스만 실행",
+    )
     args = parser.parse_args()
 
-    asyncio.run(
-        run_evaluation(
-            cases_path=args.cases,
-            output_dir=args.output,
-            filter_id=args.id,
-            check=args.check,
+    if args.multiturn:
+        asyncio.run(run_multiturn_evaluation(check=args.check))
+    else:
+        asyncio.run(
+            run_evaluation(
+                cases_path=args.cases,
+                output_dir=args.output,
+                filter_id=args.id,
+                check=args.check,
+            )
         )
-    )
