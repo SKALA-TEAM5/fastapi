@@ -14,7 +14,7 @@ OCR 엔진이 storage_key 로 S3에서 파일을 직접 가져와 파싱한다.
   wage_statement       → 거래명세표 파서 공유 (매칭 없음, Gate 3 면제)
   tax_invoice          → pdfplumber / CLOVA 세금계산서 파서
 
-매칭은 POST /api/v1/matching/run 별도 엔드포인트에서 처리한다.
+매칭은 POST /api/v1/link/run 별도 엔드포인트에서 처리한다.
 """
 
 from __future__ import annotations
@@ -262,12 +262,12 @@ DB `files` 테이블 레코드를 JSON으로 전달하면 `storage_key`로 S3에
 | uploaded_evidence_type_code | 파서 | 매칭 |
 |---|---|---|
 | `usage_statement` | pdfplumber | ❌ |
-| `receipt` | OCR 엔진 (VLM/CLOVA, OCR_ENGINE 환경변수로 전환) | ❌ (별도 /matching/run 호출) |
+| `receipt` | OCR 엔진 (VLM/CLOVA, OCR_ENGINE 환경변수로 전환) | ❌ (별도 /link/run 호출) |
 | `transaction_statement` | pdfplumber / OCR 엔진 | ❌ |
 | `wage_statement` | 거래명세표 파서 공유 | ❌ |
 | `tax_invoice` | pdfplumber / CLOVA | ❌ |
 
-매칭은 `POST /api/v1/matching/run`에서 별도로 실행합니다.
+매칭은 `POST /api/v1/link/run`에서 별도로 실행합니다.
     """,
     responses={
         200: {"description": "파싱 성공 (success: true) 또는 비즈니스 실패 (success: false)"},

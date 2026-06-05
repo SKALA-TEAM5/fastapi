@@ -426,17 +426,16 @@ def parse_usage_statement(usage_file_id: int) -> dict[str, Any]:
 
 def run_link_pipeline(
     usage_statement_id: int,
-    receipt_file_ids: list[int],
-    tax_invoice_file_ids: list[int] | None = None,
+    file_ids: list[int],
 ) -> dict[str, Any]:
     """
     영수증·세금계산서 OCR 후 사용내역서와 2-way 매칭하고 결과를 DB에 저장한다.
     분류 Agent + safety-doc 완료 후 Spring이 호출한다.
 
     Args:
-        usage_statement_id   : 이미 저장된 usage_statements.id
-        receipt_file_ids     : 영수증·거래명세표 파일들의 files.id 목록
-        tax_invoice_file_ids : 세금계산서 파일들의 files.id 목록 (선택)
+        usage_statement_id : 이미 저장된 usage_statements.id
+        file_ids           : 영수증·거래명세표·세금계산서 파일 id 혼합 목록
+                             (uploaded_evidence_type_code로 내부에서 자동 분리)
 
     Returns:
         {
@@ -453,13 +452,11 @@ def run_link_pipeline(
         ValueError : 파일 또는 usage_statement를 찾을 수 없는 경우
         RuntimeError: OCR 실패 또는 S3 접근 오류
     """
-    tax_invoice_file_ids = tax_invoice_file_ids or []
     start = time.time()
     tmp_paths: list[str] = []
     evidence_file_inputs: list[dict[str, Any]] = []
 
     # ── 로그 시작 (별도 커넥션으로 즉시 커밋) ─────────────────────────
-    # usage_statement → project_id 조회
     with get_connection() as log_conn:
         with log_conn.cursor() as _cur:
             _cur.execute(
@@ -478,18 +475,27 @@ def run_link_pipeline(
             usage_statement_id=usage_statement_id,
             details={
                 "usage_statement_id": usage_statement_id,
-                "receipt_file_ids": receipt_file_ids,
+                "file_ids": file_ids,
             },
         )
 
     try:
         with get_connection() as conn:
-            # ── DB에서 파일 정보 일괄 조회 ────────────────────────────────
-            all_ids = receipt_file_ids + tax_invoice_file_ids
-            file_map = get_files_by_ids(conn, all_ids)
+            # ── DB에서 파일 정보 일괄 조회 + doc_type 기준 분리 ──────────
+            file_map = get_files_by_ids(conn, file_ids)
             evidence_file_inputs = [
                 _build_file_agent_input(file_info)
                 for file_info in file_map.values()
+            ]
+
+            RECEIPT_TYPES = {"receipt", "transaction_statement", "wage_statement"}
+            receipt_file_ids = [
+                fid for fid, f in file_map.items()
+                if f.get("uploaded_evidence_type_code") in RECEIPT_TYPES
+            ]
+            tax_invoice_file_ids = [
+                fid for fid, f in file_map.items()
+                if f.get("uploaded_evidence_type_code") == "tax_invoice"
             ]
 
             # ── usage_statement items 조회 (매칭용) ───────────────────────
