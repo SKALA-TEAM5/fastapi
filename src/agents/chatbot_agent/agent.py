@@ -77,6 +77,7 @@ def build_chatbot_graph() -> StateGraph:
         {
             "rewrite_query":   "rewrite_query",
             "generate_answer": "answer_generator",
+            "fallback":        "fallback_handler",  # 근거 문서 없으면 생성 차단
         },
     )
 
