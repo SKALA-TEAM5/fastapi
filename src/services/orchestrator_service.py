@@ -58,10 +58,39 @@ from src.services.usage_statement_pipeline_service import parse_usage_statement,
 
 def parse_and_classify_usage_statement(file_id: int) -> OrchestratorActionResponse:
     result = parse_usage_statement(file_id)
+    usage_statement_id = _int_or_none(result.get("usage_statement_id"))
+    project_id = _int_or_none(result.get("project_id"))
+    if project_id is not None and usage_statement_id is not None:
+        classifier_details = result.get("classifier_details") if isinstance(result.get("classifier_details"), dict) else {}
+        classifier_changed_count = int(result.get("classifier_changed_count") or 0)
+        summary = (
+            f"세부내역 {classifier_changed_count}건을 올바른 항목으로 이동했습니다."
+            if classifier_changed_count
+            else "세부내역 분류 이동 없음"
+        )
+        upsert_agent_log(
+            project_id=project_id,
+            usage_statement_id=usage_statement_id,
+            agent_type_code="classi",
+            status_code="success",
+            result_code="success",
+            reason=summary,
+            details=classifier_details,
+            model_name="classifier_agent",
+        )
+        mark_orchestrator(
+            project_id=project_id,
+            usage_statement_id=usage_statement_id,
+            event="classi_completed",
+            status_code="success",
+            result_code="success",
+            reason=summary,
+            payload={"file_id": file_id, "result": result},
+        )
     return OrchestratorActionResponse(
         status="success",
         message="사용내역서 파싱 및 classi 실행 요청이 완료되었습니다.",
-        usage_statement_id=result.get("usage_statement_id"),
+        usage_statement_id=usage_statement_id,
         target_agents=["classi"],
         result=result,
     )
@@ -71,6 +100,15 @@ def classify_existing_usage_statement(
     request: UsageStatementClassifyRequest,
 ) -> OrchestratorActionResponse:
     try:
+        mark_orchestrator(
+            project_id=request.project_id,
+            usage_statement_id=request.usage_statement_id,
+            event="classi_started",
+            status_code="running",
+            result_code=None,
+            reason="classi 재분류를 시작했습니다.",
+            payload={"item_id": request.item_id, "item_name": request.item_name},
+        )
         submitted_category = request.category_code or ""
         review_response = review_usage_statement(
             usage_statement_id=request.usage_statement_id,
@@ -146,6 +184,15 @@ def classify_existing_usage_statement(
             details=details,
             model_name="classifier_agent",
         )
+        mark_orchestrator(
+            project_id=request.project_id,
+            usage_statement_id=request.usage_statement_id,
+            event="classi_completed",
+            status_code="success",
+            result_code="success",
+            reason=summary,
+            payload={"item_id": request.item_id, "details": details},
+        )
         return OrchestratorActionResponse(
             status="success",
             message=summary,
@@ -168,6 +215,19 @@ def classify_existing_usage_statement(
                 "payload": {"error_type": type(exc).__name__, "error": str(exc)},
             },
             model_name="classifier_agent",
+        )
+        mark_orchestrator(
+            project_id=request.project_id,
+            usage_statement_id=request.usage_statement_id,
+            event="classi_failed",
+            status_code="fail",
+            result_code="fail",
+            reason=reason,
+            payload={
+                "item_id": request.item_id,
+                "error_type": type(exc).__name__,
+                "error": str(exc),
+            },
         )
         return OrchestratorActionResponse(
             status="fail",
@@ -290,6 +350,17 @@ def run_evidence_review(
         elif agent == "vision":
             results[agent] = _run_vision_agent(project_id, usage_statement_id)
 
+    result_code = _aggregate_orchestrator_result_code(results)
+    mark_orchestrator(
+        project_id=project_id,
+        usage_statement_id=usage_statement_id,
+        event="evidence_review_completed",
+        status_code="success" if result_code != "fail" else "fail",
+        result_code=result_code,
+        reason="증빙 검증 대상 Agent 실행을 완료했습니다.",
+        payload={"target_agents": target_agents, "results": results},
+    )
+
     return OrchestratorActionResponse(
         status="success",
         message="증빙 검증 대상 Agent 실행을 완료했습니다.",
@@ -341,6 +412,15 @@ def run_legal_review(
         payload={"she_user_id": she_user_id},
     )
     result = _run_legal_agent(project_id, usage_statement_id, she_user_id=she_user_id)
+    mark_orchestrator(
+        project_id=project_id,
+        usage_statement_id=usage_statement_id,
+        event="legal_review_completed",
+        status_code=result.get("status_code", "fail"),
+        result_code=result.get("result_code", "fail"),
+        reason=result.get("reason", "legal Agent 실행을 완료했습니다."),
+        payload={"she_user_id": she_user_id, "result": result},
+    )
     return OrchestratorActionResponse(
         status=result["status_code"],
         message=result["reason"],
@@ -372,8 +452,26 @@ def run_report_draft(
             hil_agents=[],
         )
 
+    mark_orchestrator(
+        project_id=project_id,
+        usage_statement_id=usage_statement_id,
+        event="report_draft_started",
+        status_code="running",
+        result_code=None,
+        reason="report 초안 생성을 시작했습니다.",
+        payload={"she_user_id": she_user_id},
+    )
     result = _run_report_agent(project_id, usage_statement_id, she_user_id=she_user_id)
     report_result = cast(dict[str, Any], result.get("result")) if isinstance(result.get("result"), dict) else {}
+    mark_orchestrator(
+        project_id=project_id,
+        usage_statement_id=usage_statement_id,
+        event="report_draft_completed",
+        status_code=result.get("status_code", "fail"),
+        result_code=result.get("result_code", "fail"),
+        reason=result.get("reason", "report Agent 실행을 완료했습니다."),
+        payload={"she_user_id": she_user_id, "result": result},
+    )
     return OrchestratorActionResponse(
         status=result.get("status_code", "fail"),
         message=result.get("reason", "report Agent 실행을 완료했습니다."),
@@ -553,6 +651,24 @@ def _int_or_none(value: Any) -> int | None:
 
 def _dict_or_empty(value: Any) -> dict[str, Any]:
     return value if isinstance(value, dict) else {}
+
+
+def _aggregate_orchestrator_result_code(results: dict[str, Any]) -> str:
+    result_codes = [
+        str(result.get("result_code") or "")
+        for result in results.values()
+        if isinstance(result, dict)
+    ]
+    status_codes = [
+        str(result.get("status_code") or "")
+        for result in results.values()
+        if isinstance(result, dict)
+    ]
+    if "fail" in result_codes or "fail" in status_codes:
+        return "fail"
+    if "hil" in result_codes:
+        return "hil"
+    return "success"
 
 
 def _run_vision_agent(project_id: int, usage_statement_id: int) -> dict[str, Any]:
