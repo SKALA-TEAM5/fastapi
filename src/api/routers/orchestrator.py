@@ -59,7 +59,7 @@ async def parse_usage_statement(request: UsageStatementParseRequest) -> Orchestr
 )
 async def classify_usage_statement(request: UsageStatementClassifyRequest) -> OrchestratorActionResponse:
     try:
-        return classify_existing_usage_statement(request.project_id, request.usage_statement_id)
+        return classify_existing_usage_statement(request)
     except Exception as exc:
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
@@ -68,11 +68,11 @@ async def classify_usage_statement(request: UsageStatementClassifyRequest) -> Or
 
 
 @router.post(
-    "/usage-statements/evidence",
+    "/usage-statements/validate",
     response_model=OrchestratorActionResponse,
     summary="증빙 검증 대상 Agent 결정",
 )
-async def evidence_review(request: EvidenceReviewRequest) -> OrchestratorActionResponse:
+async def validate_review(request: EvidenceReviewRequest) -> OrchestratorActionResponse:
     return run_evidence_review(
         request.project_id,
         request.usage_statement_id,

@@ -77,6 +77,7 @@ class AIEvidenceRequirementInput:
     linked_files: list[LinkedEvidenceFileContext]
     available_evidence_types: list[str]
     evidence_type_definitions: list[EvidenceType]
+    reference_contexts: list[dict] = field(default_factory=list)
 
 
 @dataclass(slots=True)

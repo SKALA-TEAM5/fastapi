@@ -9,12 +9,12 @@ OCR 엔진이 storage_key 로 S3에서 파일을 직접 가져와 파싱한다.
 문서 유형(uploaded_evidence_type_code)에 따라 파서를 분기한다.
 
   usage_statement      → pdfplumber 사용내역서 파서 (파싱만, 매칭 없음)
-  receipt              → CLOVA OCR 영수증 모델
-  transaction_statement→ pdfplumber / CLOVA 거래명세표 파서
+  receipt              → OCR 엔진 (OCR_ENGINE=vlm: Gemini/OpenAI, clova: CLOVA OCR)
+  transaction_statement→ pdfplumber / OCR 엔진
   wage_statement       → 거래명세표 파서 공유 (매칭 없음, Gate 3 면제)
   tax_invoice          → pdfplumber / CLOVA 세금계산서 파서
 
-매칭은 POST /api/v1/matching/run 별도 엔드포인트에서 처리한다.
+매칭은 POST /api/v1/link/run 별도 엔드포인트에서 처리한다.
 """
 
 from __future__ import annotations
@@ -33,11 +33,7 @@ from src.schemas.ocr import (
     TaxInvoiceValidation,
 )
 from src.core.config import CLOVA_OCR_SECRET, CLOVA_OCR_URL
-from src.ocr.clova_ocr_receipt import (
-    call_clova_receipt,
-    parse_clova_response,
-    validate_result,
-)
+from src.ocr.ocr_engine import parse_receipt, parse_document_image, get_engine_name
 from src.ocr.parse_tax_invoice import (
     ALL_EXTS as TAX_EXTS,
     PDF_EXTS,
@@ -45,8 +41,8 @@ from src.ocr.parse_tax_invoice import (
     parse_from_pdf,
     parse_tax_invoice,
 )
-from src.ocr.parse_usage_statement import parse_pdf as parse_usage_statement
-from src.services.s3_client import fetch_file
+from src.ocr.parse_usage_statement import parse_pdf as parse_usage_statement, is_usage_statement
+from src.services.minio_client import create_presigned_file_url, fetch_file
 
 router = APIRouter(prefix="/ocr", tags=["OCR 파싱"])
 
@@ -108,6 +104,15 @@ def _parse_usage_statement(file_bytes: bytes, suffix: str, filename: str) -> dic
             status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
             detail="사용내역서는 PDF 형식만 지원합니다.",
         )
+    # ── 사용내역서 형식 사전 판별 ─────────────────────────
+    if not is_usage_statement(file_bytes):
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail=(
+                "업로드된 파일이 사용내역서 형식이 아닙니다. "
+                "산업안전보건관리비 사용내역서 PDF를 업로드해 주세요."
+            ),
+        )
     with tempfile.NamedTemporaryFile(suffix=".pdf", delete=False) as tmp:
         tmp.write(file_bytes)
         tmp_path = tmp.name
@@ -133,15 +138,10 @@ def _parse_receipt_or_statement(
 
     try:
         if doc_type in ("transaction_statement", "wage_statement"):
-            if suffix in _IMAGE_EXT and (not CLOVA_OCR_URL or not CLOVA_OCR_SECRET):
-                raise HTTPException(
-                    status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-                    detail="이미지 문서 처리를 위한 CLOVA 환경변수가 설정되지 않았습니다.",
-                )
             if suffix in _PDF_EXT:
                 parsed = parse_from_pdf(tmp_path)
             else:
-                parsed = parse_from_image(tmp_path, CLOVA_OCR_SECRET, CLOVA_OCR_URL)
+                parsed = parse_document_image(tmp_path, type_hint=doc_type)
 
             return {
                 "receipt_id":   f"rec_{uuid.uuid4().hex[:8]}",
@@ -168,36 +168,30 @@ def _parse_receipt_or_statement(
             }
 
         else:  # receipt
-            if not CLOVA_OCR_URL or not CLOVA_OCR_SECRET:
-                raise HTTPException(
-                    status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-                    detail="CLOVA_OCR_URL 또는 CLOVA_OCR_SECRET 환경변수가 설정되지 않았습니다.",
-                )
-            raw = call_clova_receipt(tmp_path, CLOVA_OCR_SECRET, CLOVA_OCR_URL)
-            parsed = parse_clova_response(raw)
-            validation = validate_result(parsed)
+            parsed = parse_receipt(tmp_path)
 
             return {
                 "receipt_id":   f"rec_{uuid.uuid4().hex[:8]}",
                 "source_file":  filename,
                 "doc_type":     "receipt",
+                "ocr_engine":   get_engine_name(),
                 "infer_result": parsed.get("infer_result", "SUCCESS"),
-                "vendor":       parsed.get("store_name"),
-                "date":         parsed.get("payment_date"),
-                "total_amount": parsed.get("total_price"),
+                "vendor":       parsed.get("store", {}).get("name") or parsed.get("store_name"),
+                "date":         parsed.get("payment", {}).get("date") or parsed.get("payment_date"),
+                "total_amount": parsed.get("total_amount") or parsed.get("total_price"),
                 "items": [
                     {
-                        "item_name":  item.get("item_name", ""),
+                        "item_name":  item.get("name", "") or item.get("item_name", ""),
                         "count":      item.get("count"),
                         "unit_price": item.get("unit_price"),
                         "amount":     item.get("amount"),
                     }
-                    for item in (parsed.get("sub_results") or [])
+                    for item in (parsed.get("items") or parsed.get("sub_results") or [])
                 ],
                 "validation": {
-                    "is_valid":        validation.get("is_valid", False),
-                    "items_sum_match": validation.get("items_sum_match"),
-                    "warnings":        validation.get("warnings", []),
+                    "is_valid":        parsed.get("validation", {}).get("is_valid", False),
+                    "items_sum_match": parsed.get("validation", {}).get("items_sum_match"),
+                    "warnings":        parsed.get("validation", {}).get("warnings", []),
                 },
             }
     except HTTPException:
@@ -218,12 +212,6 @@ def _parse_tax_invoice(file_bytes: bytes, suffix: str, filename: str) -> dict:
             status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
             detail=f"지원하지 않는 파일 형식: {suffix}",
         )
-    if suffix not in PDF_EXTS and (not CLOVA_OCR_URL or not CLOVA_OCR_SECRET):
-        raise HTTPException(
-            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-            detail="이미지 세금계산서 처리를 위한 CLOVA 환경변수가 설정되지 않았습니다.",
-        )
-
     with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as tmp:
         tmp.write(file_bytes)
         tmp_path = tmp.name
@@ -274,17 +262,17 @@ DB `files` 테이블 레코드를 JSON으로 전달하면 `storage_key`로 S3에
 | uploaded_evidence_type_code | 파서 | 매칭 |
 |---|---|---|
 | `usage_statement` | pdfplumber | ❌ |
-| `receipt` | CLOVA OCR 영수증 모델 | ❌ (별도 /matching/run 호출) |
-| `transaction_statement` | pdfplumber / CLOVA | ❌ |
+| `receipt` | OCR 엔진 (VLM/CLOVA, OCR_ENGINE 환경변수로 전환) | ❌ (별도 /link/run 호출) |
+| `transaction_statement` | pdfplumber / OCR 엔진 | ❌ |
 | `wage_statement` | 거래명세표 파서 공유 | ❌ |
 | `tax_invoice` | pdfplumber / CLOVA | ❌ |
 
-매칭은 `POST /api/v1/matching/run`에서 별도로 실행합니다.
+매칭은 `POST /api/v1/link/run`에서 별도로 실행합니다.
     """,
     responses={
         200: {"description": "파싱 성공 (success: true) 또는 비즈니스 실패 (success: false)"},
-        422: {"description": "지원하지 않는 파일 형식 또는 S3 파일 접근 불가"},
-        503: {"description": "CLOVA OCR 또는 S3 연결 오류"},
+        422: {"description": "지원하지 않는 파일 형식 또는 MinIO 파일 접근 불가"},
+        503: {"description": "OCR 엔진(VLM/CLOVA) 또는 MinIO 연결 오류"},
     },
 )
 async def parse(body: FileRecord) -> ParseResponse:
@@ -298,6 +286,12 @@ async def parse(body: FileRecord) -> ParseResponse:
 
     # ── S3에서 파일 fetch ────────────────────────────────────────────
     file_bytes = fetch_file(body.storage_key)
+    file_input = {
+        "file_id": body.id,
+        "original_filename": body.original_filename,
+        "storage_key": body.storage_key,
+        "presigned_url": create_presigned_file_url(body.storage_key),
+    }
 
     evidence_code = body.uploaded_evidence_type_code
 
@@ -308,10 +302,12 @@ async def parse(body: FileRecord) -> ParseResponse:
             return ParseResponse(
                 success=True,
                 data={
+                    "file":              file_input,
                     "usage_statement": result.get("usage_statement"),
                     "summaries":       result.get("summaries", []),
                     "items":           result.get("items", []),
                 },
+                error=None,
                 message="사용내역서 파싱 성공",
             )
 
@@ -320,7 +316,8 @@ async def parse(body: FileRecord) -> ParseResponse:
             result = _parse_tax_invoice(file_bytes, suffix, body.original_filename)
             return ParseResponse(
                 success=True,
-                data={"ocr_result": result},
+                data={"file": file_input, "ocr_result": result},
+                error=None,
                 message="세금계산서 파싱 성공",
             )
 
@@ -335,7 +332,8 @@ async def parse(body: FileRecord) -> ParseResponse:
             )
             return ParseResponse(
                 success=True,
-                data={"ocr_result": result},
+                data={"file": file_input, "ocr_result": result},
+                error=None,
                 message="파싱 성공",
             )
 
@@ -350,6 +348,7 @@ async def parse(body: FileRecord) -> ParseResponse:
     except Exception as e:
         return ParseResponse(
             success=False,
+            data=None,
             error=ParseError(code="parse_error", message=str(e)),
             message="파싱 실패",
         )

@@ -20,7 +20,7 @@ from pydantic import BaseModel, Field
 class FileRecord(BaseModel):
     """
     POST /ocr/parse 요청 — DB files 테이블 레코드를 그대로 전달
-    OCR 엔진은 storage_key 로 S3 에서 파일을 직접 가져온다.
+    OCR 엔진은 storage_key로 MinIO에서 파일을 직접 가져온다.
     """
     id: int = Field(..., description="files PK (BIGSERIAL)", examples=[1])
     project_id: Optional[int] = Field(None, description="프로젝트 ID (미사용)", examples=[10])
@@ -115,86 +115,6 @@ class ReceiptOCRResponse(BaseModel):
     total_amount: Optional[int] = Field(None, description="합계 금액 (원)", examples=[300000])
     items: list[ReceiptItem] = Field(default_factory=list, description="품목 목록")
     validation: ReceiptValidation
-
-
-# ══════════════════════════════════════════════
-# 매칭
-# ══════════════════════════════════════════════
-
-class UsageItem(BaseModel):
-    """사용내역서 단일 항목 (매칭 요청 시 입력)"""
-    seq: int = Field(..., description="항목 순번", examples=[1])
-    category_code: str = Field(..., description="안전관리비 항목 코드", examples=["CAT_03"])
-    used_on: str = Field(..., description="사용 일자 (YYYY-MM-DD)", examples=["2025-04-15"])
-    item_name: str = Field(..., description="품목명", examples=["안전모"])
-    total_amount: int = Field(..., description="합계 금액 (원)", examples=[150000])
-    remark: Optional[str] = Field(None, description="비고")
-
-
-class MatchRequest(BaseModel):
-    """POST /matching/run 요청"""
-    project_id: int = Field(..., description="프로젝트 ID", examples=[1])
-    usage_statement_id: int = Field(..., description="사용내역서 DB ID", examples=[1])
-    usage_items: list[UsageItem] = Field(..., description="사용내역서 항목 목록")
-    receipt_ocr_results: list[dict] = Field(
-        ...,
-        description="clova_ocr_receipt 파싱 결과 목록 (ReceiptOCRResponse 구조)",
-    )
-    photo_texts: Optional[dict[int, str]] = Field(
-        None,
-        description="현장사진 텍스트 {seq: OCR 텍스트} (선택)",
-    )
-    save_to_db: bool = Field(
-        True,
-        description="매칭 결과를 validation_logs에 저장할지 여부",
-    )
-
-
-class ComponentScores(BaseModel):
-    """매칭 세부 점수"""
-    date: Optional[float] = Field(None, description="날짜 일치 점수 (0~1)")
-    amount: Optional[float] = Field(None, description="금액 일치 점수 (0~1)")
-    vendor: Optional[float] = Field(None, description="업체명 유사도 (0~1)")
-    item_desc: Optional[float] = Field(None, description="품목명 유사도 (0~1)")
-
-
-class MatchResultItem(BaseModel):
-    """단일 항목의 매칭 결과"""
-    usage_item: UsageItem
-    receipt: Optional[dict] = Field(None, description="매칭된 영수증 요약 (없으면 null)")
-    match_status: str = Field(
-        ...,
-        description="매칭 상태",
-        examples=["matched"],
-    )
-    similarity_score: float = Field(..., description="종합 유사도 점수 (0~1)", examples=[0.97])
-    component_scores: ComponentScores
-    gate_failed: list[str] = Field(
-        default_factory=list,
-        description="실패한 Gate 목록",
-        examples=[["amount_gate"]],
-    )
-    reject_reason: Optional[str] = Field(None, description="rejected 사유")
-
-
-class MatchSummary(BaseModel):
-    """배치 매칭 요약"""
-    total: int
-    matched: int
-    review_needed: int
-    unmatched: int
-    rejected: int
-    match_rate_pct: float
-    review_rate_pct: float
-
-
-class MatchResponse(BaseModel):
-    """POST /matching/run 응답"""
-    batch_id: str = Field(..., description="배치 고유 ID (UUID)")
-    created_at: str = Field(..., description="실행 일시")
-    thresholds: dict = Field(..., description="사용된 임계값 {matched, review}")
-    summary: MatchSummary
-    results: list[MatchResultItem]
 
 
 # ══════════════════════════════════════════════
