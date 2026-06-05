@@ -750,14 +750,20 @@ def _run_vision_agent(project_id: int, usage_statement_id: int) -> dict[str, Any
             or ("현장사진 검토 보완 필요" if result_code == "hil" else "현장사진 검토 적정")
         )
         token = _int_or_none(body.get("token") or body.get("token_usage"))
-        details = body.get("details") if isinstance(body.get("details"), dict) else {}
+        source_details = body.get("details")
+        details = dict(source_details) if isinstance(source_details, dict) else {}
         details.setdefault("event", "vision_completed")
         details.setdefault("summary", reason)
-        details.setdefault("payload", {})
+        details["payload"] = dict(details.get("payload") or {})
+        vision_response = {
+            key: value
+            for key, value in body.items()
+            if key != "details"
+        }
         details["payload"].update(
             {
                 "photos": photos,
-                "vision_response": body,
+                "vision_response": vision_response,
                 "todos": todos,
             }
         )

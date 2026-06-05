@@ -1,0 +1,13 @@
+models/
+examples/
+tests/
+docs/
+__pycache__/
+*.pyc
+.gitignore
+.venv/
+.bentoml/
+.uv-bootstrap/
+.uv-cache/
+.uv-python/
+uv.lock.tmp

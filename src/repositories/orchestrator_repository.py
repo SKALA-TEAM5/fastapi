@@ -22,7 +22,13 @@ from src.repositories.db import get_connection
 
 
 RECEIPT_TYPES = {"receipt", "tax_invoice"}
-SITE_PHOTO_TYPES = {"site_photo"}
+SITE_PHOTO_TYPES = {
+    "site_photo",
+    "item_photo",
+    "wearing_photo",
+    "work_photo",
+    "tech_guidance_photo",
+}
 
 
 @dataclass(frozen=True)
@@ -265,6 +271,7 @@ def upsert_agent_log(
                 FROM agent_logs
                 WHERE project_id = %(project_id)s
                   AND usage_statement_id = %(usage_statement_id)s
+                  AND usage_statement_item_id IS NULL
                   AND agent_type_code = %(agent_type_code)s
                 ORDER BY id DESC
                 LIMIT 1

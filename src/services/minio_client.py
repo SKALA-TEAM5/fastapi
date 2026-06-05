@@ -15,11 +15,11 @@ from fastapi import HTTPException, status
 from src.core.config import (
     AWS_ACCESS_KEY_ID,
     AWS_SECRET_ACCESS_KEY,
-    AWS_REGION,
     S3_BUCKET,
     S3_ENDPOINT_URL,
     S3_PUBLIC_ENDPOINT_URL,
     S3_PRESIGNED_URL_EXPIRE_SECONDS,
+    S3_REGION,
 )
 
 
@@ -32,7 +32,7 @@ def _get_client(endpoint_url: str | None = None):
         )
     return boto3.client(
         "s3",
-        region_name=AWS_REGION,
+        region_name=S3_REGION,
         endpoint_url=endpoint_url or S3_ENDPOINT_URL or None,
         aws_access_key_id=AWS_ACCESS_KEY_ID or None,
         aws_secret_access_key=AWS_SECRET_ACCESS_KEY or None,
