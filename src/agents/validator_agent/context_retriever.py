@@ -54,7 +54,7 @@ def retrieve_category_context(
     category_docs = _retrieve_docs(question=category_query, retriever=retriever)
 
     item_docs: dict[str, list[Document]] = {}
-    with ThreadPoolExecutor(max_workers=min(max(len(block.items), 1), 4)) as executor:
+    with ThreadPoolExecutor(max_workers=min(max(len(block.items), 1), 2)) as executor:
         futures = {
             executor.submit(
                 _retrieve_docs,

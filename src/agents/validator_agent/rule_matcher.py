@@ -247,9 +247,8 @@ def match_category_rules(
     limit_pct, limit_rule, limit_laws = rules_repo.find_category_limit(block.category_name)
     progress_required_rate, progress_rule_text, progress_laws = rules_repo.find_progress_requirement(block.progress_rate)
 
-    # 항목별 병렬 처리 — LLM fallback 호출이 항목마다 독립적이므로 동시 실행 가능
-    # 항목 수에 비례하되 최대 5개 스레드로 제한 (Claude API rate limit 고려)
-    n_workers = min(max(len(block.items), 1), 5)
+    # 카테고리 검증도 병렬 실행되므로 항목별 동시 실행 수를 낮게 유지한다.
+    n_workers = min(max(len(block.items), 1), 2)
     item_bundles: list[ItemRuleBundle] = [None] * len(block.items)  # type: ignore[list-item]
 
     with ThreadPoolExecutor(max_workers=n_workers) as executor:
