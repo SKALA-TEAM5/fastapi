@@ -363,7 +363,7 @@ def _item_details(item, result: "CategoryAuditResult") -> dict:
 
 def _validate_blocks(base_amount: float, blocks, *, collection: str) -> AuditResponse:
     results: dict[str, CategoryAuditResult] = {}
-    with ThreadPoolExecutor(max_workers=min(max(len(blocks), 1), 5)) as executor:
+    with ThreadPoolExecutor(max_workers=min(max(len(blocks), 1), 2)) as executor:
         futures = {
             executor.submit(_validate_category_block, block, collection): block.category_name
             for block in blocks
