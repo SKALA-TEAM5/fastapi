@@ -57,7 +57,6 @@ from src.repositories.usage_statement_pipeline_repository import (
     _from_category_code,
     get_files_by_ids,
     insert_agent_log,
-    insert_evidence_file_link,
     insert_usage_statement,
     insert_usage_statement_items,
     insert_usage_statement_summaries,
@@ -309,6 +308,7 @@ def parse_usage_statement(usage_file_id: int) -> dict[str, Any]:
     parsed_usage: dict[str, Any] | None = None
     classifier_details: dict[str, Any] | None = None
     line_items: list[dict[str, Any]] = []
+    items_with_id: list[dict[str, Any]] = []
 
     try:
         with get_connection() as conn:
@@ -366,6 +366,17 @@ def parse_usage_statement(usage_file_id: int) -> dict[str, Any]:
             line_id_to_item_id = insert_usage_statement_items(
                 conn, usage_statement_id, line_items
             )
+            items_with_id = [
+                {
+                    "item_id":       line_id_to_item_id.get(item.get("line_id")),
+                    "category_code": item.get("category_code") or item.get("항목코드"),
+                    "used_on":       item.get("used_on") or item.get("사용일자"),
+                    "item_name":     item.get("item_name") or item.get("사용내역"),
+                    "total_amount":  item.get("total_amount") or item.get("금액"),
+                }
+                for item in line_items
+                if line_id_to_item_id.get(item.get("line_id"))
+            ]
             classifier_details = _attach_classifier_item_ids(
                 classifier_details or {},
                 line_id_to_item_id,
@@ -404,6 +415,7 @@ def parse_usage_statement(usage_file_id: int) -> dict[str, Any]:
         "usage_statement_id": usage_statement_id,
         "parse_status": (parsed_usage or {}).get("parse_status", "SUCCESS"),
         "item_count": len(line_items),
+        "items": items_with_id,
         "classifier_changed_count": classifier_changed_count,
         "elapsed_sec": elapsed,
     }
@@ -564,25 +576,7 @@ def run_link_pipeline(
                     and receipt_id in receipt_file_id_map
                 ):
                     file_id_for_receipt = receipt_file_id_map[receipt_id]
-                    # line_id는 이미 DB id(str)
-                    item_db_id = (
-                        int(line_id) if line_id and str(line_id).isdigit() else None
-                    )
-
-                    if item_db_id:
-                        receipt_file_info = file_map.get(file_id_for_receipt, {})
-                        evidence_type = receipt_file_info.get(
-                            "uploaded_evidence_type_code", "receipt"
-                        )
-
-                        insert_evidence_file_link(
-                            conn,
-                            usage_statement_item_id=item_db_id,
-                            file_id=file_id_for_receipt,
-                            evidence_type_code=evidence_type,
-                        )
-
-                    update_file_status(conn, file_id_for_receipt, "matched")
+                    update_file_status(conn, file_id_for_receipt, "success")
 
                 elif (
                     status in ("unmatched", "rejected")
@@ -590,14 +584,14 @@ def run_link_pipeline(
                     and receipt_id in receipt_file_id_map
                 ):
                     file_id_for_receipt = receipt_file_id_map[receipt_id]
-                    update_file_status(conn, file_id_for_receipt, "unmatched")
+                    update_file_status(conn, file_id_for_receipt, "fail")
 
             # ── 로그 completed ─────────────────────────────────────────────
             summary = batch.get("summary") or {}
             update_agent_log_status(
                 conn,
                 log_id=log_id,
-                status_code="completed",
+                status_code="success",
                 details={
                     "match_summary": summary,
                     "usage_statement_id": usage_statement_id,
