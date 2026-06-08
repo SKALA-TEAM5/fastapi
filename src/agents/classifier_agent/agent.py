@@ -69,8 +69,8 @@ _RDB_CLEAR_MARGIN = 2.0
 # RDB가 약한 신호라도 후보로 인정하는 최소 점수
 _RDB_MIN_SCORE = 2.0
 # predicted == given일 때 LLM 검증을 생략할 최소 점수
-# (이 값 미만이면 RDB 근거가 약하다고 보고 LLM에게 재확인)
-_LLM_VERIFY_SKIP_SCORE = 8.0
+# ※ predicted == given 케이스에서는 LLM 재검증 자체를 제거하여 상수 미사용
+_LLM_VERIFY_SKIP_SCORE = 8.0  # noqa: F841 — 하위 호환 보존, 실제 분기 제거됨
 
 # 인용 투표 비율이 이 값 이상이어야 신호로 인정
 _VOTE_RATIO_MIN = 0.6
@@ -723,28 +723,27 @@ def _item_status(
         if given_score > 0 and predicted_score <= 0:
             if given_score >= top_score:
                 return "유지", given_code, "", "rule(given_score_top)"
-            # 기존이 top도 아니고 예측 점수도 없는 경우 → LLM 위임
-            return _fallback_to_llm("given_not_top_no_predicted_score")
+            # 기존이 top도 아니고 예측 점수도 없는 경우 → 유지 (예측 근거 없음)
+            return "유지", given_code, "", "rule(given_not_top_no_predicted_score)"
 
         margin = predicted_score - given_score
         # 마진이 충분히 크지 않은 경우 → 유지 우선 (LLM은 마진 작을 때 신뢰 어려움)
         if given_score > 0 and margin < _RECLASSIFY_MARGIN_MIN:
             return "유지", given_code, "", "rule(low_margin_keep)"
 
-        # 신뢰도 미달 → LLM 위임
+        # 신뢰도 미달 → 유지 (확신 없을 때 기존 카테고리 보수적 유지)
         if predicted.confidence < _RECLASSIFY_CONFIDENCE_MIN:
-            return _fallback_to_llm(f"low_confidence:{predicted.confidence:.2f}")
+            return "유지", given_code, "", "rule(low_confidence_keep)"
 
-    # ── 3. 예측 == 기존이지만 RDB 근거가 충분히 강하지 않으면 유지
+    # ── 3. 예측 == 기존 → 두 신호가 일치하므로 LLM 재검증 없이 유지
     # score가 너무 낮으면 (<= 3.0) 신호 자체가 없는 것이므로 그냥 유지
-    # 3.0 ~ _LLM_VERIFY_SKIP_SCORE 사이면 LLM 검증
+    # predicted == given이면 RDB 강도·신뢰도와 무관하게 유지
+    # (분류 결과와 기존 카테고리가 일치하는 경우 LLM 재검증 불필요)
     if predicted.category_id == given_code:
         top_score = candidates[0].score if candidates else 0.0
         if top_score <= 3.0:
             return "유지", predicted.category_id, "", "rule(too_weak_signal_keep)"
-        if top_score < _LLM_VERIFY_SKIP_SCORE or predicted.confidence < _HUMAN_REVIEW_MIN_CONFIDENCE:
-            return _fallback_to_llm("predicted_equals_given_weak_rdb")
-        return "유지", predicted.category_id, "", "rule(rdb_strong_match)"
+        return "유지", predicted.category_id, "", "rule(rdb_agree_keep)"
 
     # ── 4. 사람 검토 필요 신호 → LLM 위임
     if predicted.needs_human_review:
