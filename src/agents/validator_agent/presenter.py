@@ -403,17 +403,15 @@ def _build_reason(
     """
     항목별 검토 사유를 생성한다.
 
-    항목명/금액/허용 여부는 코드가 확정하고, 각 항목의 reason 문장만 LLM이
-    원본 reasoning과 참조 법령을 바탕으로 재작성한다.
+    rule_matcher에서 LLM이 생성한 reason_text를 우선 사용하고,
+    없으면 reasoning을 그대로 사용한다. (별도 LLM 호출 없음)
     """
     lines: list[str] = []
     for item in getattr(result, "items", []) or []:
         verdict = "집행 가능" if item.allowed else "집행 불가"
-        item_reason = _synthesize_item_reason_with_llm(
-            category_name=category_name,
-            item=item,
-            result=result,
-        )
+        # rule_matcher에서 생성된 reason_text 우선 사용, 없으면 reasoning 사용
+        item_reason = getattr(item, "reason_text", "") or item.reasoning or ""
+        item_reason = _normalize_reason_output(item_reason)
         law_raw = item.referenced_laws[0] if item.referenced_laws else ""
         law = _qualify_law_for_display(law_raw) if law_raw else ""
 

@@ -56,6 +56,7 @@ class ItemJudgment(BaseModel):
     review_reason: str = Field(default="")
     exception_summary: str = Field(default="")
     judgment_source: str = Field(default="", description="판정 소스 (law_rule | qa_rule | corpus_fallback | llm_fallback | profile_fallback | none)")
+    reason_text: str = Field(default="", description="LLM이 생성한 사용자 표시용 사유 텍스트")
 
 
 class CategoryAuditResult(BaseModel):
