@@ -1,7 +1,7 @@
 """
 OCR 엔진 통합 디스패치 모듈
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-산업안전관리비 AI 검증 시스템 — src/ocr/ocr_engine.py
+산업안전관리비 AI 검증 시스템 — ocr_engine.py
 
 [역할]
   OCR_ENGINE 환경변수에 따라 CLOVA OCR 또는 VLM을 선택해 호출한다.
@@ -14,12 +14,7 @@ OCR 엔진 통합 디스패치 모듈
 [함수 목록]
   parse_receipt(file_path)              — 영수증 이미지 파싱
   parse_document_image(file_path, hint) — 거래명세표·임금명세서·세금계산서 이미지 파싱
-  get_engine_name()                     — 현재 엔진명 반환 (로깅용)
-
-[의존 모듈]
-  vlm_ocr.py            — VLM 실제 호출 구현 (Gemini / OpenAI)
-  clova_ocr_receipt.py  — CLOVA OCR 실제 호출 구현
-  receipt_validator.py  — 엔진 무관 공통 검증
+  get_engine_name()                     — 현재 엔진명 반환 (로깅·헤더 등 활용)
 """
 
 from __future__ import annotations

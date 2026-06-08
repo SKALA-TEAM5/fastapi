@@ -631,7 +631,8 @@ def _run_link_agent(
     try:
         result = run_link_pipeline(
             usage_statement_id=usage_statement_id,
-            file_ids=target_file_ids,
+            receipt_file_ids=receipt_file_ids,
+            tax_invoice_file_ids=tax_invoice_file_ids,
         )
         summary = result.get("summary") or {}
         issue_count = sum(

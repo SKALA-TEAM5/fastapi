@@ -1,37 +1,36 @@
 """
-VLM OCR — Vision Language Model 기반 증빙서류 인식 모듈
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-산업안전관리비 AI 검증 시스템 — src/ocr/vlm_ocr.py
+Vision Agent — VLM 기반 증빙서류 인식 모듈
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+현재: Google Gemini (gemini-3.1-flash-lite)
+OpenAI GPT-4o 계열도 VLM_PROVIDER=openai 로 전환 가능
 
-현재 기본 모델: Google Gemini (gemini-3.1-flash-lite)
-VLM_PROVIDER=openai 로 OpenAI GPT-4o 계열 전환 가능
-
-[핵심 설계 원칙]
-  - parse_vision_response() 출력 스키마 = parse_clova_response() 출력 스키마
-  - receipt_validator.validate_result() 재사용 → 다운스트림 매칭 엔진 변경 불필요
+핵심 설계 원칙:
+  - parse_vision_response()의 출력 스키마 = parse_clova_response()의 출력 스키마
+  - validate_result()를 그대로 재사용 → 다운스트림 매칭 엔진 변경 불필요
+  - VLM 결과는 반드시 DB(agent_logs)에 저장 → 동일 file_id 재처리 시 캐시 우선
   - VLM_PROVIDER 환경변수로 Gemini/OpenAI 전환 (코드 변경 불필요)
 
-[사용법]
-    from src.ocr.vlm_ocr import parse_vision_response
+사용법:
+    from src.ocr.vision_agent import parse_vision_response
 
-    result = parse_vision_response("영수증.jpg", type_hint="receipt")
+    result = parse_vision_response("영수증.jpg")
+    # result 구조는 parse_clova_response() 반환값과 동일
 
-[환경변수]
+환경변수 (.env):
     VLM_PROVIDER=gemini               # "gemini" | "openai"
 
-    # Gemini (기본값)
+    # Gemini (현재)
     GEMINI_API_KEY=AIza...
     GEMINI_MODEL=gemini-3.1-flash-lite
     GEMINI_MODEL_FALLBACK=gemini-2.5-flash
 
-    # OpenAI (VLM_PROVIDER=openai 전환 시)
+    # OpenAI (VLM_PROVIDER=openai 로 전환 시 사용)
     OPENAI_API_KEY=sk-...
     OPENAI_MODEL=gpt-4o-mini
     OPENAI_MODEL_FALLBACK=gpt-4o
 
-[주의]
-  현장사진 분석용 Vision Agent(orchestrator의 vision 에이전트)와 별개 모듈.
-  이 파일은 영수증·거래명세표 등 증빙서류 OCR 전용이다.
+설치:
+    pip install -r requirements.txt
 """
 
 from __future__ import annotations
