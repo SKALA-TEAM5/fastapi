@@ -184,14 +184,6 @@ class EvidenceValidationSummaryDraft(BaseModel):
     major_error: str
 
 
-class TaxSettlementRowDraft(BaseModel):
-    item_name: str
-    document_supply_amount: Decimal
-    execution_supply_amount: Decimal
-    vat_amount: Decimal
-    difference_label: str
-
-
 class ItemReviewDraft(BaseModel):
     no: int
     usage_statement_item_id: int
@@ -229,14 +221,6 @@ class IssueDetailDraft(BaseModel):
     required_action: str | None = None
 
 
-class SupplementActionDraft(BaseModel):
-    no: int
-    title: str
-    action: str
-    due_date_label: str
-    assignee: str
-
-
 class ReportTableDraft(BaseModel):
     """웹 화면과 DOCX 추출기가 같은 표를 그릴 수 있도록 보존하는 표 구조입니다."""
 
@@ -270,11 +254,9 @@ class ReportDraft(BaseModel):
     amount_summary: list[AmountSummaryDraft]
     category_summaries: list[CategorySummaryDraft]
     evidence_validation_summaries: list[EvidenceValidationSummaryDraft]
-    tax_settlement_rows: list[TaxSettlementRowDraft]
     conclusion: str
     item_reviews: list[ItemReviewDraft]
     issue_details: list[IssueDetailDraft]
-    supplement_actions: list[SupplementActionDraft]
     overall_opinion: str
     report_sections: list[ReportSectionDraft] = Field(default_factory=list)
     needs_human_review: list[str] = Field(default_factory=list)

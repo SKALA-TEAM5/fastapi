@@ -215,7 +215,6 @@ LLM이 수정할 수 있는 필드는 문장 필드로 제한됩니다.
 - `overall_opinion`
 - `issue_details[].agent_conclusion`
 - `issue_details[].required_action`
-- `supplement_actions[].action`
 
 LLM은 다음 필드를 바꿀 수 없습니다.
 
@@ -249,10 +248,8 @@ LLM은 다음 필드를 바꿀 수 없습니다.
 - 집행 금액 요약
 - 집행 항목 분류별 요약
 - 증빙 유형별 검증 현황
-- 세금 및 정산 결과
 - 항목별 적정성 검토 결과
 - 부적정/검토 필요 상세 내역
-- 보완 필요 사항
 - 종합 의견
 - `report_sections`: 실제 보고서 형식 렌더링용 섹션/표/문단 구조
 

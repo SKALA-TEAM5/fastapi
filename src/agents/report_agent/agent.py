@@ -28,8 +28,6 @@ from .schemas import (
     ReportDraft,
     ReportSectionDraft,
     ReportTableDraft,
-    SupplementActionDraft,
-    TaxSettlementRowDraft,
 )
 
 
@@ -114,7 +112,6 @@ class ReportAgent:
         item_reviews = [self._build_item_review(index, item) for index, item in enumerate(context.items, start=1)]
         issues = self._build_issues(item_reviews, context)
         evidence_summaries = self._build_evidence_summaries(context)
-        supplement_actions = self._build_supplement_actions(context, issues)
 
         conclusion = self._build_conclusion(issues)
         overall_opinion = self._build_overall_opinion(
@@ -162,11 +159,9 @@ class ReportAgent:
                 for summary in context.summaries
             ],
             evidence_validation_summaries=evidence_summaries,
-            tax_settlement_rows=self._build_tax_rows(context),
             conclusion=conclusion,
             item_reviews=item_reviews,
             issue_details=issues,
-            supplement_actions=supplement_actions,
             overall_opinion=overall_opinion,
             needs_human_review=self._find_missing_critical_inputs(context),
         )
@@ -289,49 +284,6 @@ class ReportAgent:
             for code in evidence_types
         ]
 
-    def _build_tax_rows(self, context: ReportContext) -> list[TaxSettlementRowDraft]:
-        rows: list[TaxSettlementRowDraft] = []
-        for item in context.items:
-            tax_logs = [log for log in item.validation_logs if "tax" in log.validation_type_code.lower() or log.details.get("evidence_type_code") == "tax_invoice"]
-            for log in tax_logs:
-                document_amount = Decimal(str(log.details.get("document_supply_amount", item.total_amount)))
-                execution_amount = Decimal(str(log.details.get("execution_supply_amount", item.total_amount)))
-                vat_amount = Decimal(str(log.details.get("vat_amount", 0)))
-                diff = execution_amount - document_amount
-                rows.append(
-                    TaxSettlementRowDraft(
-                        item_name=item.item_name,
-                        document_supply_amount=document_amount,
-                        execution_supply_amount=execution_amount,
-                        vat_amount=vat_amount,
-                        difference_label="일치" if diff == 0 else f"{diff:+,.0f}원 차이",
-                    )
-                )
-        return rows
-
-    def _build_supplement_actions(self, context: ReportContext, issues: list[IssueDetailDraft]) -> list[SupplementActionDraft]:
-        if context.action_requests:
-            return [
-                SupplementActionDraft(
-                    no=index,
-                    title=request.title,
-                    action=request.reason or request.title,
-                    due_date_label=request.due_date.strftime("%Y.%m.%d") if request.due_date else "미지정",
-                    assignee=request.assignee_name or "미지정",
-                )
-                for index, request in enumerate(context.action_requests, start=1)
-            ]
-        return [
-            SupplementActionDraft(
-                no=index,
-                title=issue.title,
-                action=issue.required_action or "보완 필요",
-                due_date_label="담당자 지정 필요",
-                assignee="미지정",
-            )
-            for index, issue in enumerate(issues, start=1)
-        ]
-
     def _build_conclusion(self, issues: list[IssueDetailDraft]) -> str:
         if not issues:
             return "제출된 사용내역서와 증빙자료 검토 결과, 중대한 부적정 또는 보완 필요 사항은 확인되지 않았습니다."
@@ -367,10 +319,6 @@ class ReportAgent:
         issues = self._merge_llm_issues(draft, payload.get("issue_details"))
         if issues is not draft.issue_details:
             update["issue_details"] = issues
-
-        actions = self._merge_llm_supplement_actions(draft, payload.get("supplement_actions"))
-        if actions is not draft.supplement_actions:
-            update["supplement_actions"] = actions
 
         merged = draft.model_copy(update=update)
         return merged.model_copy(update={"report_sections": self._build_report_sections(merged)})
@@ -532,26 +480,6 @@ class ReportAgent:
         if not updates:
             return draft.issue_details
         return [updates.get(issue.no, issue) for issue in draft.issue_details]
-
-    def _merge_llm_supplement_actions(self, draft: ReportDraft, payload: object):
-        if not isinstance(payload, list):
-            return draft.supplement_actions
-
-        by_no = {action.no: action for action in draft.supplement_actions}
-        updates = {}
-        for row in payload:
-            if not isinstance(row, dict):
-                continue
-            no = row.get("no")
-            if no not in by_no:
-                continue
-            value = row.get("action")
-            if isinstance(value, str) and value.strip():
-                updates[no] = by_no[no].model_copy(update={"action": value.strip()})
-
-        if not updates:
-            return draft.supplement_actions
-        return [updates.get(action.no, action) for action in draft.supplement_actions]
 
     def _find_missing_critical_inputs(self, context: ReportContext) -> list[str]:
         missing: list[str] = []

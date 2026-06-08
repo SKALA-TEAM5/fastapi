@@ -123,7 +123,7 @@ legal success/success 또는 success/hil
 -> SHE 담당자가 수정
 ```
 
-legal이 `success/hil`인 경우에도 보고서 초안은 생성한다. 이때 report는 legal의 보완·검토 필요 항목을 보고서 상세 이슈와 보완 필요 사항에 반영한다.
+legal이 `success/hil`인 경우에도 보고서 초안은 생성한다. 이때 report는 legal의 보완·검토 필요 항목을 보고서 상세 이슈의 조치 사항과 종합 의견에 반영한다.
 
 ## agent_logs 규칙
 
