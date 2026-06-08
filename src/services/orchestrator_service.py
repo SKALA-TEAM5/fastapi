@@ -41,6 +41,7 @@ from src.repositories.orchestrator_repository import (
     insert_agent_usage_record,
     scan_orchestrator_state,
     select_evidence_agents,
+    update_file_details,
     update_file_statuses,
     upsert_agent_log,
 )
@@ -726,6 +727,88 @@ def _aggregate_orchestrator_result_code(results: dict[str, Any]) -> str:
     return "success"
 
 
+def _as_dict(value: Any) -> dict[str, Any]:
+    return value if isinstance(value, dict) else {}
+
+
+def _as_list(value: Any) -> list[Any]:
+    return value if isinstance(value, list) else []
+
+
+def _vision_result_rows(body: dict[str, Any], details: dict[str, Any]) -> list[dict[str, Any]]:
+    candidates: list[Any] = [
+        *(_as_list(body.get("results"))),
+        *(_as_list(_as_dict(body.get("result")).get("results"))),
+        *(_as_list(_as_dict(details.get("result")).get("results"))),
+    ]
+    payload = _as_dict(details.get("payload"))
+    vision_response = _as_dict(payload.get("vision_response")) or _as_dict(payload.get("visionResponse"))
+    candidates.extend(_as_list(vision_response.get("results")))
+    candidates.extend(_as_list(_as_dict(vision_response.get("result")).get("results")))
+
+    if not candidates and body.get("file_id") is not None:
+        candidates.append(body)
+
+    return [row for row in candidates if isinstance(row, dict)]
+
+
+def _vision_file_details(
+    *,
+    body: dict[str, Any],
+    details: dict[str, Any],
+    photos: list[dict[str, Any]],
+    usage_statement_id: int,
+    reason: str,
+    result_code: str,
+) -> dict[int, dict[str, Any]]:
+    photo_by_file_id = {
+        int(photo["file_id"]): photo
+        for photo in photos
+        if photo.get("file_id") is not None
+    }
+    rows = _vision_result_rows(body, details)
+
+    if not rows and len(photo_by_file_id) == 1 and body.get("detections"):
+        only_file_id = next(iter(photo_by_file_id))
+        rows = [{**body, "file_id": only_file_id}]
+
+    result: dict[int, dict[str, Any]] = {}
+    for row in rows:
+        raw_file_id = row.get("file_id") or row.get("fileId")
+        if raw_file_id is None:
+            continue
+        try:
+            file_id = int(raw_file_id)
+        except (TypeError, ValueError):
+            continue
+
+        nested_result = _as_dict(row.get("result")) or row
+        detections = _as_list(nested_result.get("detections"))
+        result[file_id] = {
+            "vision_validation": {
+                "usage_statement_id": usage_statement_id,
+                "status_code": str(body.get("status_code") or "success").lower(),
+                "result_code": result_code,
+                "reason": str(row.get("reason") or row.get("message") or reason),
+                "original_filename": (
+                    row.get("original_filename")
+                    or row.get("originalFilename")
+                    or photo_by_file_id.get(file_id, {}).get("original_filename")
+                ),
+                "image_width": nested_result.get("image_width") or nested_result.get("imageWidth"),
+                "image_height": nested_result.get("image_height") or nested_result.get("imageHeight"),
+                "is_appropriate": (
+                    row.get("is_appropriate")
+                    if row.get("is_appropriate") is not None
+                    else row.get("isAppropriate", nested_result.get("is_appropriate", nested_result.get("isAppropriate")))
+                ),
+                "detections": detections,
+            }
+        }
+
+    return result
+
+
 def _run_vision_agent(
     project_id: int,
     usage_statement_id: int,
@@ -836,6 +919,17 @@ def _run_vision_agent(
                 "vision_response": vision_response,
                 "todos": todos,
             }
+        )
+        update_file_details(
+            project_id=project_id,
+            details_by_file_id=_vision_file_details(
+                body=body,
+                details=details,
+                photos=photos,
+                usage_statement_id=usage_statement_id,
+                reason=reason,
+                result_code=result_code,
+            ),
         )
 
         upsert_agent_log(
