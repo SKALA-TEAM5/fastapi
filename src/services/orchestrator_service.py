@@ -1001,7 +1001,12 @@ def _run_legal_agent(
             for result in summary_response.results
         ]
         review_count = sum(1 for row in item_results if row["status"] != "적절")
-        result_code = "hil" if review_count else "success"
+        # exceeded/shortfall은 항목 status에 반영 안 하므로 카테고리 레벨에서 별도 체크
+        category_issue_count = sum(
+            1 for s in summary_response.results
+            if s.status in {"부적절", "검토필요"}
+        )
+        result_code = "hil" if (review_count or category_issue_count) else "success"
         reason = "법령 검토 결과 특이사항 없음" if review_count == 0 else f"법령 검토 결과 보고서 반영 대상 {review_count}건"
         todos = [
             {
@@ -1243,7 +1248,7 @@ def _legal_item_results_from_audit(
                     "item_id": raw_item["행ID"],
                     "category_code": category_code,
                     "status": status,
-                    "reason": judgment.review_reason or judgment.reasoning or (summary.reason if summary else ""),
+                    "reason": judgment.reason_text or judgment.review_reason or judgment.reasoning or "",
                     "citations": citations,
                 }
             )
@@ -1251,12 +1256,12 @@ def _legal_item_results_from_audit(
 
 
 def _legal_status_from_judgment(judgment, category_status: str) -> str:
-    if judgment.needs_human_review:
-        return "검토필요"
     if not judgment.allowed:
+        if judgment.needs_human_review:
+            return "검토필요"
         return "부적절"
-    if category_status in {"부적절", "검토필요"}:
-        return category_status
+    # allowed=True이면 needs_human_review 포함 모두 적절.
+    # 전담 여부 등 조건/주의사항은 reason_text에 남긴다.
     return "적절"
 
 
