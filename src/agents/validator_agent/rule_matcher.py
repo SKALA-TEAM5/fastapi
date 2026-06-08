@@ -23,7 +23,7 @@ from pydantic import BaseModel, Field
 import src.core.llm_config as llm_config
 from src.agents.validator_agent.context_retriever import CategoryRetrievedContext
 from src.agents.validator_agent.parser import CategoryInputBlock, CategoryItemRow
-from src.prompts.validator_prompt import ITEM_JUDGMENT_PROMPT
+from src.prompts.validator_prompt import ITEM_JUDGMENT_PROMPT, ITEM_REASON_ONLY_PROMPT
 from src.repositories import LegalRulesRepository, ValidatorRuleMatch
 
 _PROGRESS_RULE_LAW = "별표 3 공사진척에 따른 산업안전보건관리비 사용기준"
@@ -33,11 +33,17 @@ _RDB_MATCH_SCORE_THRESHOLD = 1.5
 
 
 class _ItemJudgmentLLMOutput(BaseModel):
-    """LLM 항목 판단 결과"""
+    """LLM 항목 판단 결과 (판단 + 사유 동시 생성)"""
     allowed: bool | None = Field(description="허용 여부 (불확실하면 null)")
     confidence: float = Field(description="판정 확신도 0.0~1.0")
-    reasoning: str = Field(description="판정 근거 (법령 맥락 기반)")
+    reasoning: str = Field(description="내부 판단 근거 (Chain of Thought)")
+    reason_text: str = Field(default="", description="사용자 표시용 사유 (2~3문장 합니다체)")
     referenced_laws: list[str] = Field(default=[], description="참조 법령 조항")
+
+
+class _ItemReasonOnlyLLMOutput(BaseModel):
+    """LLM 사유 전용 출력 (RDB 확정 항목용)"""
+    reason_text: str = Field(description="사용자 표시용 사유 (2~3문장 합니다체)")
 
 
 @dataclass
@@ -47,6 +53,7 @@ class ItemRuleBundle:
     context_text: str
     item_exception_text: str = ""
     judgment_tier: str = "rdb"  # "rdb" | "llm" — 항목 판정에 사용된 계층
+    reason_text: str = ""       # LLM이 생성한 사용자 표시용 사유
 
     @property
     def top_allowed(self) -> ValidatorRuleMatch | None:
@@ -117,27 +124,95 @@ def _has_rdb_disallowed_match(matches: list[ValidatorRuleMatch], category_code: 
     )
 
 
+def _has_strong_allowed_match(matches: list[ValidatorRuleMatch], category_code: str) -> bool:
+    """강한 허용 RDB 매칭 여부 확인 — 이 경우 LLM 판단 스킵 가능."""
+    return any(
+        m.match_source in _AUTHORITATIVE_SOURCES
+        and m.score >= 3.5
+        and m.category_code == category_code
+        and m.allowed is True
+        for m in matches
+    )
+
+
+def _select_exception_context(context_text: str, limit: int = 1500) -> str:
+    """Qdrant 청크에서 예외/단서 조항이 있는 부분만 선별해 LLM에 넘긴다.
+    예외 문구가 없으면 앞부분만 반환."""
+    _EXCEPTION_KEYWORDS = ("단,", "다만", "제외", "불가", "아니한", "이외")
+    lines = context_text.split("\n")
+    selected: list[str] = []
+    total = 0
+    for line in lines:
+        if any(kw in line for kw in _EXCEPTION_KEYWORDS):
+            selected.append(line)
+            total += len(line)
+        if total >= limit:
+            break
+    if not selected:
+        return context_text[:limit]
+    return "\n".join(selected)[:limit]
+
+
+def _llm_generate_reason_only(
+    *,
+    item_text: str,
+    category_name: str,
+    allowed: bool,
+    rdb_evidence: str,
+    referenced_laws: list[str],
+    retrieved_context: str = "",
+) -> str:
+    """RDB 확정 항목에 대해 사유 텍스트만 LLM으로 생성한다.
+    RDB evidence + Qdrant 원문 맥락을 함께 제공해 풍부한 사유를 생성한다.
+    """
+    try:
+        llm = llm_config.get()
+    except RuntimeError:
+        return rdb_evidence[:200] if rdb_evidence else ""
+
+    verdict = "허용" if allowed else "불허"
+    laws_str = ", ".join(referenced_laws[:3]) if referenced_laws else "(법령 미확인)"
+    # Qdrant 원문: 예외/단서 조항 위주로 선별
+    law_context = _select_exception_context(retrieved_context)[:1200] if retrieved_context else ""
+    try:
+        result: _ItemReasonOnlyLLMOutput = (
+            ITEM_REASON_ONLY_PROMPT
+            | llm.with_structured_output(_ItemReasonOnlyLLMOutput)
+        ).invoke(
+            {
+                "category_name": category_name,
+                "item_text": item_text,
+                "verdict": verdict,
+                "rdb_evidence": rdb_evidence[:400] if rdb_evidence else "(근거 없음)",
+                "referenced_laws": laws_str,
+                "law_context": law_context if law_context else "(원문 없음)",
+            }
+        )
+        return result.reason_text or ""
+    except Exception:
+        return rdb_evidence[:200] if rdb_evidence else ""
+
+
 def _llm_item_fallback(
     *,
     item_text: str,
     category_name: str,
     category_code: str,
     retrieved_context: str,
-) -> ValidatorRuleMatch | None:
+) -> tuple[ValidatorRuleMatch | None, str]:
     """
-    RDB 규칙 미매칭 시 LLM이 법령 맥락을 읽고 허용 여부 판단.
+    RDB 규칙 미매칭 시 LLM이 법령 맥락을 읽고 허용 여부 판단 + 사유 동시 생성.
 
-    Tier 2: 법령 조항을 읽고 맥락상 허용 가능 → allowed=True
-    Tier 3: 법령 취지와 무관하거나 명시 불가 → allowed=False
-    판단 불가 → None 반환 (기존 profile fallback으로 위임)
+    반환: (ValidatorRuleMatch | None, reason_text)
+    판단 불가 → (None, "") 반환
     """
     try:
         llm = llm_config.get()
     except RuntimeError:
-        return None
+        return None, ""
 
-    # 컨텍스트가 너무 길면 앞부분만 사용
-    law_context = retrieved_context[:2000] if retrieved_context else "(관련 법령 맥락 없음)"
+    # 예외/단서 조항 위주로 선별 (lost in the middle 방지)
+    law_context = _select_exception_context(retrieved_context) if retrieved_context else "(관련 법령 맥락 없음)"
 
     try:
         result: _ItemJudgmentLLMOutput = (
@@ -151,30 +226,30 @@ def _llm_item_fallback(
             }
         )
     except Exception:
-        return None
+        return None, ""
 
     if result.allowed is None:
-        return None
+        # 판단 불가(애매) — reason_text는 살려서 "현장 확인 필요" 멘트 유지
+        return None, result.reason_text or ""
 
-    # confidence가 너무 낮으면 불확실하다고 보고 None 반환
     if result.confidence < 0.4:
-        return None
+        return None, result.reason_text or ""
 
-    # score: LLM confidence를 scale해서 부여 (profile fallback 4.0~5.5 보다 높게)
     score = 5.0 + result.confidence * 2.0
 
-    return ValidatorRuleMatch(
+    match = ValidatorRuleMatch(
         category_code=category_code,
         category_name=category_name,
         rule_type="llm_judgment",
         allowed=result.allowed,
         score=score,
-        evidence=result.reasoning[:220] if result.reasoning else "",
+        evidence="",  # llm_fallback은 법령 원문 근거 없음 — reasoning은 ItemJudgment.reasoning에만 저장
         referenced_laws=result.referenced_laws,
         limit_pct=None,
         source_id="llm_fallback",
         match_source="llm_fallback",
     )
+    return match, result.reason_text or ""
 
 
 def _process_single_item(
@@ -200,6 +275,12 @@ def _process_single_item(
             if any(keyword in (doc.page_content or "") for keyword in ("단,", "다만", "제외", "불가"))
         ),
     )
+    # 비고(remark)가 있으면 항목명에 붙여서 LLM 판단 정확도 향상
+    # 예: "안전표지판 설치 (현장 진입로 표지판)" → LLM이 용도를 명확히 파악
+    item_text_with_remark = (
+        f"{item.item_name} ({item.remark})" if item.remark else item.item_name
+    )
+
     matches = rules_repo.find_validator_matches(
         category=block.category_name,
         item_text=item.item_name,
@@ -208,24 +289,48 @@ def _process_single_item(
     )
 
     # 계층 판단:
-    # 강한 불허 RDB 매칭 → LLM 스킵 (불허 규칙은 명시적·구체적, 과매칭 위험 낮음)
-    # 허용만 있거나 RDB 약함 → LLM fallback 호출
-    #   ↳ 허용 규칙은 키워드 겹침으로 과매칭 가능 ('소화기 허용' → '사무실 소화기' 오인식)
-    #   ↳ LLM이 항목명·맥락을 읽고 실제 허용 여부를 재검증함
+    # 1. 강한 불허 RDB → LLM 판단 스킵, 사유만 LLM 생성
+    # 2. 강한 허용 RDB → LLM 판단 스킵, 사유만 LLM 생성
+    # 3. 애매함 → LLM이 판단 + 사유 동시 생성
+    reason_text = ""
+
     if _has_rdb_disallowed_match(matches, block.category_code):
+        # 강한 불허 → 판단은 RDB, 사유만 LLM
         judgment_tier = "rdb"
+        best = next((m for m in matches if m.allowed is False and m.match_source in _AUTHORITATIVE_SOURCES), None)
+        reason_text = _llm_generate_reason_only(
+            item_text=item_text_with_remark,
+            category_name=block.category_name,
+            allowed=False,
+            rdb_evidence=best.evidence if best else "",
+            referenced_laws=best.referenced_laws if best else [],
+            retrieved_context=context_text,
+        )
+    elif _has_strong_allowed_match(matches, block.category_code):
+        # 강한 허용 → 판단은 RDB, 사유만 LLM
+        judgment_tier = "rdb"
+        best = next((m for m in matches if m.allowed is True and m.match_source in _AUTHORITATIVE_SOURCES), None)
+        reason_text = _llm_generate_reason_only(
+            item_text=item_text_with_remark,
+            category_name=block.category_name,
+            allowed=True,
+            rdb_evidence=best.evidence if best else "",
+            referenced_laws=best.referenced_laws if best else [],
+            retrieved_context=context_text,
+        )
     else:
-        llm_match = _llm_item_fallback(
-            item_text=item.item_name,
+        # 애매함 → LLM 판단 + 사유 동시
+        llm_match, reason_text = _llm_item_fallback(
+            item_text=item_text_with_remark,
             category_name=block.category_name,
             category_code=block.category_code,
             retrieved_context=context_text,
         )
         if llm_match is not None:
             if _has_rdb_match(matches, block.category_code):
-                matches = matches + [llm_match]   # RDB 있음 → LLM은 보조
+                matches = matches + [llm_match]
             else:
-                matches = [llm_match] + matches   # RDB 없음 → LLM이 주 판단
+                matches = [llm_match] + matches
         judgment_tier = "llm"
 
     return ItemRuleBundle(
@@ -234,6 +339,7 @@ def _process_single_item(
         context_text=context_text,
         item_exception_text=item_exception_text,
         judgment_tier=judgment_tier,
+        reason_text=reason_text,
     )
 
 

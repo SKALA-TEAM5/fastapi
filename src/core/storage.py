@@ -124,6 +124,7 @@ def load_vectorstore(
                     client=_get_qdrant_client(url),
                     collection_name=collection,
                     embedding=embeddings,
+                    validate_collection_config=False,
                 )
     return _vectorstore_cache[key]
 
