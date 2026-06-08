@@ -85,6 +85,7 @@ def check_missing_evidence(
             "db_name": settings.db_name,
             "db_user": settings.db_user,
         },
+        "model_name": settings.chat_model,
         "input_from_db_views": json.loads(build_user_prompt(ai_input)),
         "ai_response": asdict(ai_output),
         "saved_requirements": saved_requirements,

@@ -13,6 +13,7 @@ from __future__ import annotations
 
 from collections import Counter
 from datetime import date
+import os
 from typing import Any, cast
 from uuid import uuid4
 
@@ -37,6 +38,7 @@ from src.repositories.orchestrator_repository import (
     list_latest_agent_logs,
     list_usage_statement_item_ids,
     mark_orchestrator,
+    insert_agent_usage_record,
     scan_orchestrator_state,
     select_evidence_agents,
     update_file_statuses,
@@ -78,6 +80,12 @@ def parse_and_classify_usage_statement(file_id: int) -> OrchestratorActionRespon
             reason=summary,
             details=classifier_details,
             model_name="classifier_agent",
+        )
+        _record_agent_usage(
+            project_id=project_id,
+            usage_statement_id=usage_statement_id,
+            agent_type_code="classi",
+            model_name=_openai_model_name(),
         )
         mark_orchestrator(
             project_id=project_id,
@@ -184,6 +192,12 @@ def classify_existing_usage_statement(
             reason=summary,
             details=details,
             model_name="classifier_agent",
+        )
+        _record_agent_usage(
+            project_id=request.project_id,
+            usage_statement_id=request.usage_statement_id,
+            agent_type_code="classi",
+            model_name=_openai_model_name(),
         )
         mark_orchestrator(
             project_id=request.project_id,
@@ -345,11 +359,11 @@ def run_evidence_review(
     results: dict[str, Any] = {}
     for agent in target_agents:
         if agent == "safety-doc":
-            results[agent] = _run_safety_doc_agent(project_id, usage_statement_id)
+            results[agent] = _run_safety_doc_agent(project_id, usage_statement_id, requested_by_user_id=requested_by_user_id)
         elif agent == "link":
-            results[agent] = _run_link_agent(project_id, usage_statement_id)
+            results[agent] = _run_link_agent(project_id, usage_statement_id, requested_by_user_id=requested_by_user_id)
         elif agent == "vision":
-            results[agent] = _run_vision_agent(project_id, usage_statement_id)
+            results[agent] = _run_vision_agent(project_id, usage_statement_id, requested_by_user_id=requested_by_user_id)
 
     result_code = _aggregate_orchestrator_result_code(results)
     mark_orchestrator(
@@ -486,7 +500,12 @@ def run_report_draft(
     )
 
 
-def _run_safety_doc_agent(project_id: int, usage_statement_id: int) -> dict[str, Any]:
+def _run_safety_doc_agent(
+    project_id: int,
+    usage_statement_id: int,
+    *,
+    requested_by_user_id: int | None = None,
+) -> dict[str, Any]:
     item_ids = list_usage_statement_item_ids(usage_statement_id)
     upsert_agent_log(
         project_id=project_id,
@@ -515,10 +534,15 @@ def _run_safety_doc_agent(project_id: int, usage_statement_id: int) -> dict[str,
             if hil_item_ids
             else "필수 증빙 누락 없음"
         )
-        token = sum(
-            int(((_dict_or_empty(_dict_or_empty(row.get("result")).get("ai_response")).get("usage") or {}).get("total_tokens")) or 0)
+        usage_tokens = _sum_usage_tokens(
+            _dict_or_empty(_dict_or_empty(row.get("result")).get("ai_response")).get("usage")
             for row in item_results
         )
+        token = usage_tokens["input_tokens"] + usage_tokens["output_tokens"]
+        model_name = _first_string(
+            _dict_or_empty(row.get("result")).get("model_name")
+            for row in item_results
+        ) or "safety_doc_agent"
         todos = [
             {
                 "usage_statement_item_id": row["item_id"],
@@ -545,8 +569,19 @@ def _run_safety_doc_agent(project_id: int, usage_statement_id: int) -> dict[str,
                     "todos": todos,
                 },
             },
-            model_name="safety_doc_agent",
+            model_name=model_name,
             token=token,
+        )
+        _record_agent_usage(
+            project_id=project_id,
+            usage_statement_id=usage_statement_id,
+            agent_type_code="safety-doc",
+            model_name=model_name,
+            token=token,
+            input_tokens=usage_tokens["input_tokens"],
+            output_tokens=usage_tokens["output_tokens"],
+            cached_input_tokens=usage_tokens["cached_input_tokens"],
+            requested_by_user_id=requested_by_user_id,
         )
         return {
             "status_code": "success",
@@ -558,7 +593,12 @@ def _run_safety_doc_agent(project_id: int, usage_statement_id: int) -> dict[str,
         return _mark_agent_failed(project_id, usage_statement_id, "safety-doc", exc)
 
 
-def _run_link_agent(project_id: int, usage_statement_id: int) -> dict[str, Any]:
+def _run_link_agent(
+    project_id: int,
+    usage_statement_id: int,
+    *,
+    requested_by_user_id: int | None = None,
+) -> dict[str, Any]:
     grouped_files = list_evidence_file_ids_by_type(project_id)
     receipt_file_ids = [
         file_id
@@ -591,8 +631,7 @@ def _run_link_agent(project_id: int, usage_statement_id: int) -> dict[str, Any]:
     try:
         result = run_link_pipeline(
             usage_statement_id=usage_statement_id,
-            receipt_file_ids=receipt_file_ids,
-            tax_invoice_file_ids=tax_invoice_file_ids,
+            file_ids=target_file_ids,
         )
         summary = result.get("summary") or {}
         issue_count = sum(
@@ -628,6 +667,13 @@ def _run_link_agent(project_id: int, usage_statement_id: int) -> dict[str, Any]:
                 "payload": {**result, "todos": todos},
             },
             model_name="link_pipeline",
+        )
+        _record_agent_usage(
+            project_id=project_id,
+            usage_statement_id=usage_statement_id,
+            agent_type_code="link",
+            model_name="link_pipeline",
+            requested_by_user_id=requested_by_user_id,
         )
         return {
             "status_code": "success",
@@ -679,7 +725,12 @@ def _aggregate_orchestrator_result_code(results: dict[str, Any]) -> str:
     return "success"
 
 
-def _run_vision_agent(project_id: int, usage_statement_id: int) -> dict[str, Any]:
+def _run_vision_agent(
+    project_id: int,
+    usage_statement_id: int,
+    *,
+    requested_by_user_id: int | None = None,
+) -> dict[str, Any]:
     photo_files = list_evidence_files_by_type(project_id, SITE_PHOTO_TYPES)
     if not photo_files:
         return {"status_code": "skipped", "result_code": None, "reason": "현장사진 파일 없음"}
@@ -764,7 +815,10 @@ def _run_vision_agent(project_id: int, usage_statement_id: int) -> dict[str, Any
             file_ids=photo_file_ids,
             status_code="success" if result_code == "success" else "fail",
         )
+        usage_tokens = _usage_tokens_from_usage(body.get("usage") or body.get("token_usage") or body)
         token = _int_or_none(body.get("token") or body.get("token_usage"))
+        if token is None:
+            token = usage_tokens["input_tokens"] + usage_tokens["output_tokens"]
         source_details = body.get("details")
         details = dict(source_details) if isinstance(source_details, dict) else {}
         details.setdefault("event", "vision_completed")
@@ -793,6 +847,17 @@ def _run_vision_agent(project_id: int, usage_statement_id: int) -> dict[str, Any
             details=details,
             model_name=str(body.get("model_name") or "vision_agent"),
             token=token,
+        )
+        _record_agent_usage(
+            project_id=project_id,
+            usage_statement_id=usage_statement_id,
+            agent_type_code="vision",
+            model_name=str(body.get("model_name") or "vision_agent"),
+            token=token,
+            input_tokens=usage_tokens["input_tokens"],
+            output_tokens=usage_tokens["output_tokens"],
+            cached_input_tokens=usage_tokens["cached_input_tokens"],
+            requested_by_user_id=requested_by_user_id,
         )
         return {
             "status_code": status_code,
@@ -871,6 +936,13 @@ def _run_legal_agent(
             },
             model_name="validator_agent",
         )
+        _record_agent_usage(
+            project_id=project_id,
+            usage_statement_id=usage_statement_id,
+            agent_type_code="legal",
+            model_name=_openai_model_name(),
+            requested_by_user_id=she_user_id,
+        )
         return {
             "status_code": "success",
             "result_code": result_code,
@@ -913,7 +985,10 @@ def _run_report_agent(
                 report_written_date=written_date,
                 report_period_label=f"{usage_statement['report_month']:%Y년 %m월}",
             )
-        draft = ReportAgent().generate(context)
+        report_agent = ReportAgent()
+        draft = report_agent.generate(context)
+        usage_tokens = _usage_tokens_from_report_agent(report_agent)
+        report_model_name = _report_agent_model_name(report_agent)
         report_draft = draft.model_dump(mode="json")
         result = {"reportDraft": report_draft, "run_id": str(uuid4())}
         upsert_agent_log(
@@ -933,7 +1008,17 @@ def _run_report_agent(
                     "reportDraft": report_draft,
                 },
             },
-            model_name="report_agent",
+            model_name=report_model_name,
+        )
+        _record_agent_usage(
+            project_id=project_id,
+            usage_statement_id=usage_statement_id,
+            agent_type_code="report",
+            model_name=report_model_name,
+            input_tokens=usage_tokens["input_tokens"],
+            output_tokens=usage_tokens["output_tokens"],
+            cached_input_tokens=usage_tokens["cached_input_tokens"],
+            requested_by_user_id=she_user_id,
         )
         return {
             "agent_type_code": "report",
@@ -1087,6 +1172,122 @@ def _number_or_none(value: Any) -> float | None:
         return float(value)
     except (TypeError, ValueError):
         return None
+
+
+def _record_agent_usage(
+    *,
+    project_id: int,
+    usage_statement_id: int,
+    agent_type_code: str,
+    model_name: str | None = None,
+    token: int | None = None,
+    input_tokens: int | None = None,
+    output_tokens: int | None = None,
+    cached_input_tokens: int | None = None,
+    requested_by_user_id: int | None = None,
+) -> None:
+    try:
+        insert_agent_usage_record(
+            project_id=project_id,
+            usage_statement_id=usage_statement_id,
+            agent_type_code=agent_type_code,
+            model_name=model_name,
+            token=token,
+            input_tokens=input_tokens,
+            output_tokens=output_tokens,
+            cached_input_tokens=cached_input_tokens,
+            requested_by_user_id=requested_by_user_id,
+        )
+    except Exception:
+        return
+
+
+def _usage_tokens_from_report_agent(report_agent: ReportAgent) -> dict[str, int]:
+    llm_client = getattr(report_agent, "llm_client", None)
+    return _usage_tokens_from_usage(getattr(llm_client, "last_usage", None))
+
+
+def _report_agent_model_name(report_agent: ReportAgent) -> str:
+    llm_client = getattr(report_agent, "llm_client", None)
+    model_name = getattr(llm_client, "model", None)
+    return model_name if isinstance(model_name, str) and model_name.strip() else "report_agent"
+
+
+def _sum_usage_tokens(usages) -> dict[str, int]:
+    total = {"input_tokens": 0, "output_tokens": 0, "cached_input_tokens": 0}
+    for usage in usages:
+        tokens = _usage_tokens_from_usage(usage)
+        total["input_tokens"] += tokens["input_tokens"]
+        total["output_tokens"] += tokens["output_tokens"]
+        total["cached_input_tokens"] += tokens["cached_input_tokens"]
+    return total
+
+
+def _usage_tokens_from_usage(usage: Any) -> dict[str, int]:
+    usage_dict = _usage_dict(usage)
+    input_tokens = _first_int(
+        usage_dict.get("input_tokens"),
+        usage_dict.get("prompt_tokens"),
+        usage_dict.get("inputTokenCount"),
+        usage_dict.get("promptTokenCount"),
+    )
+    output_tokens = _first_int(
+        usage_dict.get("output_tokens"),
+        usage_dict.get("completion_tokens"),
+        usage_dict.get("candidatesTokenCount"),
+        usage_dict.get("outputTokenCount"),
+        usage_dict.get("completionTokenCount"),
+    )
+    total_tokens = _first_int(
+        usage_dict.get("total_tokens"),
+        usage_dict.get("totalTokenCount"),
+        usage_dict.get("totalToken"),
+    )
+    cached_input_tokens = _first_int(
+        usage_dict.get("cached_tokens"),
+        usage_dict.get("cached_input_tokens"),
+        usage_dict.get("cachedContentTokenCount"),
+        _usage_dict(usage_dict.get("input_tokens_details")).get("cached_tokens"),
+        _usage_dict(usage_dict.get("prompt_tokens_details")).get("cached_tokens"),
+    )
+    if input_tokens == 0 and output_tokens == 0 and total_tokens > 0:
+        input_tokens = total_tokens
+    return {
+        "input_tokens": input_tokens,
+        "output_tokens": output_tokens,
+        "cached_input_tokens": min(cached_input_tokens, input_tokens),
+    }
+
+
+def _usage_dict(usage: Any) -> dict[str, Any]:
+    if isinstance(usage, dict):
+        return usage
+    if hasattr(usage, "model_dump"):
+        dumped = usage.model_dump()
+        return dumped if isinstance(dumped, dict) else {}
+    if hasattr(usage, "dict"):
+        dumped = usage.dict()
+        return dumped if isinstance(dumped, dict) else {}
+    return {}
+
+
+def _first_int(*values: Any) -> int:
+    for value in values:
+        parsed = _int_or_none(value)
+        if parsed is not None:
+            return max(parsed, 0)
+    return 0
+
+
+def _first_string(values) -> str | None:
+    for value in values:
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+    return None
+
+
+def _openai_model_name() -> str:
+    return os.getenv("OPENAI_MODEL", "gpt-4o-mini").strip() or "gpt-4o-mini"
 
 
 def _build_status_todos(logs: dict[str, dict[str, Any]]) -> list[SupplementTodoSnapshot]:
