@@ -13,7 +13,9 @@ Agent별 최신 실행 상태를 `agent_logs`에 기록한다.
 from __future__ import annotations
 
 import json
+import os
 from dataclasses import dataclass
+from decimal import Decimal, ROUND_HALF_UP
 from typing import Any
 
 import psycopg2.extras
@@ -28,6 +30,24 @@ SITE_PHOTO_TYPES = {
     "wearing_photo",
     "work_photo",
     "tech_guidance_photo",
+}
+DEFAULT_AGENT_USAGE_USD_PER_1K_TOKENS = Decimal(os.getenv("AGENT_USAGE_DEFAULT_USD_PER_1K_TOKENS", "0.005"))
+DEFAULT_AGENT_USAGE_INPUT_USD_PER_1M_TOKENS = Decimal(os.getenv("AGENT_USAGE_DEFAULT_INPUT_USD_PER_1M_TOKENS", "0.40"))
+DEFAULT_AGENT_USAGE_CACHED_INPUT_USD_PER_1M_TOKENS = Decimal(os.getenv("AGENT_USAGE_DEFAULT_CACHED_INPUT_USD_PER_1M_TOKENS", "0.10"))
+DEFAULT_AGENT_USAGE_OUTPUT_USD_PER_1M_TOKENS = Decimal(os.getenv("AGENT_USAGE_DEFAULT_OUTPUT_USD_PER_1M_TOKENS", "1.60"))
+
+MODEL_USAGE_PRICES_USD_PER_1M: dict[str, tuple[Decimal, Decimal, Decimal]] = {
+    "gpt-4.1": (Decimal("2.00"), Decimal("0.50"), Decimal("8.00")),
+    "gpt-4.1-mini": (Decimal("0.40"), Decimal("0.10"), Decimal("1.60")),
+    "gpt-4o": (Decimal("2.50"), Decimal("1.25"), Decimal("10.00")),
+    "gpt-4o-mini": (Decimal("0.15"), Decimal("0.075"), Decimal("0.60")),
+    "gpt-5.2": (Decimal("1.75"), Decimal("0.175"), Decimal("14.00")),
+    "gpt-5-mini": (Decimal("0.25"), Decimal("0.025"), Decimal("2.00")),
+    "text-embedding-3-small": (Decimal("0.02"), Decimal("0.02"), Decimal("0")),
+    "gemini-2.5-flash": (Decimal("0.30"), Decimal("0.03"), Decimal("2.50")),
+    "gemini-2.5-flash-lite": (Decimal("0.10"), Decimal("0.01"), Decimal("0.40")),
+    "claude-sonnet-4.6": (Decimal("3.00"), Decimal("0.30"), Decimal("15.00")),
+    "claude-sonnet-4-6": (Decimal("3.00"), Decimal("0.30"), Decimal("15.00")),
 }
 
 
@@ -365,6 +385,215 @@ def upsert_agent_log(
             if inserted is None:
                 raise RuntimeError("agent_logs INSERT failed: RETURNING id returned no row")
             return int(inserted[0])
+
+
+def insert_agent_usage_record(
+    *,
+    project_id: int,
+    usage_statement_id: int,
+    agent_type_code: str,
+    model_name: str | None = None,
+    token: int | None = None,
+    input_tokens: int | None = None,
+    output_tokens: int | None = None,
+    cached_input_tokens: int | None = None,
+    requested_by_user_id: int | None = None,
+) -> int | None:
+    """실제 Agent 실행 1회를 사용량 집계 테이블에 기록합니다.
+
+    `created_at`은 DB 기본값(now())을 사용하므로 실제 실행 시각 기준으로 집계됩니다.
+    """
+
+    with get_connection() as conn:
+        with conn.cursor() as cur:
+            user_id = _resolve_usage_record_user_id(
+                cur,
+                project_id=project_id,
+                usage_statement_id=usage_statement_id,
+                requested_by_user_id=requested_by_user_id,
+            )
+            if user_id is None:
+                return None
+
+            stored_input_tokens = _non_negative_int(input_tokens if input_tokens is not None else token)
+            stored_output_tokens = _non_negative_int(output_tokens)
+            stored_cached_input_tokens = min(_non_negative_int(cached_input_tokens), stored_input_tokens)
+            cost_usd = _estimate_agent_usage_cost_usd(
+                model_name=model_name,
+                agent_type_code=agent_type_code,
+                input_tokens=stored_input_tokens,
+                output_tokens=stored_output_tokens,
+                cached_input_tokens=stored_cached_input_tokens,
+            )
+            cur.execute(
+                """
+                INSERT INTO agent_usage_records
+                    (user_id, project_id, usage_statement_id,
+                     agent_type_code, model_name, input_tokens, output_tokens, cost_usd)
+                VALUES
+                    (%(user_id)s, %(project_id)s, %(usage_statement_id)s,
+                     %(agent_type_code)s, %(model_name)s, %(input_tokens)s, %(output_tokens)s, %(cost_usd)s)
+                RETURNING id
+                """,
+                {
+                    "user_id": user_id,
+                    "project_id": project_id,
+                    "usage_statement_id": usage_statement_id,
+                    "agent_type_code": agent_type_code,
+                    "model_name": model_name,
+                    "input_tokens": stored_input_tokens,
+                    "output_tokens": stored_output_tokens,
+                    "cost_usd": cost_usd,
+                },
+            )
+            inserted = cur.fetchone()
+            return int(inserted[0]) if inserted else None
+
+
+def _resolve_usage_record_user_id(
+    cur,
+    *,
+    project_id: int,
+    usage_statement_id: int,
+    requested_by_user_id: int | None,
+) -> int | None:
+    if requested_by_user_id is not None:
+        cur.execute(
+            """
+            SELECT id
+            FROM users
+            WHERE id = %(user_id)s
+            """,
+            {"user_id": requested_by_user_id},
+        )
+        row = cur.fetchone()
+        if row:
+            return int(row[0])
+
+    cur.execute(
+        """
+        SELECT f.uploaded_by_user_id
+        FROM usage_statements us
+        JOIN files f ON f.id = us.source_file_id
+        WHERE us.id = %(usage_statement_id)s
+          AND us.project_id = %(project_id)s
+        """,
+        {"project_id": project_id, "usage_statement_id": usage_statement_id},
+    )
+    row = cur.fetchone()
+    if row and row[0] is not None:
+        return int(row[0])
+
+    cur.execute(
+        """
+        SELECT user_id
+        FROM project_user_assignments
+        WHERE project_id = %(project_id)s
+        ORDER BY created_at DESC, id DESC
+        LIMIT 1
+        """,
+        {"project_id": project_id},
+    )
+    row = cur.fetchone()
+    if row and row[0] is not None:
+        return int(row[0])
+
+    return None
+
+
+def _estimate_agent_usage_cost_usd(
+    *,
+    model_name: str | None,
+    agent_type_code: str,
+    input_tokens: int,
+    output_tokens: int,
+    cached_input_tokens: int,
+) -> Decimal:
+    if input_tokens <= 0 and output_tokens <= 0:
+        return Decimal("0")
+    input_price, cached_input_price, output_price = _agent_usage_prices_per_1m_tokens(
+        model_name=model_name,
+        agent_type_code=agent_type_code,
+    )
+    billable_input_tokens = max(input_tokens - cached_input_tokens, 0)
+    cost = (
+        Decimal(billable_input_tokens) / Decimal(1_000_000) * input_price
+        + Decimal(cached_input_tokens) / Decimal(1_000_000) * cached_input_price
+        + Decimal(output_tokens) / Decimal(1_000_000) * output_price
+    )
+    return cost.quantize(Decimal("0.00000001"), rounding=ROUND_HALF_UP)
+
+
+def _agent_usage_prices_per_1m_tokens(*, model_name: str | None, agent_type_code: str) -> tuple[Decimal, Decimal, Decimal]:
+    normalized_model_name = (model_name or "").strip().lower()
+    model_price = _known_model_usage_price(normalized_model_name)
+    if model_price is not None:
+        return model_price
+
+    legacy_price = _legacy_agent_usage_price_per_1k_tokens(model_name=model_name, agent_type_code=agent_type_code)
+    input_price = _decimal_env(
+        _price_env_keys("INPUT", model_name=model_name, agent_type_code=agent_type_code),
+        DEFAULT_AGENT_USAGE_INPUT_USD_PER_1M_TOKENS,
+    )
+    cached_input_price = _decimal_env(
+        _price_env_keys("CACHED_INPUT", model_name=model_name, agent_type_code=agent_type_code),
+        DEFAULT_AGENT_USAGE_CACHED_INPUT_USD_PER_1M_TOKENS,
+    )
+    output_price = _decimal_env(
+        _price_env_keys("OUTPUT", model_name=model_name, agent_type_code=agent_type_code),
+        DEFAULT_AGENT_USAGE_OUTPUT_USD_PER_1M_TOKENS,
+    )
+    if legacy_price != DEFAULT_AGENT_USAGE_USD_PER_1K_TOKENS:
+        legacy_per_1m = legacy_price * Decimal(1000)
+        return legacy_per_1m, legacy_per_1m, legacy_per_1m
+    return input_price, cached_input_price, output_price
+
+
+def _known_model_usage_price(model_name: str) -> tuple[Decimal, Decimal, Decimal] | None:
+    if model_name in MODEL_USAGE_PRICES_USD_PER_1M:
+        return MODEL_USAGE_PRICES_USD_PER_1M[model_name]
+    for known_model in sorted(MODEL_USAGE_PRICES_USD_PER_1M, key=len, reverse=True):
+        if model_name.startswith(f"{known_model}-"):
+            return MODEL_USAGE_PRICES_USD_PER_1M[known_model]
+    return None
+
+
+def _legacy_agent_usage_price_per_1k_tokens(*, model_name: str | None, agent_type_code: str) -> Decimal:
+    env_keys: list[str] = []
+    if model_name:
+        env_keys.append(f"AGENT_USAGE_USD_PER_1K_TOKENS_{_env_key_suffix(model_name)}")
+    env_keys.append(f"AGENT_USAGE_USD_PER_1K_TOKENS_{_env_key_suffix(agent_type_code)}")
+    return _decimal_env(env_keys, DEFAULT_AGENT_USAGE_USD_PER_1K_TOKENS)
+
+
+def _price_env_keys(kind: str, *, model_name: str | None, agent_type_code: str) -> list[str]:
+    env_keys: list[str] = []
+    if model_name:
+        env_keys.append(f"AGENT_USAGE_{kind}_USD_PER_1M_TOKENS_{_env_key_suffix(model_name)}")
+    env_keys.append(f"AGENT_USAGE_{kind}_USD_PER_1M_TOKENS_{_env_key_suffix(agent_type_code)}")
+    return env_keys
+
+
+def _decimal_env(env_keys: list[str], default: Decimal) -> Decimal:
+    for key in env_keys:
+        raw = os.getenv(key)
+        if raw:
+            try:
+                return Decimal(raw)
+            except Exception:
+                continue
+    return default
+
+
+def _non_negative_int(value: int | None) -> int:
+    try:
+        return max(int(value or 0), 0)
+    except (TypeError, ValueError):
+        return 0
+
+
+def _env_key_suffix(value: str) -> str:
+    return "".join(char if char.isalnum() else "_" for char in value.upper()).strip("_")
 
 
 def mark_orchestrator(

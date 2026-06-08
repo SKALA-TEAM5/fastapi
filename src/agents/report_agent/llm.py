@@ -43,6 +43,7 @@ class OpenAIReportLLMClient:
         self.model = model or os.getenv("OPENAI_REPORT_MODEL") or DEFAULT_OPENAI_MODEL
         self.base_url = base_url
         self.timeout_seconds = timeout_seconds
+        self.last_usage: dict[str, Any] | None = None
 
     @classmethod
     def from_environment(cls) -> "OpenAIReportLLMClient | None":
@@ -107,6 +108,7 @@ class OpenAIReportLLMClient:
         except urllib.error.URLError as exc:
             raise ReportLLMError(f"OpenAI API request failed: {exc.reason}") from exc
 
+        self.last_usage = _extract_usage(raw)
         return _parse_response_json(raw)
 
 
@@ -137,6 +139,12 @@ def _parse_response_json(raw: str) -> dict[str, Any]:
                 return json.loads(content["text"])
 
     raise ReportLLMError("OpenAI API response did not contain JSON output text.")
+
+
+def _extract_usage(raw: str) -> dict[str, Any] | None:
+    body = json.loads(raw)
+    usage = body.get("usage")
+    return usage if isinstance(usage, dict) else None
 
 
 def _read_prompt(filename: str) -> str:
