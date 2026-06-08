@@ -157,23 +157,13 @@ def _response_schema() -> dict[str, Any]:
             "required_action": text_field,
         },
     }
-    numbered_action = {
-        "type": "object",
-        "additionalProperties": False,
-        "required": ["no", "action"],
-        "properties": {
-            "no": {"type": "integer"},
-            "action": text_field,
-        },
-    }
     return {
         "type": "object",
         "additionalProperties": False,
-        "required": ["conclusion", "overall_opinion", "issue_details", "supplement_actions"],
+        "required": ["conclusion", "overall_opinion", "issue_details"],
         "properties": {
             "conclusion": text_field,
             "overall_opinion": text_field,
             "issue_details": {"type": "array", "items": numbered_issue},
-            "supplement_actions": {"type": "array", "items": numbered_action},
         },
     }

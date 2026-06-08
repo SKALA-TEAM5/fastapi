@@ -77,27 +77,8 @@
       ]
     },
     {
-      "section_id": "tax_settlement",
-      "title": "4. 세금 및 정산 검토",
-      "kind": "table",
-      "tables": [
-        {
-          "headers": ["항목", "세금계산서 금액", "영수증 기재액", "부가세", "일치 여부"],
-          "repeat_for": "tax_settlement_rows",
-          "row_template": [
-            "{{item.item_name}}",
-            "{{item.document_supply_amount|money}}",
-            "{{item.execution_supply_amount|money}}",
-            "{{item.vat_amount|money}}",
-            "{{item.difference_label}}"
-          ],
-          "empty_row": ["-", "-", "-", "-", "-"]
-        }
-      ]
-    },
-    {
       "section_id": "item_reviews",
-      "title": "5. 항목별 적정성 검토 결과",
+      "title": "4. 항목별 적정성 검토 결과",
       "kind": "table",
       "tables": [
         {
@@ -116,13 +97,13 @@
     },
     {
       "section_id": "issue_details",
-      "title": "6. 부적정 및 검토 필요 상세 내역",
+      "title": "5. 부적정 및 검토 필요 상세 내역",
       "kind": "detail",
       "tables": [
         {
           "repeat_for": "issue_details",
           "repeat_mode": "tables",
-          "title": "6.{{index}}  {{item.issue_label}} - No.{{item.no}}  {{item.title}}",
+          "title": "5.{{index}}  {{item.issue_label}} - No.{{item.no}}  {{item.title}}",
           "rows": [
             ["집행 금액", "{{item.amount_label}}"],
             ["{{item.problem_label}}", "{{item.problem_text}}"],
@@ -130,7 +111,7 @@
             ["법령 근거", "{{item.legal_basis}}"],
             ["조치 사항", "{{item.action_text}}"]
           ],
-          "empty_title": "6.1  -",
+          "empty_title": "5.1  -",
           "empty_rows": [
             ["확인된 문제", "-"],
             ["법령 근거", "-"],
@@ -140,27 +121,8 @@
       ]
     },
     {
-      "section_id": "supplement_actions",
-      "title": "7. 보완 필요 사항",
-      "kind": "table",
-      "tables": [
-        {
-          "headers": ["No.", "보완 항목", "실행 내용", "완료 기한", "담당자"],
-          "repeat_for": "supplement_actions",
-          "row_template": [
-            "{{item.no}}",
-            "{{item.title}}",
-            "{{item.action}}",
-            "{{item.due_date_label}}",
-            "{{item.assignee}}"
-          ],
-          "empty_row": ["-", "-", "-", "-", "-"]
-        }
-      ]
-    },
-    {
       "section_id": "overall_opinion",
-      "title": "8. 종합 의견",
+      "title": "6. 종합 의견",
       "kind": "opinion",
       "paragraphs": [
         "{{draft.overall_opinion}}",
