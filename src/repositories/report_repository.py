@@ -132,17 +132,17 @@ class PostgresReportRepository(ReportRepository):
     def list_validation_logs_by_item(self, usage_statement_id: int) -> dict[int, list[dict]]:
         rows = self._fetch_all(
             """
-            SELECT id, agent_type_code, result_code, reason, details,
+            SELECT id, usage_statement_item_id AS item_id,
+                   validation_type_code, result_code, details,
                    model_name, created_at
-            FROM agent_logs
+            FROM validation_logs
             WHERE usage_statement_id = %(usage_statement_id)s
-              AND agent_type_code IN ('safety-doc', 'link', 'vision', 'legal')
-              AND status_code = 'success'
-            ORDER BY created_at, id
+              AND usage_statement_item_id IS NOT NULL
+            ORDER BY usage_statement_item_id, created_at, id
             """,
             {"usage_statement_id": usage_statement_id},
         )
-        return _group_agent_logs_by_item(rows)
+        return _group_by_item(rows)
 
     def list_action_requests(self, project_id: int, usage_statement_id: int) -> list[dict]:
         return self._fetch_all(
@@ -205,48 +205,6 @@ def _group_by_item(rows: list[dict]) -> dict[int, list[dict]]:
     return dict(grouped)
 
 
-def _group_agent_logs_by_item(rows: list[dict]) -> dict[int, list[dict]]:
-    grouped: dict[int, list[dict]] = defaultdict(list)
-    for row in rows:
-        details = _json_dict(row.get("details"))
-        for item_id, item_details in _iter_agent_log_item_details(details):
-            grouped[item_id].append(
-                {
-                    "id": row["id"],
-                    "validation_type_code": row["agent_type_code"],
-                    "result_code": row.get("result_code") or "success",
-                    "details": {
-                        "agent_type_code": row["agent_type_code"],
-                        "reason": row.get("reason"),
-                        **item_details,
-                    },
-                    "model_name": row.get("model_name"),
-                    "created_at": row["created_at"],
-                }
-            )
-    return dict(grouped)
-
-
-def _iter_agent_log_item_details(details: dict[str, Any]) -> list[tuple[int, dict[str, Any]]]:
-    item_details: list[tuple[int, dict[str, Any]]] = []
-    for row in _iter_result_rows(details):
-        item_id = _item_id(row)
-        if item_id is not None:
-            item_details.append((item_id, row))
-
-    raw_payload = details.get("payload")
-    payload: dict[str, Any] = raw_payload if isinstance(raw_payload, dict) else {}
-    todos = payload.get("todos")
-    if isinstance(todos, list):
-        for todo in todos:
-            if not isinstance(todo, dict):
-                continue
-            item_id = _item_id(todo)
-            if item_id is not None:
-                item_details.append((item_id, todo))
-    return item_details
-
-
 def _normalize_row(row: dict[str, Any]) -> dict[str, Any]:
     normalized = dict(row)
     details = normalized.get("details")
@@ -301,11 +259,9 @@ def _extract_legal_results(details: dict[str, Any]) -> tuple[dict[int, dict], di
 
 
 def _iter_result_rows(details: dict[str, Any]) -> list[dict[str, Any]]:
-    raw_payload = details.get("payload")
-    payload: dict[str, Any] = raw_payload if isinstance(raw_payload, dict) else {}
+    payload = details.get("payload") if isinstance(details.get("payload"), dict) else {}
     rows: list[dict[str, Any]] = []
-    sources: tuple[dict[str, Any], dict[str, Any]] = (details, payload)
-    for source in sources:
+    for source in (details, payload):
         for key in ("results", "items", "item_results", "category_results", "result"):
             candidates = source.get(key)
             if isinstance(candidates, dict):

@@ -309,8 +309,8 @@ def insert_usage_statement_items(
                 "used_on":            used_on,
                 "item_name":          str(item.get("사용내역") or item.get("item_name") or "")[:300],
                 "unit":               str(unit or "")[:50] or None,
-                "quantity":           float(str(quantity)) if quantity not in (None, "") else 0.0,
-                "unit_price":         float(str(unit_price)) if unit_price not in (None, "") else 0.0,
+                "quantity":           float(quantity) if quantity not in (None, "") else 0.0,
+                "unit_price":         float(unit_price) if unit_price not in (None, "") else 0.0,
                 "total_amount":       int(total_amount or 0),
                 "remark":             str(item.get("remark") or "")[:500] or None,
                 "page_no":            int(page_no),
@@ -334,7 +334,7 @@ def update_file_status(
 ) -> None:
     """
     files.status_code를 업데이트한다.
-    status_code: 'draft' | 'success' | 'fail'
+    status_code: 'matched' | 'unmatched'
     """
     sql = """
         UPDATE files

@@ -21,8 +21,6 @@ class Settings:
     db_name: str = "safety"
     db_user: str = "safety_service_app"
     db_password: str = "safety_service_app_password"
-    reference_collection: str = "safety-guide"
-    reference_top_k: int = 5
 
 
 def app_root_dir() -> Path:
@@ -84,6 +82,4 @@ def load_settings() -> Settings:
         db_name=os.getenv("POSTGRES_DB", "safety").strip(),
         db_user=os.getenv("SERVICE_APP_USER", "safety_service_app").strip(),
         db_password=os.getenv("SERVICE_APP_PASSWORD", "safety_service_app_password").strip(),
-        reference_collection=os.getenv("SAFETY_DOC_COLLECTION", "safety-guide").strip(),
-        reference_top_k=int(os.getenv("SAFETY_DOC_REFERENCE_TOP_K", "5").strip()),
     )

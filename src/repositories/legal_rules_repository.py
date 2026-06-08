@@ -11,19 +11,25 @@
 # --------------------------------------------------------------------------
 import json
 import math
+import os
 import re
 from dataclasses import dataclass
 from pathlib import Path
 
 import psycopg
 from psycopg.rows import dict_row
+from dotenv import load_dotenv
 
-from src.core.config import LEGAL_DATABASE_URL
 from src.schemas.classifier import CATEGORIES
+
+load_dotenv()
 
 DEFAULT_RULES_PATH = Path("artifacts/legal_rules_payload.json")
 DEFAULT_RULE_CONFIG_PATH = Path("scripts/seed_legal_rule_profiles.json")
-DEFAULT_DATABASE_URL = LEGAL_DATABASE_URL
+DEFAULT_DATABASE_URL = os.environ.get(
+    "DATABASE_URL",
+    "postgresql://safety_user:safety_password@localhost:5432/safety",
+)
 
 
 def _load_static_rule_config(rule_config_path: Path = DEFAULT_RULE_CONFIG_PATH) -> dict:
