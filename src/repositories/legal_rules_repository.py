@@ -210,9 +210,11 @@ class LegalRulesRepository:
             if rule.get("rule_type") not in _CLASSIFIER_RULE_TYPES:
                 continue
 
+            # rule_text(body)는 타 품목 맥락 언급으로 오매칭 유발 → 제외
+            # keyword / item_pattern / category_name만 핵심 매칭 대상으로 사용
             text = " ".join(
                 str(rule.get(key, "") or "")
-                for key in ("keyword", "item_pattern", "rule_text", "legal_basis", "category_name")
+                for key in ("keyword", "item_pattern", "category_name")
             )
             tokens = _tokenize(text)
             if not tokens:
@@ -485,8 +487,10 @@ class LegalRulesRepository:
     ) -> list[ValidatorRuleMatch]:
         category_code, category_name = self.resolve_category(category)
         item_text_norm = _normalize_text(item_text)
-        query_tokens = _validator_tokens(item_text)
-        context_tokens = _validator_tokens(retrieved_context)
+        # DB에서 로드한 validator_synonyms 사용 (파일 기반 _ACTIVE_VALIDATOR_SYNONYMS 대체)
+        db_synonyms = self.validator_synonyms
+        query_tokens = _validator_tokens(item_text, synonyms=db_synonyms)
+        context_tokens = _validator_tokens(retrieved_context, synonyms=db_synonyms)
 
         # 1차(authoritative), 2차(secondary), 보조(fallback), 전역정책(global) 분리
         primary_matches: list[ValidatorRuleMatch] = []
@@ -601,6 +605,30 @@ class LegalRulesRepository:
         # 전역 정책은 항목과 실제로 겹치는 경우에만 최대 2개 추가
         result.extend(global_matches[:2])
 
+        # validator_profiles fallback — 1차 RDB 매칭이 약할 때 profile allow/disallow_terms로 보완
+        top_score = result[0].score if result else 0.0
+        if top_score < 3.0:
+            profiles = self.validator_profiles
+            profile = profiles.get(category_code or "", {})
+            allow_hits = {
+                term for term in profile.get("allow_terms", [])
+                if term.lower() in item_text_norm
+            }
+            disallow_hits = {
+                term for term in profile.get("disallow_terms", [])
+                if term.lower() in item_text_norm
+            }
+            fallback = _build_fallback_validator_match(
+                category_code=category_code,
+                category_name=category_name,
+                item_text=item_text_norm,
+                allow_hits=allow_hits,
+                disallow_hits=disallow_hits,
+                validator_profiles=profiles,
+            )
+            if fallback:
+                result.append(fallback)
+
         result.sort(key=lambda m: m.score, reverse=True)
         return result[:limit]
 
@@ -618,19 +646,63 @@ _SECONDARY_RULE_TYPES = {"qa_allowed", "qa_disallowed", "qa_limit"}
 _FALLBACK_RULE_TYPES = {"rule_like_allowed", "rule_like_disallowed", "rule_like_limit"}
 _VALIDATOR_RULE_TYPES = _AUTHORITATIVE_RULE_TYPES | _SECONDARY_RULE_TYPES | _FALLBACK_RULE_TYPES
 _LIMIT_HINTS = ("초과", "%", "분의", "이내")
+_LAW_NAME_고시 = "건설업 산업안전보건관리비 계상 및 사용기준"
+
+# 조항 번호만 있는 경우 → 전체 법령명으로 보완하기 위한 매핑
+_ARTICLE_TO_LAW: dict[str, str] = {
+    # ── 산업안전보건법 ──────────────────────────────────────────────
+    "제5조":  "산업안전보건법 제5조",
+    "제10조": "산업안전보건법 제10조",
+    "제11조": "산업안전보건법 제11조",
+    "제14조": "산업안전보건법 제14조",
+    "제15조": "산업안전보건법 제15조",
+    "제16조": "산업안전보건법 제16조",
+    "제17조": "산업안전보건법 제17조",
+    "제18조": "산업안전보건법 제18조",
+    "제19조": "산업안전보건법 제19조",
+    "제24조": "산업안전보건법 제24조",
+    "제25조": "산업안전보건법 제25조",
+    "제29조": "산업안전보건법 제29조",
+    "제36조": "산업안전보건법 제36조",
+    "제62조": "산업안전보건법 제62조",
+    "제63조": "산업안전보건법 제63조",
+    "제64조": "산업안전보건법 제64조",
+    "제72조": "산업안전보건법 제72조",
+    "제73조": "산업안전보건법 제73조",
+    "제80조": "산업안전보건법 제80조",
+    "제83조": "산업안전보건법 제83조",
+    "제84조": "산업안전보건법 제84조",
+    "제125조": "산업안전보건법 제125조",
+    "제129조": "산업안전보건법 제129조",
+    # ── 산업안전보건법 시행령 ──────────────────────────────────────
+    "제74조": "산업안전보건법 시행령 제74조",
+    "제75조": "산업안전보건법 시행령 제75조",
+    "제77조": "산업안전보건법 시행령 제77조",
+    "제89조": "산업안전보건법 시행령 제89조",
+    # ── 산업안전보건법 시행규칙 ───────────────────────────────────
+    "제98조": "산업안전보건법 시행규칙 제98조",
+    # ── 중대재해 처벌 등에 관한 법률 시행령 ──────────────────────
+    "제4조":  "중대재해처벌법 시행령 제4조",
+    "제4조제2호": "중대재해처벌법 시행령 제4조제2호",
+    "제4조제2호나목": "중대재해처벌법 시행령 제4조제2호나목",
+    # ── 건설기술 진흥법 ───────────────────────────────────────────
+    "제62조의3": "건설기술진흥법 제62조의3",
+    # ── 응급의료에 관한 법률 ──────────────────────────────────────
+    "제47조의2": "응급의료에 관한 법률 제47조의2",
+}
 _PRIMARY_LAW_BY_CATEGORY = {
-    "CAT_01": "제7조제1항제1호",
-    "CAT_02": "제7조제1항제2호",
-    "CAT_03": "제7조제1항제3호",
-    "CAT_04": "제7조제1항제4호",
-    "CAT_05": "제7조제1항제5호",
-    "CAT_06": "제7조제1항제6호",
-    "CAT_07": "제7조제1항제7호",
-    "CAT_08": "제7조제1항제8호",
-    "CAT_09": "제7조제1항제9호",
+    "CAT_01": f"{_LAW_NAME_고시} 제7조제1항제1호",
+    "CAT_02": f"{_LAW_NAME_고시} 제7조제1항제2호",
+    "CAT_03": f"{_LAW_NAME_고시} 제7조제1항제3호",
+    "CAT_04": f"{_LAW_NAME_고시} 제7조제1항제4호",
+    "CAT_05": f"{_LAW_NAME_고시} 제7조제1항제5호",
+    "CAT_06": f"{_LAW_NAME_고시} 제7조제1항제6호",
+    "CAT_07": f"{_LAW_NAME_고시} 제7조제1항제7호",
+    "CAT_08": f"{_LAW_NAME_고시} 제7조제1항제8호",
+    "CAT_09": f"{_LAW_NAME_고시} 제7조제1항제9호",
 }
 _STOPWORDS = {
-    "건설", "건설공사", "건설현장", "현장", "근로자", "산업", "안전", "보건", "산업안전", "산업안전보건",
+    "건설", "건설공사", "건설현장", "현장", "작업장", "근로자", "산업", "안전", "보건", "산업안전", "산업안전보건",
     "관리비", "비용", "구입", "임대", "설치", "사용", "가능", "가능한지", "항목", "소요", "해당", "따른",
     "법", "규정", "기준", "제", "호", "목", "등", "위한", "위하여", "대한", "경우", "업무", "관련", "실시",
     "관리", "예방", "필요", "장비", "시설", "현수", "세트", "인건비",
@@ -759,11 +831,13 @@ def _score_rule(
     return score, rule["evidence"]
 
 
-def _validator_tokens(text: str) -> set[str]:
+def _validator_tokens(text: str, synonyms: dict[str, set[str]] | None = None) -> set[str]:
+    # synonyms: DB에서 로드한 validator_synonyms (없으면 파일 기반 _ACTIVE_VALIDATOR_SYNONYMS 사용)
+    active_synonyms = synonyms if synonyms is not None else _ACTIVE_VALIDATOR_SYNONYMS
     base = _tokenize(text)
     expanded = set(base)
     for token in list(base):
-        for key, values in _ACTIVE_VALIDATOR_SYNONYMS.items():
+        for key, values in active_synonyms.items():
             if token == key.lower() or token in values:
                 expanded |= values
     return expanded
@@ -866,15 +940,45 @@ def _primary_laws(category_code: str | None) -> list[str]:
     return [law] if law else []
 
 
+_LAW_NAME_PATTERN = re.compile(
+    r"(산업안전보건법(?:\s*시행령|\s*시행규칙)?|"
+    r"건설업\s*산업안전보건관리비\s*계상\s*및\s*사용기준|"
+    r"중대재해\s*처벌\s*등에\s*관한\s*법률(?:\s*시행령)?|"
+    r"건설기술\s*진흥법|"
+    r"응급의료에\s*관한\s*법률)"
+    r"\s*(제\d+조(?:제\d+항)?(?:제\d+호)?)"
+)
+_ARTICLE_ONLY_PATTERN = re.compile(r"제\d+조(?:제\d+항)?(?:제\d+호)?|별표\s*\d+")
+
+
 def _rule_laws(rule: dict, category_code: str | None) -> list[str]:
     laws: list[str] = []
     legal_basis = str(rule.get("legal_basis") or "").strip()
-    if legal_basis and legal_basis not in laws:
-        laws.append(legal_basis)
+    if legal_basis:
+        # 조항 번호만 있으면 전체 법령명으로 보완 (세부 조항 우선, 기본 조항 fallback)
+        def _enrich(part: str) -> str:
+            p = part.strip()
+            if p in _ARTICLE_TO_LAW:
+                return _ARTICLE_TO_LAW[p]
+            # 세부 조항(제4조제2호)을 기본 조항(제4조)으로 fallback 매핑
+            base = re.match(r"(제\d+조)", p)
+            if base and base.group(1) in _ARTICLE_TO_LAW:
+                return _ARTICLE_TO_LAW[base.group(1)].rstrip() + p[len(base.group(1)):]
+            return p
+        enriched = " | ".join(_enrich(part) for part in legal_basis.split("|"))
+        if enriched not in laws:
+            laws.append(enriched)
     rule_text = str(rule.get("rule_text") or "")
-    for law in re.findall(r"제\d+조(?:제\d+항)?(?:제\d+호)?|별표\s*\d+", rule_text):
-        if law not in laws:
-            laws.append(law)
+    # 법령명 + 조항 같이 추출 (우선)
+    for m in _LAW_NAME_PATTERN.finditer(rule_text):
+        full = f"{m.group(1).strip()} {m.group(2)}"
+        if full not in laws:
+            laws.append(full)
+    # 조항 번호만 있는 것 추가 (중복 제외, 매핑 테이블로 법령명 보완)
+    for law in _ARTICLE_ONLY_PATTERN.findall(rule_text):
+        enriched_law = _enrich(law)
+        if enriched_law not in laws and not any(law in l for l in laws):
+            laws.append(enriched_law)
     for law in _primary_laws(category_code):
         if law and law not in laws:
             laws.append(law)
@@ -890,9 +994,11 @@ def _score_validator_rule(
     item_text: str,
     normalized_allowed: bool | None,
 ) -> float:
+    # rule_text(body)는 타 품목 맥락 언급으로 오매칭 유발 → 제외
+    # keyword / item_pattern / category_name만 핵심 매칭 대상으로 사용
     rule_text = " ".join(
         str(rule.get(key, "") or "")
-        for key in ("keyword", "item_pattern", "rule_text", "category_name", "legal_basis")
+        for key in ("keyword", "item_pattern", "category_name")
     )
     # ★ item·rule 양쪽 모두 synonym 확장 없이 base 토큰만 사용한다.
     #   synonym 그룹(보호구 전체 등)을 확장하면 "보호구" 한 단어만 있는 규칙이

@@ -12,6 +12,7 @@ POST /ocr/parse
   - 적재 : usage_statements INSERT
            usage_statement_summaries INSERT
            usage_statement_items INSERT
+           agent_logs INSERT (classi, 파이프라인 단위 1행)
 
 POST /link/run
   - 설명 : classi + safety-doc 완료 후 Spring이 호출
@@ -23,6 +24,12 @@ POST /link/run
             }
   - 호출 : run_link_pipeline(usage_statement_id, receipt_file_ids, tax_invoice_file_ids)
   - 적재 : evidence_file_links INSERT (매칭 성공 항목)
+           agent_logs INSERT (link, 파이프라인 단위 1행)
+
+[ 로그 커넥션 설계 ]
+  - insert_agent_log                 : 별도 커넥션으로 즉시 커밋 (메인 트랜잭션 롤백과 무관)
+  - update_agent_log_status('success'): 메인 커넥션 마지막에 호출
+  - update_agent_log_status('failed') : except 절에서 별도 커넥션으로 호출
 """
 
 from __future__ import annotations
@@ -34,7 +41,14 @@ from typing import Any
 
 from src.agents.classifier_agent.agent import review_usage_statement
 from src.core.config import CLOVA_OCR_SECRET, CLOVA_OCR_URL
-from src.ocr.ocr_engine import parse_receipt as ocr_parse_receipt
+from src.ocr.clova_ocr_receipt import (
+    SUPPORTED_EXTS,
+    call_clova_receipt,
+    parse_clova_response,
+)
+from src.ocr.clova_ocr_receipt import (
+    validate_result as validate_ocr_result,
+)
 from src.ocr.parse_tax_invoice import ALL_EXTS as TAX_INVOICE_EXTS
 from src.ocr.parse_tax_invoice import parse_tax_invoice
 from src.ocr.parse_usage_statement import parse_pdf as parse_usage_pdf
@@ -42,10 +56,11 @@ from src.repositories.db import get_connection
 from src.repositories.usage_statement_pipeline_repository import (
     _from_category_code,
     get_files_by_ids,
-    insert_evidence_file_link,
+    insert_agent_log,
     insert_usage_statement,
     insert_usage_statement_items,
     insert_usage_statement_summaries,
+    update_agent_log_status,
     update_file_status,
 )
 from src.services.matching_service_monthly import (
@@ -53,7 +68,7 @@ from src.services.matching_service_monthly import (
     THRESHOLD_REVIEW,
     match_all_usage_to_receipts,
 )
-from src.services.minio_client import create_presigned_file_url, fetch_file
+from src.services.minio_client import fetch_file
 
 # ─────────────────────────────────────────────────────────────
 # 내부 헬퍼
@@ -67,16 +82,6 @@ def _fetch_and_save_temp(storage_key: str, suffix: str) -> str:
     tmp.write(file_bytes)
     tmp.close()
     return tmp.name
-
-
-def _build_file_agent_input(file_info: dict[str, Any]) -> dict[str, Any]:
-    """Agent 입력에 사용할 파일 접근 정보를 만든다."""
-    return {
-        "file_id": file_info.get("id"),
-        "original_filename": file_info.get("original_filename"),
-        "storage_key": file_info.get("storage_key"),
-        "presigned_url": create_presigned_file_url(file_info["storage_key"]),
-    }
 
 
 def _cleanup(*paths: str) -> None:
@@ -102,7 +107,7 @@ def _classify_usage_statement(
 ) -> tuple[dict[str, Any], dict[str, Any]]:
     """
     OCR 파싱된 사용내역서를 classifier에 태워 카테고리를 보정하고,
-    오케스트레이터가 기록할 classifier details도 함께 만든다.
+    agent_logs.details에 저장할 classifier JSON도 함께 만든다.
     """
     line_items = parsed_usage.get("line_items") or []
     if not line_items:
@@ -243,6 +248,34 @@ def _attach_classifier_item_ids(
     return {**classifier_details, "results": updated_results}
 
 
+def _complete_classifier_log(
+    conn,
+    *,
+    log_id: int,
+    usage_statement_id: int,
+    details: dict[str, Any],
+) -> None:
+    """Mark classifier log complete and bind it to the persisted usage_statement."""
+    import json as _json
+
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            UPDATE agent_logs
+            SET usage_statement_id = %(usage_statement_id)s,
+                status_code = 'success',
+                result_code = 'success',
+                details = %(details)s::jsonb
+            WHERE id = %(log_id)s
+            """,
+            {
+                "log_id": log_id,
+                "usage_statement_id": usage_statement_id,
+                "details": _json.dumps(details, ensure_ascii=False),
+            },
+        )
+
+
 # ─────────────────────────────────────────────────────────────
 # 엔드포인트 1: 사용내역서 파싱 (/ocr/parse)
 # ─────────────────────────────────────────────────────────────
@@ -270,11 +303,12 @@ def parse_usage_statement(usage_file_id: int) -> dict[str, Any]:
     """
     start = time.time()
     tmp_paths: list[str] = []
+    classifier_log_id: int | None = None
     usage_statement_id: int | None = None
     parsed_usage: dict[str, Any] | None = None
     classifier_details: dict[str, Any] | None = None
-    source_file_input: dict[str, Any] | None = None
     line_items: list[dict[str, Any]] = []
+    items_with_id: list[dict[str, Any]] = []
 
     try:
         with get_connection() as conn:
@@ -286,7 +320,6 @@ def parse_usage_statement(usage_file_id: int) -> dict[str, Any]:
                     f"사용내역서 파일을 찾을 수 없습니다 (file_id={usage_file_id})"
                 )
             project_id = usage_file["project_id"]
-            source_file_input = _build_file_agent_input(usage_file)
 
             # ── S3 fetch + 파싱 ────────────────────────────────────────────
             usage_suffix = Path(usage_file["original_filename"]).suffix.lower()
@@ -300,6 +333,16 @@ def parse_usage_statement(usage_file_id: int) -> dict[str, Any]:
 
             if parsed_usage.get("parse_status") == "FAILED":
                 raise RuntimeError("사용내역서 파싱 실패 (FAILED)")
+
+            with get_connection() as classifier_log_conn:
+                classifier_log_id = insert_agent_log(
+                    classifier_log_conn,
+                    project_id=project_id,
+                    usage_statement_id=None,
+                    details={"source_file_id": usage_file_id},
+                    agent_type_code="classi",
+                    model_name="classifier_agent",
+                )
 
             parsed_usage, classifier_details = _classify_usage_statement(
                 usage_file_id=usage_file_id,
@@ -323,11 +366,38 @@ def parse_usage_statement(usage_file_id: int) -> dict[str, Any]:
             line_id_to_item_id = insert_usage_statement_items(
                 conn, usage_statement_id, line_items
             )
+            items_with_id = [
+                {
+                    "item_id": line_id_to_item_id.get(item.get("line_id")),
+                    "category_code": item.get("category_code") or item.get("항목코드"),
+                    "used_on": item.get("used_on") or item.get("사용일자"),
+                    "item_name": item.get("item_name") or item.get("사용내역"),
+                    "total_amount": item.get("total_amount") or item.get("금액"),
+                }
+                for item in line_items
+                if line_id_to_item_id.get(item.get("line_id"))
+            ]
             classifier_details = _attach_classifier_item_ids(
                 classifier_details or {},
                 line_id_to_item_id,
             )
-            classifier_details.setdefault("payload", {})["source_file"] = source_file_input
+
+            # ── 로그 completed ─────────────────────────────────────────────
+            if classifier_log_id is not None:
+                _complete_classifier_log(
+                    conn,
+                    log_id=classifier_log_id,
+                    usage_statement_id=usage_statement_id,
+                    details=classifier_details or {},
+                )
+
+    except Exception:
+        with get_connection() as err_conn:
+            if classifier_log_id is not None:
+                update_agent_log_status(
+                    err_conn, log_id=classifier_log_id, status_code="failed"
+                )
+        raise
 
     finally:
         _cleanup(*tmp_paths)
@@ -342,13 +412,11 @@ def parse_usage_statement(usage_file_id: int) -> dict[str, Any]:
     )
 
     return {
-        "project_id": project_id,
         "usage_statement_id": usage_statement_id,
         "parse_status": (parsed_usage or {}).get("parse_status", "SUCCESS"),
         "item_count": len(line_items),
+        "items": items_with_id,
         "classifier_changed_count": classifier_changed_count,
-        "classifier_details": classifier_details or {},
-        "source_file": source_file_input,
         "elapsed_sec": elapsed,
     }
 
@@ -360,16 +428,17 @@ def parse_usage_statement(usage_file_id: int) -> dict[str, Any]:
 
 def run_link_pipeline(
     usage_statement_id: int,
-    file_ids: list[int],
+    receipt_file_ids: list[int],
+    tax_invoice_file_ids: list[int] | None = None,
 ) -> dict[str, Any]:
     """
     영수증·세금계산서 OCR 후 사용내역서와 2-way 매칭하고 결과를 DB에 저장한다.
     분류 Agent + safety-doc 완료 후 Spring이 호출한다.
 
     Args:
-        usage_statement_id : 이미 저장된 usage_statements.id
-        file_ids           : 영수증·거래명세표·세금계산서 파일 id 혼합 목록
-                             (uploaded_evidence_type_code로 내부에서 자동 분리)
+        usage_statement_id   : 이미 저장된 usage_statements.id
+        receipt_file_ids     : 영수증·거래명세표 파일들의 files.id 목록
+        tax_invoice_file_ids : 세금계산서 파일들의 files.id 목록 (선택)
 
     Returns:
         {
@@ -386,11 +455,12 @@ def run_link_pipeline(
         ValueError : 파일 또는 usage_statement를 찾을 수 없는 경우
         RuntimeError: OCR 실패 또는 S3 접근 오류
     """
+    tax_invoice_file_ids = tax_invoice_file_ids or []
     start = time.time()
     tmp_paths: list[str] = []
-    evidence_file_inputs: list[dict[str, Any]] = []
 
     # ── 로그 시작 (별도 커넥션으로 즉시 커밋) ─────────────────────────
+    # usage_statement → project_id 조회
     with get_connection() as log_conn:
         with log_conn.cursor() as _cur:
             _cur.execute(
@@ -409,28 +479,15 @@ def run_link_pipeline(
             usage_statement_id=usage_statement_id,
             details={
                 "usage_statement_id": usage_statement_id,
-                "file_ids": file_ids,
+                "receipt_file_ids": receipt_file_ids,
             },
         )
 
     try:
         with get_connection() as conn:
-            # ── DB에서 파일 정보 일괄 조회 + doc_type 기준 분리 ──────────
-            file_map = get_files_by_ids(conn, file_ids)
-            evidence_file_inputs = [
-                _build_file_agent_input(file_info)
-                for file_info in file_map.values()
-            ]
-
-            RECEIPT_TYPES = {"receipt", "transaction_statement", "wage_statement"}
-            receipt_file_ids = [
-                fid for fid, f in file_map.items()
-                if f.get("uploaded_evidence_type_code") in RECEIPT_TYPES
-            ]
-            tax_invoice_file_ids = [
-                fid for fid, f in file_map.items()
-                if f.get("uploaded_evidence_type_code") == "tax_invoice"
-            ]
+            # ── DB에서 파일 정보 일괄 조회 ────────────────────────────────
+            all_ids = receipt_file_ids + tax_invoice_file_ids
+            file_map = get_files_by_ids(conn, all_ids)
 
             # ── usage_statement items 조회 (매칭용) ───────────────────────
             # v_usage_statement_context 뷰 사용 (직접 테이블 조회 대신)
@@ -467,18 +524,21 @@ def run_link_pipeline(
                     continue
 
                 suffix = Path(file_info["original_filename"]).suffix.lower()
-                _IMAGE_EXT = {".jpg", ".jpeg", ".png", ".tif", ".tiff"}
-                if suffix not in _IMAGE_EXT:
+                if suffix not in SUPPORTED_EXTS:
                     continue
 
                 tmp_path = _fetch_and_save_temp(file_info["storage_key"], suffix)
                 tmp_paths.append(tmp_path)
 
-                ocr_result = ocr_parse_receipt(tmp_path)
+                raw = call_clova_receipt(tmp_path, CLOVA_OCR_SECRET, CLOVA_OCR_URL)
+                ocr_result = parse_clova_response(raw)
+                ocr_result = validate_ocr_result(ocr_result)
                 ocr_result["source_file"] = file_info["original_filename"]
 
                 receipt_file_id_map[ocr_result.get("receipt_id", "")] = fid
                 receipt_ocr_results.append(ocr_result)
+
+                time.sleep(0.3)  # CLOVA API rate limit 방지
 
             # ── 세금계산서 파싱 ────────────────────────────────────────────
             for fid in tax_invoice_file_ids:
@@ -516,24 +576,6 @@ def run_link_pipeline(
                     and receipt_id in receipt_file_id_map
                 ):
                     file_id_for_receipt = receipt_file_id_map[receipt_id]
-                    # line_id는 이미 DB id(str)
-                    item_db_id = (
-                        int(line_id) if line_id and str(line_id).isdigit() else None
-                    )
-
-                    if item_db_id:
-                        receipt_file_info = file_map.get(file_id_for_receipt, {})
-                        evidence_type = receipt_file_info.get(
-                            "uploaded_evidence_type_code", "receipt"
-                        )
-
-                        insert_evidence_file_link(
-                            conn,
-                            usage_statement_item_id=item_db_id,
-                            file_id=file_id_for_receipt,
-                            evidence_type_code=evidence_type,
-                        )
-
                     update_file_status(conn, file_id_for_receipt, "success")
 
                 elif (
@@ -544,9 +586,31 @@ def run_link_pipeline(
                     file_id_for_receipt = receipt_file_id_map[receipt_id]
                     update_file_status(conn, file_id_for_receipt, "fail")
 
+            # ── 로그 completed ─────────────────────────────────────────────
             summary = batch.get("summary") or {}
+            update_agent_log_status(
+                conn,
+                log_id=log_id,
+                status_code="success",
+                details={
+                    "match_summary": summary,
+                    "usage_statement_id": usage_statement_id,
+                    "receipt_file_ids": receipt_file_ids,
+                    "match_results": [
+                        {
+                            "line_id": r.get("line_id"),
+                            "match_status": r.get("match_status"),
+                            "score": r.get("score"),
+                            "gate_failed": r.get("gate_failed"),
+                        }
+                        for r in (batch.get("results") or [])
+                    ],
+                },
+            )
 
     except Exception:
+        with get_connection() as err_conn:
+            update_agent_log_status(err_conn, log_id=log_id, status_code="failed")
         raise
 
     finally:
@@ -558,6 +622,5 @@ def run_link_pipeline(
         "usage_statement_id": usage_statement_id,
         "summary": summary,
         "match_results": batch.get("results") or [],
-        "evidence_files": evidence_file_inputs,
         "elapsed_sec": elapsed,
     }

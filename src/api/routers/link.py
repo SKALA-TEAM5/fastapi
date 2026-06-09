@@ -32,7 +32,7 @@ router = APIRouter(prefix="/link", tags=["Link Agent"])
 
 **처리 흐름**
 
-1. `file_ids`를 DB에서 조회해 영수증/세금계산서로 자동 분리
+1. `receipt_file_ids`(영수증·거래명세표) + `tax_invoice_file_ids`(세금계산서) 수신
 2. 영수증·거래명세표 → OCR 엔진 실행
 3. 세금계산서 → pdfplumber / CLOVA 파싱 후 영수증 사전 검증
 4. 사용내역서 항목(DB 조회) ↔ 영수증 2-way 매칭
@@ -59,7 +59,8 @@ async def link_run(body: LinkRunRequest) -> ParseResponse:
     try:
         result = run_link_pipeline(
             usage_statement_id=body.usage_statement_id,
-            file_ids=body.file_ids,
+            receipt_file_ids=body.receipt_file_ids,
+            tax_invoice_file_ids=body.tax_invoice_file_ids,
         )
         return ParseResponse(
             success=True,
@@ -90,11 +91,13 @@ class LinkRunRequest(BaseModel):
         description="사용내역서 DB ID",
         examples=[3],
     )
-    file_ids: list[int] = Field(
-        ...,
-        description=(
-            "증빙 파일 ID 목록 (영수증·거래명세표·세금계산서 혼합 가능). "
-            "files.uploaded_evidence_type_code로 내부에서 자동 분리."
-        ),
-        examples=[[10, 11, 12, 20]],
+    receipt_file_ids: list[int] = Field(
+        default_factory=list,
+        description="영수증·거래명세표 파일 ID 목록",
+        examples=[[10, 11, 12]],
+    )
+    tax_invoice_file_ids: list[int] = Field(
+        default_factory=list,
+        description="세금계산서 파일 ID 목록",
+        examples=[[20]],
     )

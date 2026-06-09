@@ -258,6 +258,33 @@ def update_file_statuses(
             )
 
 
+def update_file_details(
+    *,
+    project_id: int,
+    details_by_file_id: dict[int, dict[str, Any]],
+) -> None:
+    if not details_by_file_id:
+        return
+
+    with get_connection() as conn:
+        with conn.cursor() as cur:
+            for file_id, detail in details_by_file_id.items():
+                cur.execute(
+                    """
+                    UPDATE files
+                    SET detail = COALESCE(detail, '{}'::jsonb) || %(detail)s::jsonb
+                    WHERE project_id = %(project_id)s
+                      AND id = %(file_id)s
+                      AND deleted_at IS NULL
+                    """,
+                    {
+                        "project_id": project_id,
+                        "file_id": file_id,
+                        "detail": json.dumps(detail, ensure_ascii=False),
+                    },
+                )
+
+
 def list_latest_agent_logs(
     *,
     project_id: int,

@@ -1,11 +1,11 @@
 """
 영수증 파싱 결과 후처리 검증 모듈
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-산업안전관리비 AI 검증 시스템 — src/ocr/receipt_validator.py
+산업안전관리비 AI 검증 시스템 — receipt_validator.py
 
 [역할]
   VLM / CLOVA 등 OCR 엔진에 무관하게 파싱 결과를 검증한다.
-  ocr_engine.py → vlm_ocr.py / clova_ocr_receipt.py 양쪽에서 공통으로 호출한다.
+  clova_ocr_receipt.py 의존성을 제거하고 독립 모듈로 분리.
 
 [검증 항목]
   1. 필수 필드 존재 여부  (store.biz_num / payment.date / total_amount)
@@ -119,17 +119,25 @@ def validate_result(parsed: dict) -> dict:
             )
 
     # ── 단가 × 수량 = 품목 합계 검증 ────────────────
+    # 영수증: 부가세 포함 금액 표기  → unit_price × count ≈ amount
+    # 거래명세표: 부가세 별도 공급가액 표기 → unit_price × count / 1.1 ≈ amount
+    # 둘 중 하나라도 ±1원 이내로 일치하면 통과
     for item in parsed.get("items", []):
         iname      = item.get("name") or "미상"
         unit_price = item.get("unit_price")
         amount     = item.get("amount")
         count      = item.get("count")
         if unit_price and amount and count:
-            expected = unit_price * count
-            if expected != amount:
+            expected_incl = unit_price * count               # 부가세 포함
+            expected_excl = round(unit_price * count / 1.1)  # 부가세 제외 공급가액
+
+            match_incl = abs(expected_incl - amount) <= 1
+            match_excl = abs(expected_excl - amount) <= 1
+
+            if not match_incl and not match_excl:
                 flags["warnings"].append(
                     f"단가×수량≠합계: '{iname}' "
-                    f"단가({unit_price:,}원) × 수량({count}개) = {expected:,}원 ≠ 합계({amount:,}원)"
+                    f"단가({unit_price:,}원) × 수량({count}개) = {expected_incl:,}원 ≠ 합계({amount:,}원)"
                 )
 
     # ── 날짜 이상값 탐지 ─────────────────────────────

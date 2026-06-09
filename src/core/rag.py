@@ -47,6 +47,7 @@ _retriever_cache: _RetrieverCache | None = None
 _retriever_cache_lock = Lock()
 _rerank_model: HuggingFaceCrossEncoder | None = None
 _rerank_model_lock = Lock()
+_rerank_score_lock = Lock()
 
 
 def rewrite_query(state: AgenticRAGState) -> AgenticRAGState:
@@ -133,9 +134,12 @@ def _get_rerank_model() -> HuggingFaceCrossEncoder:
 
 def _score_in_batches(model: HuggingFaceCrossEncoder, pairs: list) -> list[float]:
     scores: list[float] = []
-    for i in range(0, len(pairs), _BATCH_SIZE):
-        batch = pairs[i : i + _BATCH_SIZE]
-        scores.extend(model.score(batch))
+    # HuggingFace fast tokenizers are not thread-safe when the shared cross-encoder
+    # is called from validator category workers in parallel.
+    with _rerank_score_lock:
+        for i in range(0, len(pairs), _BATCH_SIZE):
+            batch = pairs[i : i + _BATCH_SIZE]
+            scores.extend(model.score(batch))
     return scores
 
 

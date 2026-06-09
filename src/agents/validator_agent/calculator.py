@@ -37,6 +37,7 @@ def calculate_category_metrics(
     *,
     block: CategoryInputBlock,
     rule_bundle: CategoryRuleBundle,
+    total_cumulative_used_amount: float | None = None,
 ) -> CategoryComputation:
     total = sum(item.amount for item in block.items)
     limit_amount = (
@@ -53,9 +54,12 @@ def calculate_category_metrics(
         block.base_amount * required_usage_rate
         if required_usage_rate is not None else None
     )
+    # 공정률 shortfall은 전체 카테고리 누적합 기준으로 판단한다.
+    # total_cumulative_used_amount가 없으면 이 카테고리의 누적금액으로 대체(하위 호환).
+    progress_cumulative = total_cumulative_used_amount if total_cumulative_used_amount is not None else cumulative_used_amount
     usage_shortfall_amount = None
-    if required_used_amount is not None and cumulative_used_amount is not None:
-        usage_shortfall_amount = max(required_used_amount - cumulative_used_amount, 0.0)
+    if required_used_amount is not None and progress_cumulative is not None:
+        usage_shortfall_amount = max(required_used_amount - progress_cumulative, 0.0)
 
     return CategoryComputation(
         total=total,

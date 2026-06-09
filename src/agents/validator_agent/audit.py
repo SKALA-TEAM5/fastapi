@@ -59,9 +59,38 @@ _CONDITIONAL_EXCLUSION_PATTERNS = (
     re.compile(r"사용할\s*수\s*있"),     # "사용할 수 있음" — 조건 내 예외 허용 문구
     re.compile(r"경우에는\s*사용"),      # "경우에는 사용할"
     re.compile(r"아니한\s*경우"),        # "하지 아니한 경우" (부정 조건)
+    re.compile(r"병행하는\s*경우"),      # "다른 업무를 병행하는 경우" (본사 전담조직 등)
+    re.compile(r"않는\s*경우"),          # "전담하지 않는 경우" 등
+    re.compile(r"경우에\s*한하"),        # "경우에 한하여" (조건부 허용)
+    re.compile(r"목적으로\s*하"),        # 특정 목적에 한정된 불허
+    re.compile(r"목적의"),               # 특정 목적의 시설/장비만 불허
+    re.compile(r"용도"),                 # 특정 용도 한정
+    re.compile(r"등에서"),               # 특정 공사/상황 예시 한정
+    re.compile(r"외의"),                 # 특정 대상 외 범위 한정
 )
-# RDB 기반 출처만 조건부 제외 판정 대상 — LLM이 생성한 불허 판단은 확정 판단으로 취급
+# RDB 기반 출처만 운영상 허용 처리 대상.
 _RDB_SOURCES = frozenset({"law_rule", "qa_rule"})
+
+# 「」 감싸기 대상 법령명 — 긴 것부터 먼저 매칭해야 중복 치환 방지
+_QUALIFIED_LAW_NAMES = [
+    "건설업 산업안전보건관리비 계상 및 사용기준",
+    "산업안전보건법 시행규칙",
+    "산업안전보건법 시행령",
+    "산업안전보건법",
+    "중대재해처벌법 시행령",
+    "중대재해처벌법",
+    "건설기술진흥법 시행령",
+    "건설기술진흥법",
+]
+
+
+def _wrap_law_name(text: str) -> str:
+    """법령명에 「」 감싸기. 이미 감싸진 경우 스킵."""
+    if not text or "「" in text:
+        return text
+    for name in _QUALIFIED_LAW_NAMES:
+        text = text.replace(name, f"「{name}」")
+    return text
 
 
 class CategoryDecisionOutput(BaseModel):
@@ -83,26 +112,11 @@ def decide_category(
     ]
     referenced_laws = _collect_laws(rule_bundle=rule_bundle, computation=computation)
 
-    # Tier 1 최적화: 전 항목이 RDB 강한 매칭으로 해결된 경우 LLM 판단 호출 생략.
-    # _resolve_final_status()와 _compose_category_reason() 모두 decision을 사용하지 않으며,
-    # final_laws에만 추가 조항이 보충되므로 생략해도 판정 결과에 영향 없음.
-    all_rdb = rule_bundle.items and all(
-        b.judgment_tier == "rdb" for b in rule_bundle.items
-    )
-    if all_rdb:
-        decision = None
-    else:
-        decision = _llm_decision(
-            block=block,
-            retrieved=retrieved,
-            rule_bundle=rule_bundle,
-            computation=computation,
-            law_candidates=referenced_laws,
-        )
-
+    # _llm_decision() 제거 — 항목별 LLM이 판단+사유를 처리하므로 카테고리 레벨 LLM 불필요
+    # 카테고리 적절성은 _hard_status() 수치 기반 하드룰로만 결정
     status = _resolve_final_status(
         hard_status=hard_status,
-        decision=decision,
+        decision=None,
         rule_bundle=rule_bundle,
         computation=computation,
         retrieved=retrieved,
@@ -111,14 +125,10 @@ def decide_category(
     rejection_reason = _compose_category_reason(
         status=status,
         hard_reason=hard_reason,
-        decision=decision,
+        decision=None,
     )
 
     final_laws = referenced_laws[:]
-    if decision:
-        for law in decision.referenced_laws:
-            if law and law not in final_laws:
-                final_laws.append(law)
 
     evidence_snippets = _build_evidence_snippets(retrieved)
     return CategoryAuditResult(
@@ -265,7 +275,21 @@ def _verbalize_from_match(
 def _build_item_judgment(bundle: ItemRuleBundle, *, category_name: str) -> ItemJudgment:
     allowed = bundle.top_allowed
     disallowed = bundle.top_disallowed
-    item_allowed = bool(allowed and (not disallowed or allowed.score >= disallowed.score))
+
+    # 조건부 불허 규칙은 항목 자체를 확정 불허하지 않는다.
+    # 운영상 allowed=True 항목은 "적절"로 넘기고, 확인 조건은 reason_text에 남긴다.
+    disallowed_is_conditional = disallowed is not None and _is_conditional_exclusion(disallowed)
+    llm_disallowed_is_conditional = (
+        disallowed is not None
+        and getattr(disallowed, "match_source", "") == "llm_fallback"
+        and _has_condition_limited_text(bundle.reason_text)
+    )
+
+    if disallowed_is_conditional:
+        item_allowed = True
+    else:
+        item_allowed = bool(allowed and (not disallowed or allowed.score >= disallowed.score))
+
     # ★ best는 item_allowed 판단 방향과 일치하는 규칙을 우선 선택한다.
     #   이전: 항상 allowed 규칙 우선 → allowed=false인 항목에 허용 근거가 붙는 문제
     if item_allowed:
@@ -275,7 +299,13 @@ def _build_item_judgment(bundle: ItemRuleBundle, *, category_name: str) -> ItemJ
     exception_source = _best_exception_source(bundle)
     exception_summary = _extract_exception_summary(exception_source)
     has_conflict = bool(allowed and disallowed and abs(allowed.score - disallowed.score) < 1.0)
-    needs_review = bool(exception_summary or has_conflict)
+    # 조건부 불허이면 조건 확인이 필요하므로 needs_human_review 강제 설정
+    needs_review = bool(
+        exception_summary
+        or has_conflict
+        or disallowed_is_conditional
+        or llm_disallowed_is_conditional
+    )
     reasoning = "직접 매칭된 규칙이 없습니다."
     referenced_laws: list[str] = []
     if best is not None:
@@ -312,7 +342,134 @@ def _build_item_judgment(bundle: ItemRuleBundle, *, category_name: str) -> ItemJ
         ),
         exception_summary=exception_summary,
         judgment_source=best.match_source if best is not None else "none",
+        reason_text=_conditional_reason_text(
+            disallowed_is_conditional=disallowed_is_conditional,
+            llm_disallowed_is_conditional=llm_disallowed_is_conditional,
+            item_allowed=item_allowed,
+            allowed=allowed,
+            disallowed=disallowed,
+            fallback=bundle.reason_text,
+            item_name=bundle.item.item_name,
+        ),
     )
+
+
+def _conditional_reason_text(
+    *,
+    disallowed_is_conditional: bool,
+    llm_disallowed_is_conditional: bool,
+    item_allowed: bool,
+    allowed,
+    disallowed,
+    fallback: str,
+    item_name: str = "",
+) -> str:
+    """
+    조건부 불허 케이스는 판정은 허용으로 두고, 제외 가능 조건만 사유에 남긴다.
+    운영 흐름을 막는 "확인 필요" 문구 대신 보고서 설명에 남길 주의사항으로 작성한다.
+    """
+    if not (disallowed_is_conditional or llm_disallowed_is_conditional):
+        return fallback
+
+    # 허용 근거 법령 추출
+    law = ""
+    if allowed and allowed.referenced_laws:
+        law = allowed.referenced_laws[0]
+    elif disallowed and disallowed.referenced_laws:
+        law = disallowed.referenced_laws[0]
+
+    law_prefix = f"{_wrap_law_name(law)}에 따르면 " if law else ""
+
+    cond_text = _extract_condition_text(disallowed, fallback=fallback)
+
+    def _subject_marker(name: str) -> str:
+        """받침 있으면 '은', 없으면 '는'"""
+        if not name:
+            return "해당 항목은"
+        last = name[-1]
+        code = ord(last)
+        if 0xAC00 <= code <= 0xD7A3:
+            return f"{name}은" if (code - 0xAC00) % 28 != 0 else f"{name}는"
+        return f"{name}은"  # 비한글 fallback
+
+    item_label = _subject_marker(item_name) if item_name else "해당 항목은"
+
+    if llm_disallowed_is_conditional and not item_allowed:
+        if _looks_like_traffic_safety_condition(fallback):
+            return (
+                f"{law_prefix}{item_label} 입력 내용만으로 확정 불허로 보기 어렵습니다. "
+                "다만, 도로 확·포장공사, 관로공사, 도심지 공사 등에서 "
+                "공사차량 외의 차량 유도ㆍ안내ㆍ주의ㆍ경고 목적의 교통안전시설물로 "
+                "사용되는 경우에는 집행 제외 대상이 될 수 있어 용도 확인이 필요합니다."
+            )
+        if cond_text:
+            return (
+                f"{law_prefix}{item_label} 입력 내용만으로 확정 불허로 보기 어렵습니다. "
+                f"다만, {cond_text}{_condition_suffix(cond_text, classified=True)} "
+                "집행 제외 대상이 될 수 있어 용도 확인이 필요합니다."
+            )
+        return (
+            f"{law_prefix}{item_label} 입력 내용만으로 확정 불허로 보기 어렵습니다. "
+            "다만, 법령상 제외 조건에 해당하는지 용도 확인이 필요합니다."
+        )
+
+    if cond_text:
+        return (
+            f"{law_prefix}{item_label} 산안비 집행 가능 항목으로 봅니다. "
+            f"다만, {cond_text}{_condition_suffix(cond_text, classified=True)} "
+            "집행 제외 대상이 될 수 있습니다."
+        )
+    return (
+        f"{law_prefix}{item_label} 산안비 집행 가능 항목으로 봅니다. "
+        "다만, 법령상 제외 조건에 해당하는 경우에는 집행 제외 대상이 될 수 있습니다."
+    )
+
+
+def _extract_condition_text(disallowed, *, fallback: str) -> str:
+    import re as _re
+
+    raw = ""
+    if disallowed and disallowed.evidence:
+        raw = disallowed.evidence.strip()
+    elif fallback:
+        raw = fallback.strip()
+    if not raw:
+        return ""
+
+    numbered = _re.findall(r"\d+\)\s*([^0-9※\n]{4,60}?)(?=\s*\d+\)|$|※|\n)", raw)
+    if numbered:
+        return ", ".join(c.strip(" .") for c in numbered[:3])
+
+    first = raw.split("\n")[0][:160].strip(" .")
+    first = _re.sub(r"^[가-힣]\.\s*", "", first).strip()
+    for marker in ("그러나 관련 법령에서는", "다만, 관련 법령에서는", "관련 법령에서는", "법령에서는"):
+        if marker in first:
+            first = first.split(marker, 1)[1].strip()
+            break
+    first = _re.sub(r"^(그러나|다만)[,\s]*", "", first).strip()
+
+    condition_only = _re.split(
+        r"\s*(?:산업안전보건관리비로\s*)?(?:사용할\s*수\s*없|사용\s*불가|불가|불허|제외)",
+        first,
+        maxsplit=1,
+    )[0]
+    condition_only = _re.sub(r"^(관련\s*법령에서는|법령에서는)\s*", "", condition_only).strip()
+    condition_only = _re.sub(r"[은는]$", "", condition_only.strip(" ."))
+    return condition_only
+
+
+def _condition_suffix(cond_text: str, *, classified: bool) -> str:
+    if cond_text.endswith("경우"):
+        return "에는"
+    if classified:
+        return "으로 분류되는 경우에는"
+    return "에 해당하는 경우에는"
+
+
+def _looks_like_traffic_safety_condition(text: str) -> bool:
+    if not text:
+        return False
+    return "교통안전시설물" in text or "공사차량 외의 차량" in text
 
 
 def _resolve_final_status(
@@ -501,6 +658,12 @@ def _is_conditional_exclusion(match) -> bool:
     return any(pattern.search(evidence) for pattern in _CONDITIONAL_EXCLUSION_PATTERNS)
 
 
+def _has_condition_limited_text(text: str) -> bool:
+    if not text:
+        return False
+    return any(pattern.search(text) for pattern in _CONDITIONAL_EXCLUSION_PATTERNS)
+
+
 def _has_duplicate_cost_risk(bundle: ItemRuleBundle) -> bool:
     texts = [bundle.context_text, bundle.item_exception_text]
     for match in bundle.matches[:4]:
@@ -520,5 +683,3 @@ def _exception_snippet_score(text: str) -> tuple[int, int]:
 def _contains_exception_phrase(text: str) -> bool:
     normalized = re.sub(r"\s+", " ", text or "").strip()
     return any(pattern.search(normalized) for pattern in _EXCEPTION_PATTERNS)
-
-

@@ -41,6 +41,7 @@ from src.repositories.orchestrator_repository import (
     insert_agent_usage_record,
     scan_orchestrator_state,
     select_evidence_agents,
+    update_file_details,
     update_file_statuses,
     upsert_agent_log,
 )
@@ -631,7 +632,8 @@ def _run_link_agent(
     try:
         result = run_link_pipeline(
             usage_statement_id=usage_statement_id,
-            file_ids=target_file_ids,
+            receipt_file_ids=receipt_file_ids,
+            tax_invoice_file_ids=tax_invoice_file_ids,
         )
         summary = result.get("summary") or {}
         issue_count = sum(
@@ -723,6 +725,88 @@ def _aggregate_orchestrator_result_code(results: dict[str, Any]) -> str:
     if "hil" in result_codes:
         return "hil"
     return "success"
+
+
+def _as_dict(value: Any) -> dict[str, Any]:
+    return value if isinstance(value, dict) else {}
+
+
+def _as_list(value: Any) -> list[Any]:
+    return value if isinstance(value, list) else []
+
+
+def _vision_result_rows(body: dict[str, Any], details: dict[str, Any]) -> list[dict[str, Any]]:
+    candidates: list[Any] = [
+        *(_as_list(body.get("results"))),
+        *(_as_list(_as_dict(body.get("result")).get("results"))),
+        *(_as_list(_as_dict(details.get("result")).get("results"))),
+    ]
+    payload = _as_dict(details.get("payload"))
+    vision_response = _as_dict(payload.get("vision_response")) or _as_dict(payload.get("visionResponse"))
+    candidates.extend(_as_list(vision_response.get("results")))
+    candidates.extend(_as_list(_as_dict(vision_response.get("result")).get("results")))
+
+    if not candidates and body.get("file_id") is not None:
+        candidates.append(body)
+
+    return [row for row in candidates if isinstance(row, dict)]
+
+
+def _vision_file_details(
+    *,
+    body: dict[str, Any],
+    details: dict[str, Any],
+    photos: list[dict[str, Any]],
+    usage_statement_id: int,
+    reason: str,
+    result_code: str,
+) -> dict[int, dict[str, Any]]:
+    photo_by_file_id = {
+        int(photo["file_id"]): photo
+        for photo in photos
+        if photo.get("file_id") is not None
+    }
+    rows = _vision_result_rows(body, details)
+
+    if not rows and len(photo_by_file_id) == 1 and body.get("detections"):
+        only_file_id = next(iter(photo_by_file_id))
+        rows = [{**body, "file_id": only_file_id}]
+
+    result: dict[int, dict[str, Any]] = {}
+    for row in rows:
+        raw_file_id = row.get("file_id") or row.get("fileId")
+        if raw_file_id is None:
+            continue
+        try:
+            file_id = int(raw_file_id)
+        except (TypeError, ValueError):
+            continue
+
+        nested_result = _as_dict(row.get("result")) or row
+        detections = _as_list(nested_result.get("detections"))
+        result[file_id] = {
+            "vision_validation": {
+                "usage_statement_id": usage_statement_id,
+                "status_code": str(body.get("status_code") or "success").lower(),
+                "result_code": result_code,
+                "reason": str(row.get("reason") or row.get("message") or reason),
+                "original_filename": (
+                    row.get("original_filename")
+                    or row.get("originalFilename")
+                    or photo_by_file_id.get(file_id, {}).get("original_filename")
+                ),
+                "image_width": nested_result.get("image_width") or nested_result.get("imageWidth"),
+                "image_height": nested_result.get("image_height") or nested_result.get("imageHeight"),
+                "is_appropriate": (
+                    row.get("is_appropriate")
+                    if row.get("is_appropriate") is not None
+                    else row.get("isAppropriate", nested_result.get("is_appropriate", nested_result.get("isAppropriate")))
+                ),
+                "detections": detections,
+            }
+        }
+
+    return result
 
 
 def _run_vision_agent(
@@ -836,6 +920,17 @@ def _run_vision_agent(
                 "todos": todos,
             }
         )
+        update_file_details(
+            project_id=project_id,
+            details_by_file_id=_vision_file_details(
+                body=body,
+                details=details,
+                photos=photos,
+                usage_statement_id=usage_statement_id,
+                reason=reason,
+                result_code=result_code,
+            ),
+        )
 
         upsert_agent_log(
             project_id=project_id,
@@ -906,7 +1001,12 @@ def _run_legal_agent(
             for result in summary_response.results
         ]
         review_count = sum(1 for row in item_results if row["status"] != "적절")
-        result_code = "hil" if review_count else "success"
+        # exceeded/shortfall은 항목 status에 반영 안 하므로 카테고리 레벨에서 별도 체크
+        category_issue_count = sum(
+            1 for s in summary_response.results
+            if s.status in {"부적절", "검토필요"}
+        )
+        result_code = "hil" if (review_count or category_issue_count) else "success"
         reason = "법령 검토 결과 특이사항 없음" if review_count == 0 else f"법령 검토 결과 보고서 반영 대상 {review_count}건"
         todos = [
             {
@@ -1148,7 +1248,7 @@ def _legal_item_results_from_audit(
                     "item_id": raw_item["행ID"],
                     "category_code": category_code,
                     "status": status,
-                    "reason": judgment.review_reason or judgment.reasoning or (summary.reason if summary else ""),
+                    "reason": judgment.reason_text or judgment.review_reason or judgment.reasoning or "",
                     "citations": citations,
                 }
             )
@@ -1156,12 +1256,12 @@ def _legal_item_results_from_audit(
 
 
 def _legal_status_from_judgment(judgment, category_status: str) -> str:
-    if judgment.needs_human_review:
-        return "검토필요"
     if not judgment.allowed:
+        if judgment.needs_human_review:
+            return "검토필요"
         return "부적절"
-    if category_status in {"부적절", "검토필요"}:
-        return category_status
+    # allowed=True이면 needs_human_review 포함 모두 적절.
+    # 전담 여부 등 조건/주의사항은 reason_text에 남긴다.
     return "적절"
 
 
