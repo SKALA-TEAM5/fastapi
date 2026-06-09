@@ -8,8 +8,8 @@ DB에서 usage_statement_items를 가져와 classi Agent를 실행하는 확인 
 
 기본 모드는 실제 카테고리를 수정하거나 agent_logs에 INSERT하지 않고,
 orchestrator의 classi 완료 로그와 같은 aggregate row payload를 출력한다.
---item-id를 주면 orchestrator의 classify_existing_usage_statement() 단건 경로를
-INSERT 없이 재현한 row payload를 출력한다.
+--item-id를 주면 orchestrator의 classify_existing_usage_statement() 단건 요청/응답/agent_logs
+payload 형식을 INSERT 없이 재현한다.
 """
 
 from __future__ import annotations
@@ -17,6 +17,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+from decimal import Decimal
 from typing import Any
 
 import psycopg2
@@ -26,6 +27,7 @@ from langchain_openai import ChatOpenAI
 
 from src.agents.classifier_agent.agent import review_usage_statement
 from src.core import llm_config
+from src.schemas.orchestrator import UsageStatementClassifyRequest
 
 load_dotenv()
 
@@ -205,6 +207,131 @@ def _aggregate_agent_log_payload(
     }
 
 
+def _to_decimal(value: Any) -> Decimal | None:
+    if value is None:
+        return None
+    return Decimal(str(value))
+
+
+def _to_int(value: Any) -> int | None:
+    if value is None:
+        return None
+    return int(Decimal(str(value)).to_integral_value())
+
+
+def _build_orchestrator_request(
+    *,
+    project_id: int,
+    usage_statement_id: int,
+    row: dict[str, Any],
+) -> UsageStatementClassifyRequest:
+    return UsageStatementClassifyRequest(
+        project_id=project_id,
+        usage_statement_id=usage_statement_id,
+        item_id=row["row_id"],
+        category_code=row.get("given_category_code") or "",
+        item_name=row.get("item_name") or "",
+        used_on=row.get("used_on"),
+        unit=row.get("unit"),
+        quantity=_to_decimal(row.get("quantity")),
+        unit_price=_to_decimal(row.get("unit_price")),
+        total_amount=_to_int(row.get("total_amount")),
+        remark=row.get("remark") or None,
+    )
+
+
+def _orchestrator_single_item_payload(
+    *,
+    request: UsageStatementClassifyRequest,
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    submitted_category = request.category_code or ""
+    review_response = review_usage_statement(
+        usage_statement_id=request.usage_statement_id,
+        rows=[
+            {
+                "row_id": 1,
+                "given_category_code": submitted_category,
+                "item_name": request.item_name,
+            }
+        ],
+        basic_info={},
+    )
+    review_map = {result.row_id: result for result in review_response.results}
+    review = review_map.get(1)
+
+    if review is None:
+        updated_category = submitted_category
+        status = "appropriate"
+        reason = "classifier result was missing, so the submitted category was kept."
+        item_name = request.item_name
+    else:
+        updated_category = review.final_category_code or submitted_category
+        status = "appropriate" if review.decision_status == "유지" else "inappropriate"
+        reason = review.reason
+        item_name = review.item_name
+
+    changes: list[dict[str, Any]] = []
+    if updated_category != submitted_category:
+        changes.append(
+            {
+                "row_id": 1,
+                "item_id": request.item_id,
+                "item_name": item_name,
+                "before": {"category_code": submitted_category},
+                "after": {"category_code": updated_category},
+                "reason": reason,
+            }
+        )
+
+    changed_count = len(changes)
+    summary = (
+        f"세부내역 {changed_count}건을 올바른 항목으로 이동했습니다."
+        if changed_count
+        else "세부내역 분류 이동 없음"
+    )
+    details = {
+        "event": "classification_updated" if changed_count else "classification_checked",
+        "summary": summary,
+        "payload": {
+            "changed_count": changed_count,
+            "kept_count": 0 if changed_count else 1,
+            "changes": changes,
+            "results": [
+                {
+                    "row_id": 1,
+                    "item_id": request.item_id,
+                    "item_name": item_name,
+                    "original_category_code": submitted_category,
+                    "final_category_code": updated_category,
+                    "status": status,
+                    "reason": reason,
+                }
+            ],
+        },
+    }
+    response_payload = {
+        "status": "success",
+        "message": summary,
+        "usage_statement_id": request.usage_statement_id,
+        "target_agents": ["classi"],
+        "hil_agents": [],
+        "result": details,
+    }
+    agent_log_payload = {
+        "project_id": request.project_id,
+        "usage_statement_id": request.usage_statement_id,
+        "usage_statement_item_id": None,
+        "agent_type_code": "classi",
+        "status_code": "success",
+        "result_code": "success",
+        "reason": summary,
+        "details": details,
+        "model_name": "classifier_agent",
+        "token": None,
+    }
+    return response_payload, agent_log_payload
+
+
 def run_aggregate_classi(
     *,
     usage_statement_id: int,
@@ -266,25 +393,24 @@ def run_orchestrator_single_item(
     if row is None:
         raise ValueError(f"usage_statement id={usage_statement_id} item_id={item_id} 없음")
 
-    response = review_usage_statement(
-        usage_statement_id=usage_statement_id,
-        rows=[row],
-        basic_info=data["basic_info"],
-    )
-    details = _result_details(response.results)
-    agent_log = _aggregate_agent_log_payload(
+    request = _build_orchestrator_request(
         project_id=project_id,
         usage_statement_id=usage_statement_id,
-        details=details,
+        row=row,
     )
 
     print(f"\n{'=' * 76}")
-    print("  orchestrator classify_existing_usage_statement 단건 로그 payload 재현")
+    print("  orchestrator classify_existing_usage_statement 단건 경로")
     print(f"{'=' * 76}\n")
     print(f"[요청] project_id={project_id} | usage_statement_id={usage_statement_id} | item_id={item_id}")
     if verbose:
-        print(json.dumps(row, ensure_ascii=False, indent=2, default=str))
+        print("\n[orchestrator request]")
+        print(json.dumps(request.model_dump(), ensure_ascii=False, indent=2, default=str))
 
+    response_payload, agent_log = _orchestrator_single_item_payload(request=request)
+    print("\n[모드] dry-run: 실제 orchestrator 호출/agent_logs INSERT 없음")
+    print("\n[orchestrator response payload]")
+    print(json.dumps(response_payload, ensure_ascii=False, indent=2, default=str))
     print("\n[agent_logs payload]")
     print(json.dumps(agent_log, ensure_ascii=False, indent=2, default=str))
 

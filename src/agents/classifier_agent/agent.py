@@ -33,9 +33,7 @@ from pydantic import BaseModel, Field
 
 from src.core.rag import (
     MAX_RETRY,
-    _get_rerank_model,
     build_retriever,
-    rerank,
     retrieve,
     rewrite_query,
 )
@@ -236,11 +234,9 @@ def _retrieve_docs(question: str, collection: str) -> list[Document]:
         "retry_count": 0,
     }
     state = retrieve(state, retriever)
-    state = rerank(state)
     while not state["retrieved_docs"] and state.get("retry_count", 0) < MAX_RETRY:
         state = rewrite_query(state)
         state = retrieve(state, retriever)
-        state = rerank(state)
     return state["retrieved_docs"]
 
 
@@ -892,9 +888,6 @@ def review_usage_statement(
     if not request.rows:
         results: list[RowReviewResult] = []
     else:
-        # 병렬 구간 진입 전에 reranker를 한 번만 초기화해
-        # 스레드 간 중복 모델 로딩과 종료 시 리소스 경고를 줄인다.
-        _get_rerank_model()
         max_workers = min(8, len(request.rows))
 
         def _run() -> list[RowReviewResult]:
