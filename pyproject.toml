@@ -47,7 +47,7 @@ dependencies = [
   "rank-bm25>=0.2.2",
   "requests>=2.31.0",
   "selenium>=4.15.0",
-  "sentence-transformers>=5.4.1",
+  "sentence-transformers[onnx]>=5.4.1",
   "torch==2.9.1+cpu",
   "torchvision==0.24.1+cpu",
   "uvicorn>=0.46.0",
