@@ -9,7 +9,9 @@ DB에서 직접 usage_statement 데이터를 가져와 validator를 테스트하
 
 import argparse
 import json
+import logging
 import os
+from time import perf_counter
 
 import psycopg2
 import psycopg2.extras
@@ -224,7 +226,30 @@ def main() -> None:
     parser.add_argument("--id", type=int, default=1, help="usage_statement id (기본값: 1)")
     parser.add_argument("--model", default="gpt-4o-mini")
     parser.add_argument("--verbose", "-v", action="store_true")
+    parser.add_argument(
+        "--force-cpu-reranker",
+        action="store_true",
+        help="로컬 MPS를 쓰지 않고 reranker를 CPU로 강제 실행",
+    )
+    parser.add_argument(
+        "--debug-timing",
+        action="store_true",
+        help="validator/RAG 단계별 소요 시간을 로그로 출력",
+    )
     args = parser.parse_args()
+
+    if args.force_cpu_reranker:
+        os.environ["RAG_FORCE_CPU"] = "true"
+        import torch
+        torch.backends.mps.is_available = lambda: False
+    if args.debug_timing:
+        os.environ["VALIDATOR_TIMING_LOGS"] = "true"
+        logging.basicConfig(
+            level=logging.INFO,
+            format="%(asctime)s %(levelname)s %(name)s - %(message)s",
+        )
+        for noisy_logger in ("httpx", "httpcore", "huggingface_hub"):
+            logging.getLogger(noisy_logger).setLevel(logging.WARNING)
 
     api_key = os.getenv("OPENAI_API_KEY")
     if api_key:
@@ -235,8 +260,12 @@ def main() -> None:
     print(f"{'=' * 70}\n")
 
     # 1. DB 조회
+    total_started = perf_counter()
+    db_started = perf_counter()
     v1_input = fetch_v1_input(args.id)
     validator_input = _validator_input_from_v1(v1_input)
+    if args.debug_timing:
+        print(f"[timing][test.db_fetch] elapsed={perf_counter() - db_started:.3f}s")
 
     print("[v1_input 요약]")
     print(f"  project_id       : {v1_input['project']['id']}")
@@ -251,8 +280,14 @@ def main() -> None:
 
     # 2. Validator 실행
     print("\nValidator 실행 중...\n")
+    validator_started = perf_counter()
     response: AuditResponse = validate_usage_statement(document=validator_input)
+    if args.debug_timing:
+        print(f"[timing][test.validate_usage_statement] elapsed={perf_counter() - validator_started:.3f}s")
+    summary_started = perf_counter()
     summary_response = summarize_audit_response(response=response, usage_statement_id=args.id)
+    if args.debug_timing:
+        print(f"[timing][test.summarize_audit_response] elapsed={perf_counter() - summary_started:.3f}s")
 
     # 3. orchestrator와 동일한 방식으로 결과 조립
     # category_rows: orchestrator의 _build_validator_document와 동일한 구조
@@ -307,6 +342,8 @@ def main() -> None:
 
     print("\n[agent_logs payload]")
     print(json.dumps(agent_log, ensure_ascii=False, indent=2, default=str))
+    if args.debug_timing:
+        print(f"\n[timing][test.total] elapsed={perf_counter() - total_started:.3f}s")
 
     if args.verbose:
         print("\n[AuditResponse 전체]")

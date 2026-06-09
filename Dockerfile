@@ -3,6 +3,8 @@ FROM python:3.11-slim
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
     UV_LINK_MODE=copy \
+    HF_HOME="/app/.cache/huggingface" \
+    TRANSFORMERS_CACHE="/app/.cache/huggingface/transformers" \
     PATH="/app/.venv/bin:${PATH}"
 
 WORKDIR /app
@@ -34,6 +36,13 @@ RUN --mount=type=cache,target=/root/.cache/uv \
 
 RUN --mount=type=cache,target=/root/.cache/uv \
     uv sync --frozen --no-dev
+
+# Preload local embedding and legal reranker models into the image so the first
+# orchestrator legal run does not download them from HuggingFace at runtime.
+RUN .venv/bin/python -c "\
+from sentence_transformers import CrossEncoder, SentenceTransformer; \
+SentenceTransformer('jhgan/ko-sroberta-multitask'); \
+CrossEncoder('BAAI/bge-reranker-v2-m3')"
 
 COPY src ./src
 
