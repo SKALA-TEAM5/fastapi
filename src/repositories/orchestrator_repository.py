@@ -12,7 +12,6 @@ Agent별 최신 실행 상태를 `agent_logs`에 기록한다.
 
 from __future__ import annotations
 
-import json
 import os
 from dataclasses import dataclass
 from decimal import Decimal, ROUND_HALF_UP
@@ -20,6 +19,7 @@ from typing import Any
 
 import psycopg2.extras
 
+from src.core.json_utils import json_dumps
 from src.repositories.db import get_connection
 
 
@@ -280,7 +280,7 @@ def update_file_details(
                     {
                         "project_id": project_id,
                         "file_id": file_id,
-                        "detail": json.dumps(detail, ensure_ascii=False),
+                        "detail": json_dumps(detail, ensure_ascii=False),
                     },
                 )
 
@@ -339,7 +339,7 @@ def upsert_agent_log(
     model_name: str | None = None,
     token: int | None = None,
 ) -> int:
-    payload = json.dumps(details or {}, ensure_ascii=False)
+    payload = json_dumps(details or {}, ensure_ascii=False)
     with get_connection() as conn:
         with conn.cursor() as cur:
             cur.execute(

@@ -41,6 +41,7 @@ from typing import Any
 
 from src.agents.classifier_agent.agent import review_usage_statement
 from src.core.config import CLOVA_OCR_SECRET, CLOVA_OCR_URL
+from src.core.json_utils import to_json_compatible
 from src.ocr.clova_ocr_receipt import (
     SUPPORTED_EXTS,
     call_clova_receipt,
@@ -508,7 +509,7 @@ def run_link_pipeline(
                     "항목코드": _from_category_code(r[1]),
                     "사용일자": str(r[2]) if r[2] else None,
                     "사용내역": r[3],
-                    "금액": r[4],
+                    "금액": int(r[4]) if r[4] is not None else 0,
                 }
                 for r in items_rows
             ]
@@ -563,6 +564,7 @@ def run_link_pipeline(
                 threshold=THRESHOLD_REVIEW,
                 threshold_matched=THRESHOLD_MATCHED,
             )
+            batch = to_json_compatible(batch)
 
             # ── 매칭 결과 DB 저장 ──────────────────────────────────────────
             for match_result in batch.get("results") or []:
