@@ -21,6 +21,7 @@ from src.api.routers import (
     tax_invoices,
     validation,
 )
+from src.core.metrics import configure_metrics
 
 logging.basicConfig(
     level=logging.INFO,
@@ -28,6 +29,7 @@ logging.basicConfig(
 )
 
 app = FastAPI(title="AI Workspace", version="0.1.0")
+configure_metrics(app)
 
 app.add_middleware(
     CORSMiddleware,
