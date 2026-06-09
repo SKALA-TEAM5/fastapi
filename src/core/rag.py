@@ -15,8 +15,8 @@ from typing import NamedTuple
 
 from kiwipiepy import Kiwi
 from langchain_classic.retrievers.ensemble import EnsembleRetriever
-from langchain_community.cross_encoders import HuggingFaceCrossEncoder
 from langchain_community.retrievers import BM25Retriever
+from sentence_transformers import CrossEncoder
 from langchain_core.documents import Document
 from langchain_core.output_parsers import StrOutputParser
 from langchain_core.retrievers import BaseRetriever
@@ -45,7 +45,7 @@ class _RetrieverCache(NamedTuple):
 
 _retriever_cache: _RetrieverCache | None = None
 _retriever_cache_lock = Lock()
-_rerank_model: HuggingFaceCrossEncoder | None = None
+_rerank_model: CrossEncoder | None = None
 _rerank_model_lock = Lock()
 _rerank_score_lock = Lock()
 
@@ -116,30 +116,34 @@ def retrieve(state: AgenticRAGState, retriever: BaseRetriever) -> AgenticRAGStat
     return {**state, "retrieved_docs": docs}
 
 
-def _get_rerank_model() -> HuggingFaceCrossEncoder:
+def _get_rerank_model() -> CrossEncoder:
     global _rerank_model
     if _rerank_model is None:
         with _rerank_model_lock:
             if _rerank_model is None:
-                import torch
-
-                device = "mps" if torch.backends.mps.is_available() else "cpu"
-                log.info(f"ReRanker 로드 중 ({device}): {_RERANK_MODEL}")
-                _rerank_model = HuggingFaceCrossEncoder(
-                    model_name=_RERANK_MODEL,
-                    model_kwargs={"device": device},
-                )
+                import platform
+                if platform.system() == "Linux":
+                    # K8s (x86 Linux): ONNX Runtime으로 3-4배 빠른 추론
+                    log.info(f"ReRanker 로드 중 (ONNX/cpu): {_RERANK_MODEL}")
+                    _rerank_model = CrossEncoder(_RERANK_MODEL, backend="onnx")
+                else:
+                    # Mac: CoreML 간섭 문제로 PyTorch 사용
+                    import torch
+                    device = "mps" if torch.backends.mps.is_available() else "cpu"
+                    log.info(f"ReRanker 로드 중 ({device}): {_RERANK_MODEL}")
+                    _rerank_model = CrossEncoder(_RERANK_MODEL)
+                log.info("ReRanker 로드 완료")
     return _rerank_model
 
 
-def _score_in_batches(model: HuggingFaceCrossEncoder, pairs: list) -> list[float]:
+def _score_in_batches(model: CrossEncoder, pairs: list) -> list[float]:
     scores: list[float] = []
-    # HuggingFace fast tokenizers are not thread-safe when the shared cross-encoder
-    # is called from validator category workers in parallel.
+    # ONNX 백엔드는 thread-safe하지 않으므로 lock 유지
     with _rerank_score_lock:
         for i in range(0, len(pairs), _BATCH_SIZE):
             batch = pairs[i : i + _BATCH_SIZE]
-            scores.extend(model.score(batch))
+            result = model.predict(batch)
+            scores.extend(result.tolist() if hasattr(result, "tolist") else list(result))
     return scores
 
 
