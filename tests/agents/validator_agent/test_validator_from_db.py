@@ -175,6 +175,48 @@ def _validator_input_from_v1(v1_input: dict) -> dict:
     }
 
 
+def _agent_logs_from_response(
+    *,
+    v1_input: dict,
+    summary_response,
+    item_results: list[dict],
+    result_code: str,
+    reason: str,
+    todos: list[dict],
+    model_name: str,
+) -> dict:
+    """DB에 쓰지 않고 orchestrator _run_legal_agent()의 upsert row payload를 만든다."""
+    project_id = int(v1_input["project"]["id"])
+    usage_statement_id = int(v1_input["usage_statement"]["id"])
+    category_results = [
+        result.model_dump(mode="json", by_alias=False)
+        for result in summary_response.results
+    ]
+
+    return {
+        "project_id": project_id,
+        "usage_statement_id": usage_statement_id,
+        "usage_statement_item_id": None,
+        "agent_type_code": "legal",
+        "status_code": "success",
+        "result_code": result_code,
+        "reason": reason,
+        "details": {
+            "event": "legal_completed",
+            "summary": reason,
+            "payload": {
+                "she_user_id": None,
+                "usage_statement_id": usage_statement_id,
+                "category_results": category_results,
+                "results": item_results,
+                "todos": todos,
+            },
+        },
+        "model_name": model_name,
+        "token": None,
+    }
+
+
 # ── 실행 ─────────────────────────────────────────────────────────────────────
 
 def main() -> None:
@@ -245,6 +287,15 @@ def main() -> None:
         for row in item_results
         if row["status"] != "적절"
     ]
+    agent_log = _agent_logs_from_response(
+        v1_input=v1_input,
+        summary_response=summary_response,
+        item_results=item_results,
+        result_code=result_code,
+        reason=reason,
+        todos=todos,
+        model_name="validator_agent",
+    )
 
     print(f"[결과] result_code={result_code} | {reason}")
     print(f"  항목 이슈: {review_count}건 / 카테고리 이슈: {category_issue_count}건")
@@ -253,6 +304,9 @@ def main() -> None:
     if todos:
         print("\n[todos]")
         print(json.dumps(todos, ensure_ascii=False, indent=2, default=str))
+
+    print("\n[agent_logs payload]")
+    print(json.dumps(agent_log, ensure_ascii=False, indent=2, default=str))
 
     if args.verbose:
         print("\n[AuditResponse 전체]")
