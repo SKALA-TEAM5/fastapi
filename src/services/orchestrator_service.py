@@ -996,6 +996,13 @@ def _run_legal_agent(
             summary_response=summary_response,
             category_rows=category_rows,
         )
+        linked_file_names_by_item_id = _linked_file_names_by_item_id(usage_statement_id)
+        frontend_categories = _legal_frontend_categories(
+            summary_response=summary_response,
+            item_results=item_results,
+            category_rows=category_rows,
+            linked_file_names_by_item_id=linked_file_names_by_item_id,
+        )
         category_results = [
             result.model_dump(mode="json", by_alias=False)
             for result in summary_response.results
@@ -1032,6 +1039,7 @@ def _run_legal_agent(
                     "category_results": category_results,
                     "results": item_results,
                     "todos": todos,
+                    "categories": frontend_categories,
                 },
             },
             model_name="validator_agent",
@@ -1253,6 +1261,173 @@ def _legal_item_results_from_audit(
                 }
             )
     return results
+
+
+def _legal_frontend_categories(
+    *,
+    summary_response,
+    item_results: list[dict[str, Any]],
+    category_rows: dict[str, list[dict[str, Any]]],
+    linked_file_names_by_item_id: dict[int, list[str]],
+) -> list[dict[str, Any]]:
+    item_results_by_category: dict[str, list[dict[str, Any]]] = {}
+    for item_result in item_results:
+        category_code = str(item_result.get("category_code") or "")
+        item_results_by_category.setdefault(category_code, []).append(item_result)
+
+    categories: list[dict[str, Any]] = []
+    for summary in summary_response.results:
+        category_code = str(summary.category_code)
+        rows = category_rows.get(category_code) or []
+        category_item_results = item_results_by_category.get(category_code) or []
+        usage_amount = sum(_number_or_none(row.get("금액")) or 0 for row in rows)
+        decision = _frontend_legal_decision(str(summary.status))
+        issue_item_ids = {
+            item_result.get("item_id")
+            for item_result in category_item_results
+            if str(item_result.get("status") or "") != "적절"
+        }
+        disputed_amount = sum(
+            _number_or_none(row.get("금액")) or 0
+            for row in rows
+            if row.get("행ID") in issue_item_ids
+        )
+        if decision != "appropriate" and disputed_amount == 0:
+            disputed_amount = usage_amount
+        recognized_amount = max(0, usage_amount - disputed_amount)
+        categories.append(
+            {
+                "categoryId": _category_id_number(category_code),
+                "categoryName": CATEGORIES.get(category_code, category_code),
+                "categoryCode": category_code,
+                "usageAmount": usage_amount,
+                "recognizedAmount": recognized_amount,
+                "disputedAmount": disputed_amount,
+                "decision": decision,
+                "riskLevel": _frontend_legal_risk_level(decision),
+                "legalBasis": _frontend_legal_basis(summary, category_item_results),
+                "issues": _frontend_legal_issues(
+                    category_item_results,
+                    str(summary.reason),
+                    linked_file_names_by_item_id,
+                ),
+            }
+        )
+    return categories
+
+
+def _linked_file_names_by_item_id(usage_statement_id: int) -> dict[int, list[str]]:
+    with get_connection() as conn:
+        with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+            cur.execute(
+                """
+                SELECT efl.usage_statement_item_id AS item_id,
+                       f.original_filename
+                FROM evidence_file_links efl
+                JOIN usage_statement_items usi ON usi.id = efl.usage_statement_item_id
+                JOIN files f ON f.id = efl.file_id
+                WHERE usi.usage_statement_id = %(usage_statement_id)s
+                ORDER BY efl.usage_statement_item_id, f.uploaded_at, f.id
+                """,
+                {"usage_statement_id": usage_statement_id},
+            )
+            rows = cur.fetchall()
+
+    result: dict[int, list[str]] = {}
+    for row in rows:
+        item_id = _int_or_none(row.get("item_id"))
+        filename = str(row.get("original_filename") or "").strip()
+        if item_id is None or not filename:
+            continue
+        result.setdefault(item_id, []).append(filename)
+    return result
+
+
+def _category_id_number(category_code: str) -> int:
+    try:
+        return int(category_code.removeprefix("CAT_"))
+    except ValueError:
+        return 0
+
+
+def _frontend_legal_decision(status: str) -> str:
+    normalized = status.strip().lower()
+    if normalized in {"부적절", "inappropriate", "invalid", "fail", "failed"}:
+        return "inappropriate"
+    if normalized in {"검토필요", "검토 필요", "needs_review", "review", "conditional", "hil"}:
+        return "conditional"
+    return "appropriate"
+
+
+def _frontend_legal_risk_level(decision: str) -> str:
+    if decision == "inappropriate":
+        return "high"
+    if decision == "conditional":
+        return "medium"
+    return "low"
+
+
+def _frontend_legal_basis(summary, item_results: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    basis_by_key: dict[str, dict[str, Any]] = {}
+    for source in getattr(summary, "sources", []) or []:
+        law_name = str(getattr(source, "law", "") or "산업안전보건관리비 계상 및 사용기준")
+        basis_by_key[law_name] = {
+            "lawName": law_name,
+            "article": "",
+            "clause": "",
+            "summary": str(getattr(source, "summary", "") or ""),
+            "agentReasoning": str(getattr(summary, "reason", "") or ""),
+        }
+    for item_result in item_results:
+        for citation in item_result.get("citations") or []:
+            if not isinstance(citation, dict):
+                continue
+            law_name = str(citation.get("legal_basis") or "산업안전보건관리비 계상 및 사용기준")
+            basis_by_key.setdefault(
+                law_name,
+                {
+                    "lawName": law_name,
+                    "article": "",
+                    "clause": "",
+                    "summary": str(citation.get("summary") or ""),
+                    "agentReasoning": str(item_result.get("reason") or getattr(summary, "reason", "") or ""),
+                },
+            )
+    if basis_by_key:
+        return list(basis_by_key.values())
+    return [
+        {
+            "lawName": "산업안전보건관리비 계상 및 사용기준",
+            "article": "",
+            "clause": "",
+            "summary": "",
+            "agentReasoning": str(getattr(summary, "reason", "") or ""),
+        }
+    ]
+
+
+def _frontend_legal_issues(
+    item_results: list[dict[str, Any]],
+    fallback_reason: str,
+    linked_file_names_by_item_id: dict[int, list[str]],
+) -> list[dict[str, Any]]:
+    issues: list[dict[str, Any]] = []
+    for item_result in item_results:
+        status = str(item_result.get("status") or "")
+        if status == "적절":
+            continue
+        item_id = _int_or_none(item_result.get("item_id"))
+        reason = str(item_result.get("reason") or fallback_reason or "법령 검토가 필요합니다.")
+        issues.append(
+            {
+                "title": "법령 검토 필요" if status == "검토필요" else "부적정 사용 가능성",
+                "description": reason,
+                "problemFileNames": linked_file_names_by_item_id.get(item_id, []) if item_id is not None else [],
+                "requiredAction": reason,
+                "recommendedFiles": [],
+            }
+        )
+    return issues
 
 
 def _legal_status_from_judgment(judgment, category_status: str) -> str:
