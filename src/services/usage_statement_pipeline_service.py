@@ -68,7 +68,7 @@ from src.services.matching_service_monthly import (
     THRESHOLD_REVIEW,
     match_all_usage_to_receipts,
 )
-from src.services.s3_client import fetch_file
+from src.services.minio_client import fetch_file
 
 # ─────────────────────────────────────────────────────────────
 # 내부 헬퍼
@@ -368,11 +368,11 @@ def parse_usage_statement(usage_file_id: int) -> dict[str, Any]:
             )
             items_with_id = [
                 {
-                    "item_id":       line_id_to_item_id.get(item.get("line_id")),
+                    "item_id": line_id_to_item_id.get(item.get("line_id")),
                     "category_code": item.get("category_code") or item.get("항목코드"),
-                    "used_on":       item.get("used_on") or item.get("사용일자"),
-                    "item_name":     item.get("item_name") or item.get("사용내역"),
-                    "total_amount":  item.get("total_amount") or item.get("금액"),
+                    "used_on": item.get("used_on") or item.get("사용일자"),
+                    "item_name": item.get("item_name") or item.get("사용내역"),
+                    "total_amount": item.get("total_amount") or item.get("금액"),
                 }
                 for item in line_items
                 if line_id_to_item_id.get(item.get("line_id"))

@@ -12,15 +12,17 @@ from dotenv import load_dotenv
 
 # 프로젝트 루트의 .env 로드 (없으면 상위 디렉토리까지 탐색 — skala 모노레포 구조 대응)
 _ROOT = Path(__file__).parent.parent.parent
-load_dotenv(_ROOT / ".env")          # fastapi/.env 우선
-load_dotenv(_ROOT.parent / ".env")   # skala/.env fallback (override=False 기본값 — 이미 로드된 값은 덮어쓰지 않음)
+load_dotenv(_ROOT / ".env")  # fastapi/.env 우선
+load_dotenv(
+    _ROOT.parent / ".env"
+)  # skala/.env fallback (override=False 기본값 — 이미 로드된 값은 덮어쓰지 않음)
 
 
 # ══════════════════════════════════════════════
 # OCR 엔진 선택
-# OCR_ENGINE=clova  → NAVER CLOVA OCR (인쇄 영수증, 저비용)
-# OCR_ENGINE=vlm    → Gemini / OpenAI VLM (수기 포함 전체, 고품질) ← 기본값
 # ══════════════════════════════════════════════
+# OCR_ENGINE=clova  → NAVER CLOVA OCR (인쇄 영수증, 저비용)
+# OCR_ENGINE=vlm    → Gemini / OpenAI VLM (수기 포함, 고품질) ← 기본값
 
 OCR_ENGINE: str = os.getenv("OCR_ENGINE", "vlm").lower()
 
@@ -37,14 +39,14 @@ CLOVA_OCR_SECRET: str = os.getenv("CLOVA_OCR_SECRET", "")
 # VLM — Gemini / OpenAI (OCR_ENGINE=vlm 시 사용)
 # ══════════════════════════════════════════════
 
-VLM_PROVIDER: str          = os.getenv("VLM_PROVIDER", "gemini").lower()
+VLM_PROVIDER: str = os.getenv("VLM_PROVIDER", "gemini").lower()
 
-GEMINI_API_KEY: str        = os.getenv("GEMINI_API_KEY", "")
-GEMINI_MODEL: str          = os.getenv("GEMINI_MODEL", "gemini-2.0-flash-lite")
-GEMINI_MODEL_FALLBACK: str = os.getenv("GEMINI_MODEL_FALLBACK", "gemini-2.5-flash")
+GEMINI_API_KEY: str = os.getenv("GEMINI_API_KEY", "")
+GEMINI_MODEL: str = os.getenv("GEMINI_MODEL", "gemini-3.1-flash-lite")
+GEMINI_MODEL_FALLBACK: str = os.getenv("GEMINI_MODEL_FALLBACK", "gemini-3.5-flash")
 
-OPENAI_API_KEY: str        = os.getenv("OPENAI_API_KEY", "")
-OPENAI_MODEL: str          = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
+OPENAI_API_KEY: str = os.getenv("OPENAI_API_KEY", "")
+OPENAI_MODEL: str = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
 OPENAI_MODEL_FALLBACK: str = os.getenv("OPENAI_MODEL_FALLBACK", "gpt-4o")
 
 
@@ -66,10 +68,18 @@ DB_NAME: str = os.getenv("POSTGRES_DB", "safety")
 DB_USER: str = os.getenv("SERVICE_APP_USER", "safety_user")
 DB_PASSWORD: str = os.getenv("SERVICE_APP_PASSWORD", "safety_password")
 DB_SCHEMA: str = "service"
+LAW_DB_USER: str = os.getenv("LAW_APP_USER", "safety_law_app")
+LAW_DB_PASSWORD: str = os.getenv("LAW_APP_PASSWORD", "safety_law_password")
+LAW_DB_SCHEMA: str = "legal_rag"
 
 DATABASE_URL: str = (
     f"postgresql://{DB_USER}:{DB_PASSWORD}@{DB_HOST}:{DB_PORT}/{DB_NAME}"
     f"?options=-csearch_path%3D{DB_SCHEMA}"
+)
+
+LEGAL_DATABASE_URL: str = (
+    f"postgresql://{LAW_DB_USER}:{LAW_DB_PASSWORD}@{DB_HOST}:{DB_PORT}/{DB_NAME}"
+    f"?options=-csearch_path%3D{LAW_DB_SCHEMA}"
 )
 
 
@@ -85,10 +95,37 @@ QDRANT_API_KEY: str = os.getenv("QDRANT_API_KEY", "")  # Cloud 사용 시에만 
 
 
 # ══════════════════════════════════════════════
-# AWS S3
+# AWS S3 / MinIO
 # ══════════════════════════════════════════════
 
-AWS_ACCESS_KEY_ID: str = os.getenv("AWS_ACCESS_KEY_ID", "")
-AWS_SECRET_ACCESS_KEY: str = os.getenv("AWS_SECRET_ACCESS_KEY", "")
+AWS_ACCESS_KEY_ID: str = os.getenv("AWS_ACCESS_KEY_ID") or os.getenv(
+    "APP_MINIO_ACCESS_KEY", ""
+)
+AWS_SECRET_ACCESS_KEY: str = os.getenv("AWS_SECRET_ACCESS_KEY") or os.getenv(
+    "APP_MINIO_SECRET_KEY", ""
+)
 AWS_REGION: str = os.getenv("AWS_REGION", "ap-northeast-2")
-S3_BUCKET: str = os.getenv("S3_BUCKET", "")  # 필수 — 버킷 이름 확정 후 .env에 설정
+S3_REGION: str = os.getenv("S3_REGION", "us-east-1")
+S3_BUCKET: str = os.getenv("S3_BUCKET") or os.getenv(
+    "APP_MINIO_BUCKET", ""
+)  # 필수 — 버킷 이름 확정 후 .env에 설정
+S3_ENDPOINT_URL: str = os.getenv("S3_ENDPOINT_URL") or os.getenv(
+    "APP_MINIO_ENDPOINT", ""
+)
+S3_PUBLIC_ENDPOINT_URL: str = (
+    os.getenv("S3_PUBLIC_ENDPOINT_URL")
+    or os.getenv("APP_MINIO_PUBLIC_ENDPOINT")
+    or S3_ENDPOINT_URL
+)
+S3_PRESIGNED_URL_EXPIRE_SECONDS: int = int(
+    os.getenv("S3_PRESIGNED_URL_EXPIRE_SECONDS", "900")
+)
+
+
+# ══════════════════════════════════════════════
+# External Agents
+# ══════════════════════════════════════════════
+
+VISION_AGENT_BASE_URL: str = os.getenv("VISION_AGENT_BASE_URL", "")
+VISION_AGENT_REVIEW_PATH: str = os.getenv("VISION_AGENT_REVIEW_PATH", "/vision/review")
+VISION_AGENT_TIMEOUT_SECONDS: int = int(os.getenv("VISION_AGENT_TIMEOUT_SECONDS", "60"))
