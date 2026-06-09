@@ -349,6 +349,7 @@ def _build_item_judgment(bundle: ItemRuleBundle, *, category_name: str) -> ItemJ
             allowed=allowed,
             disallowed=disallowed,
             fallback=bundle.reason_text,
+            item_name=bundle.item.item_name,
         ),
     )
 
@@ -361,6 +362,7 @@ def _conditional_reason_text(
     allowed,
     disallowed,
     fallback: str,
+    item_name: str = "",
 ) -> str:
     """
     조건부 불허 케이스는 판정은 허용으로 두고, 제외 가능 조건만 사유에 남긴다.
@@ -380,33 +382,45 @@ def _conditional_reason_text(
 
     cond_text = _extract_condition_text(disallowed, fallback=fallback)
 
+    def _subject_marker(name: str) -> str:
+        """받침 있으면 '은', 없으면 '는'"""
+        if not name:
+            return "해당 항목은"
+        last = name[-1]
+        code = ord(last)
+        if 0xAC00 <= code <= 0xD7A3:
+            return f"{name}은" if (code - 0xAC00) % 28 != 0 else f"{name}는"
+        return f"{name}은"  # 비한글 fallback
+
+    item_label = _subject_marker(item_name) if item_name else "해당 항목은"
+
     if llm_disallowed_is_conditional and not item_allowed:
         if _looks_like_traffic_safety_condition(fallback):
             return (
-                f"{law_prefix}해당 항목은 입력 내용만으로 확정 불허로 보기 어렵습니다. "
+                f"{law_prefix}{item_label} 입력 내용만으로 확정 불허로 보기 어렵습니다. "
                 "다만, 도로 확·포장공사, 관로공사, 도심지 공사 등에서 "
                 "공사차량 외의 차량 유도ㆍ안내ㆍ주의ㆍ경고 목적의 교통안전시설물로 "
                 "사용되는 경우에는 집행 제외 대상이 될 수 있어 용도 확인이 필요합니다."
             )
         if cond_text:
             return (
-                f"{law_prefix}해당 항목은 입력 내용만으로 확정 불허로 보기 어렵습니다. "
+                f"{law_prefix}{item_label} 입력 내용만으로 확정 불허로 보기 어렵습니다. "
                 f"다만, {cond_text}{_condition_suffix(cond_text, classified=True)} "
                 "집행 제외 대상이 될 수 있어 용도 확인이 필요합니다."
             )
         return (
-            f"{law_prefix}해당 항목은 입력 내용만으로 확정 불허로 보기 어렵습니다. "
+            f"{law_prefix}{item_label} 입력 내용만으로 확정 불허로 보기 어렵습니다. "
             "다만, 법령상 제외 조건에 해당하는지 용도 확인이 필요합니다."
         )
 
     if cond_text:
         return (
-            f"{law_prefix}해당 항목은 산안비 집행 가능 항목으로 봅니다. "
+            f"{law_prefix}{item_label} 산안비 집행 가능 항목으로 봅니다. "
             f"다만, {cond_text}{_condition_suffix(cond_text, classified=True)} "
             "집행 제외 대상이 될 수 있습니다."
         )
     return (
-        f"{law_prefix}해당 항목은 산안비 집행 가능 항목으로 봅니다. "
+        f"{law_prefix}{item_label} 산안비 집행 가능 항목으로 봅니다. "
         "다만, 법령상 제외 조건에 해당하는 경우에는 집행 제외 대상이 될 수 있습니다."
     )
 

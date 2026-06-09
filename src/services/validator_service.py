@@ -46,16 +46,13 @@ try:
 except ImportError:  # pragma: no cover
     get_openai_callback = None  # type: ignore
 
+from src.agents.validator_agent.audit import decide_category
 from src.agents.validator_agent.calculator import calculate_category_metrics
 from src.agents.validator_agent.context_retriever import retrieve_category_context
-from src.agents.validator_agent.audit import decide_category
 from src.agents.validator_agent.parser import (
     build_legacy_blocks,
     parse_single_category_request,
     parse_usage_statement,
-)
-from src.agents.validator_agent.presenter import (
-    _synthesize_item_reason_with_llm as _llm_synthesize_item_reason,
 )
 from src.agents.validator_agent.rule_matcher import match_category_rules
 from src.core.storage import DEFAULT_COLLECTION
@@ -117,10 +114,14 @@ def validate_usage_statement_service(
     total_tokens: int | None = None
     if get_openai_callback is not None:
         with get_openai_callback() as cb:
-            response = _validate_blocks(parsed.base_amount, parsed.blocks, collection=collection)
+            response = _validate_blocks(
+                parsed.base_amount, parsed.blocks, collection=collection
+            )
         total_tokens = cb.total_tokens or None
     else:
-        response = _validate_blocks(parsed.base_amount, parsed.blocks, collection=collection)
+        response = _validate_blocks(
+            parsed.base_amount, parsed.blocks, collection=collection
+        )
 
     if project_id is not None and usage_statement_id is not None:
         _write_legal_agent_log(
@@ -183,24 +184,29 @@ def _write_legal_agent_log(
             with conn.cursor() as cur:
                 for _, result in response.categories.items():
                     for item in result.items:
-                        item_db_id  = _resolve_item_db_id(item_id_map, item)
+                        item_db_id = _resolve_item_db_id(item_id_map, item)
                         result_code = _item_result_code(item, result)
-                        reason      = _item_reason(item, result)
-                        details     = _item_details(item, result)
+                        reason = _item_reason(item, result)
+                        details = _item_details(item, result)
 
-                        cur.execute(_INSERT_AGENT_LOG_SQL, {
-                            "project_id":         project_id,
-                            "usage_statement_id": usage_statement_id,
-                            "item_db_id":         item_db_id,
-                            "result_code":        result_code,
-                            "reason":             reason,
-                            "details":            json.dumps(details, ensure_ascii=False),
-                            "model_name":         model_name,
-                            "token":              token,
-                        })
+                        cur.execute(
+                            _INSERT_AGENT_LOG_SQL,
+                            {
+                                "project_id": project_id,
+                                "usage_statement_id": usage_statement_id,
+                                "item_db_id": item_db_id,
+                                "result_code": result_code,
+                                "reason": reason,
+                                "details": json.dumps(details, ensure_ascii=False),
+                                "model_name": model_name,
+                                "token": token,
+                            },
+                        )
                         inserted += 1
 
-        logger.info("[agent_log] legal INSERT %d건 완료 (카테고리 summary 포함)", inserted)
+        logger.info(
+            "[agent_log] legal INSERT %d건 완료 (카테고리 summary 포함)", inserted
+        )
     except Exception as exc:
         logger.warning("[agent_log] INSERT 실패 (로그 생략 후 계속): %s", exc)
 
@@ -221,7 +227,7 @@ def _fetch_item_id_map(conn, usage_statement_id: int) -> dict[tuple[str, str], i
         result: dict[tuple[str, str], int] = {}
         for row_id, cat_code, item_name in cur.fetchall():
             key = (cat_code, item_name)
-            if key not in result:   # 중복 시 첫 번째(작은 id) 우선
+            if key not in result:  # 중복 시 첫 번째(작은 id) 우선
                 result[key] = row_id
     return result
 
@@ -241,7 +247,9 @@ def _resolve_item_db_id(item_id_map: dict[tuple[str, str], int], item) -> int | 
 def _category_code_for(category: str) -> str:
     if category in _CATEGORIES:
         return category
-    return next((code for code, name in _CATEGORIES.items() if name == category), category)
+    return next(
+        (code for code, name in _CATEGORIES.items() if name == category), category
+    )
 
 
 def _item_result_code(item, result: "CategoryAuditResult") -> str:
@@ -286,10 +294,16 @@ def _category_reason(result) -> str:
     shortfall = getattr(result, "usage_shortfall_amount", None)
     if shortfall and shortfall > 0:
         rate = getattr(result, "required_usage_rate", None)
-        return f"공정률 기준 미달: 누적사용액이 기준({rate*100:.0f}%)에 {shortfall:,.0f}원 부족합니다."[:1000]
+        return f"공정률 기준 미달: 누적사용액이 기준({rate * 100:.0f}%)에 {shortfall:,.0f}원 부족합니다."[
+            :1000
+        ]
     if getattr(result, "exceeded", False):
         limit = getattr(result, "limit", None)
-        return f"한도 초과: 카테고리 사용한도({limit:,.0f}원)를 초과하였습니다."[:1000] if limit else "한도 초과"
+        return (
+            f"한도 초과: 카테고리 사용한도({limit:,.0f}원)를 초과하였습니다."[:1000]
+            if limit
+            else "한도 초과"
+        )
     return ""
 
 
@@ -316,9 +330,7 @@ _DUPLICATE_CONCLUSION_RE = re.compile(
     r"(허용됩니다|사용이 가능합니다|불허됩니다|사용이 불가합니다)[.\s]*$"
 )
 # 공백 포함 조항 번호 패턴 — "제X조 제X항 제X호" 전체 매칭
-_BARE_ARTICLE_RE = re.compile(
-    r"(?<![가-힣])(제\d+조(?:\s*제\d+항)?(?:\s*제\d+호)?)"
-)
+_BARE_ARTICLE_RE = re.compile(r"(?<![가-힣])(제\d+조(?:\s*제\d+항)?(?:\s*제\d+호)?)")
 
 
 def _enrich_reason_law(reason: str, referenced_laws: list[str]) -> str:
@@ -337,7 +349,7 @@ def _enrich_reason_law(reason: str, referenced_laws: list[str]) -> str:
         bare = m.group(1).replace(" ", "")
         start = m.start()
         # 앞 30자에 한국어 2자 이상 있으면 이미 법령명이 있는 것 → 스킵
-        preceding = reason[max(0, start - 30):start]
+        preceding = reason[max(0, start - 30) : start]
         if re.search(r"[가-힣]{2,}", preceding):
             return m.group(0)
         # 가장 길게 매칭되는 full law ref 찾기 (세부 조항 우선)
@@ -408,7 +420,9 @@ def _item_details(item, result: "CategoryAuditResult") -> dict:
     # 공정률 shortfall은 문서 레벨 판단이므로 개별 항목 supplement_codes에 반영 안 함
     # 한도 초과(exceeded)만 항목 레벨 카테고리 이슈로 인정
     has_category_issue = bool(getattr(result, "exceeded", False))
-    is_insufficient = bool(getattr(item, "needs_human_review", False)) or has_category_issue
+    is_insufficient = (
+        bool(getattr(item, "needs_human_review", False)) or has_category_issue
+    )
 
     if is_violation:
         status = "supplement"
@@ -431,10 +445,10 @@ def _item_details(item, result: "CategoryAuditResult") -> dict:
     cat_code = _category_code_for(getattr(item, "category", ""))
 
     cat_entry: dict = {
-        "status":           status,
+        "status": status,
         "supplement_codes": supplement_codes,
-        "detail":           None,
-        "confidence":       confidence,
+        "detail": None,
+        "confidence": confidence,
     }
     if basis:
         cat_entry["basis"] = basis
@@ -442,8 +456,8 @@ def _item_details(item, result: "CategoryAuditResult") -> dict:
     # ── item section ──────────────────────────────────────────────────────────
     item_section: dict = {
         "item_name": item.item,
-        "amount":    int(item.amount),
-        "allowed":   item.allowed,
+        "amount": int(item.amount),
+        "allowed": item.allowed,
     }
     if item_laws:
         item_section["referenced_laws"] = item_laws
@@ -479,13 +493,17 @@ def _item_details(item, result: "CategoryAuditResult") -> dict:
         "item": item_section,
     }
 
+
 # ── 카테고리 검증 실행 ────────────────────────────────────────────────────────
+
 
 def _validate_blocks(base_amount: float, blocks, *, collection: str) -> AuditResponse:
     # 공정률 shortfall은 전체 카테고리 누적합 기준으로 판단한다.
     total_cumulative_used_amount: float | None = None
     for block in blocks:
-        val = block.summary.get("누적사용금액") or block.summary.get("cumulative_amount")
+        val = block.summary.get("누적사용금액") or block.summary.get(
+            "cumulative_amount"
+        )
         try:
             v = float(val) if val is not None else 0.0
         except (TypeError, ValueError):
@@ -495,7 +513,12 @@ def _validate_blocks(base_amount: float, blocks, *, collection: str) -> AuditRes
     results: dict[str, CategoryAuditResult] = {}
     with ThreadPoolExecutor(max_workers=min(max(len(blocks), 1), 2)) as executor:
         futures = {
-            executor.submit(_validate_category_block, block, collection, total_cumulative_used_amount): block.category_name
+            executor.submit(
+                _validate_category_block,
+                block,
+                collection,
+                total_cumulative_used_amount,
+            ): block.category_name
             for block in blocks
         }
         for future in as_completed(futures):
@@ -504,7 +527,9 @@ def _validate_blocks(base_amount: float, blocks, *, collection: str) -> AuditRes
     return AuditResponse(base_amount=base_amount, categories=results)
 
 
-def _validate_category_block(block, collection: str, total_cumulative_used_amount: float | None = None) -> CategoryAuditResult:
+def _validate_category_block(
+    block, collection: str, total_cumulative_used_amount: float | None = None
+) -> CategoryAuditResult:
     retrieved = retrieve_category_context(block=block, collection=collection)
     rule_bundle = match_category_rules(block=block, retrieved=retrieved)
     computation = calculate_category_metrics(
