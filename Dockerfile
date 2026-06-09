@@ -42,7 +42,7 @@ RUN --mount=type=cache,target=/root/.cache/uv \
 RUN .venv/bin/python -c "\
 from sentence_transformers import CrossEncoder, SentenceTransformer; \
 SentenceTransformer('jhgan/ko-sroberta-multitask'); \
-CrossEncoder('BAAI/bge-reranker-v2-m3')"
+CrossEncoder('BAAI/bge-reranker-v2-m3', backend='onnx')"
 
 COPY src ./src
 
