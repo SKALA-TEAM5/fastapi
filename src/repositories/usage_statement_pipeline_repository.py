@@ -382,10 +382,15 @@ def insert_agent_log(
     run_id: str | None = None,
 ) -> int:
     """
-    파이프라인 시작 시 agent_logs에 running 상태로 INSERT한다.
+    파이프라인 시작 시 statement 단위 agent_logs를 생성하거나 갱신한다.
+
+    agent_logs는 (usage_statement_id, agent_type_code) 조합을 한 행으로
+    유지하므로, Orchestrator가 선행 상태를 기록했거나 Agent를 재실행하는
+    경우 기존 행을 running 상태로 초기화해 재사용한다.
 
     Returns:
-        생성된 agent_logs.id (완료/실패 시 update_agent_log_status에 전달)
+        생성되거나 갱신된 agent_logs.id
+        (완료/실패 시 update_agent_log_status에 전달)
     """
     import json as _json
 
@@ -396,6 +401,17 @@ def insert_agent_log(
         VALUES
             (%(project_id)s, %(usage_statement_id)s, %(agent_type_code)s,
              %(status_code)s, %(details)s::jsonb, %(model_name)s)
+        ON CONFLICT (usage_statement_id, agent_type_code)
+            WHERE usage_statement_item_id IS NULL
+        DO UPDATE SET
+            project_id = EXCLUDED.project_id,
+            status_code = EXCLUDED.status_code,
+            result_code = NULL,
+            reason = NULL,
+            details = EXCLUDED.details,
+            model_name = EXCLUDED.model_name,
+            token = NULL,
+            token_current = NULL
         RETURNING id
     """
     with conn.cursor() as cur:
