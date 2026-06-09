@@ -26,6 +26,8 @@ from typing import Any
 from psycopg2.extensions import connection as PgConnection
 import psycopg2.extras
 
+from src.core.json_utils import json_dumps
+
 # ─────────────────────────────────────────────────────────────
 # 카테고리 코드 매핑 (OCR JSON 항목코드 → DB category_code)
 # OCR 파서: "1"~"9"  /  DB: "CAT_01"~"CAT_09"
@@ -392,8 +394,6 @@ def insert_agent_log(
         생성되거나 갱신된 agent_logs.id
         (완료/실패 시 update_agent_log_status에 전달)
     """
-    import json as _json
-
     sql = """
         INSERT INTO agent_logs
             (project_id, usage_statement_id, agent_type_code,
@@ -418,7 +418,7 @@ def insert_agent_log(
         cur.execute(sql, {
             "project_id":         project_id,
             "usage_statement_id": usage_statement_id,
-            "details":            _json.dumps(details or {}, ensure_ascii=False),
+            "details":            json_dumps(details or {}, ensure_ascii=False),
             "status_code":        status_code,
             "agent_type_code":    agent_type_code,
             "model_name":         model_name,
@@ -440,8 +440,6 @@ def update_agent_log_status(
         'completed' — 정상 완료
         'failed'    — 서버/시스템 오류 (비즈니스 실패 아님)
     """
-    import json as _json
-
     normalized_status_code = {
         "completed": "success",
         "failed": "fail",
@@ -464,7 +462,7 @@ def update_agent_log_status(
             "log_id":      log_id,
             "status_code": normalized_status_code,
             "result_code": result_code,
-            "details":     _json.dumps(details, ensure_ascii=False),
+            "details":     json_dumps(details, ensure_ascii=False),
         }
     else:
         sql = """
