@@ -27,6 +27,7 @@ log = logging.getLogger(__name__)
 DEFAULT_TTL = 7 * 24 * 3600
 DEFAULT_DIR = Path(".cache")
 DEFAULT_EMBED_MODEL = "jhgan/ko-sroberta-multitask"
+DEFAULT_EMBED_LOCAL_PATH = "/app/models/ko-sroberta-multitask"
 DEFAULT_QDRANT_URL = "http://localhost:6333"
 DEFAULT_COLLECTION = "legal_documents"
 
@@ -88,12 +89,21 @@ def _sanitize_name(name: str) -> str:
     return sanitized[:63]
 
 
+def _resolve_embed_model(model_name: str) -> str:
+    if model_name != DEFAULT_EMBED_MODEL:
+        return model_name
+    local_path = os.getenv("EMBED_MODEL_PATH", DEFAULT_EMBED_LOCAL_PATH).strip()
+    return local_path if local_path and Path(local_path).exists() else model_name
+
+
 def _get_embeddings(model_name: str = DEFAULT_EMBED_MODEL) -> HuggingFaceEmbeddings:
-    if model_name not in _embeddings_cache:
+    resolved_model = _resolve_embed_model(model_name)
+    if resolved_model not in _embeddings_cache:
         with _embeddings_lock:
-            if model_name not in _embeddings_cache:
-                _embeddings_cache[model_name] = HuggingFaceEmbeddings(model_name=model_name)
-    return _embeddings_cache[model_name]
+            if resolved_model not in _embeddings_cache:
+                log.info("Embedding 모델 로드 중: %s", resolved_model)
+                _embeddings_cache[resolved_model] = HuggingFaceEmbeddings(model_name=resolved_model)
+    return _embeddings_cache[resolved_model]
 
 
 def _get_qdrant_url(qdrant_url: str | None = None) -> str:
