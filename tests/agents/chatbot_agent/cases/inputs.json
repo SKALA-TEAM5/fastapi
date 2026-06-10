@@ -1,0 +1,114 @@
+[
+  {
+    "id": "chat_01",
+    "description": "카테고리판단 — 안전모",
+    "question": "안전모는 몇 번 카테고리인가요?",
+    "expected_intent": "카테고리판단",
+    "expected_keywords": ["CAT_03", "보호구"]
+  },
+  {
+    "id": "chat_02",
+    "description": "카테고리판단 — 핫팩 (CAT_03 vs CAT_06 혼동 케이스)",
+    "question": "근로자에게 지급하는 핫팩은 CAT_03 보호구인가요, CAT_06 건강장해예방비인가요?",
+    "expected_intent": "카테고리판단",
+    "expected_keywords": ["CAT_06", "건강장해예방"]
+  },
+  {
+    "id": "chat_03",
+    "description": "카테고리판단 — 추락방지망 설치 인건비",
+    "question": "추락방지망 설치 공사에 투입된 인건비는 어느 카테고리에 속하나요?",
+    "expected_intent": "카테고리판단",
+    "expected_keywords": ["CAT_02", "안전시설비"]
+  },
+  {
+    "id": "chat_04",
+    "description": "법령한도 — CAT_02 한도율",
+    "question": "안전시설비(CAT_02) 한도율이 얼마인가요?",
+    "expected_intent": "법령한도",
+    "expected_keywords": ["한도", "20%"]
+  },
+  {
+    "id": "chat_05",
+    "description": "적법성판단 — 사무실 냉방기 구입 불가",
+    "question": "현장 사무실에 냉방기를 구입한 비용을 산안비로 사용할 수 있나요?",
+    "expected_intent": "적법성판단",
+    "expected_keywords": ["인정되지 않습니다", "경비"]
+  },
+  {
+    "id": "chat_06",
+    "description": "적법성판단 — 외부 안전교육 강사비",
+    "question": "외부 강사를 초청해서 안전교육을 진행했는데 강사비가 산안비로 인정되나요?",
+    "expected_intent": "적법성판단",
+    "expected_keywords": ["CAT_05", "안전보건교육"]
+  },
+  {
+    "id": "chat_07",
+    "description": "카테고리판단 — 방진마스크",
+    "question": "방진마스크 구입비는 산안비 몇 번에 해당해?",
+    "expected_intent": "카테고리판단",
+    "expected_keywords": ["CAT_03", "보호구"]
+  },
+  {
+    "id": "chat_08",
+    "description": "기타 — 범위 밖 질문 (fallback)",
+    "question": "오늘 날씨가 어때요?",
+    "expected_intent": "기타",
+    "expected_keywords": ["산안비", "카테고리"]
+  },
+  {
+    "id": "chat_09",
+    "description": "카테고리판단 — 안전관리자 급여",
+    "question": "안전관리자 월급은 어느 카테고리로 처리해야 하나요?",
+    "expected_intent": "카테고리판단",
+    "expected_keywords": ["CAT_01", "인건비"]
+  },
+  {
+    "id": "chat_10",
+    "description": "적법성판단 — 위험성평가 외부용역",
+    "question": "위험성평가를 외부 업체에 용역 의뢰한 비용이 산안비로 가능한가요?",
+    "expected_intent": "적법성판단",
+    "expected_keywords": ["CAT_09", "위험성평가"]
+  },
+  {
+    "id": "chat_11",
+    "description": "계상기준 — 산안비 총액 계산 방법",
+    "question": "산안비 총액은 어떻게 계산하나요?",
+    "expected_intent": "계상기준",
+    "expected_keywords": ["대상액", "비율"]
+  },
+  {
+    "id": "chat_12",
+    "description": "계상기준 — 공사 규모별 요율 (경계: 법령한도)",
+    "question": "대상액이 5억 원 미만인 경우 산안비 요율이 어떻게 되나요?",
+    "expected_intent": "계상기준",
+    "expected_keywords": ["별표", "비율"]
+  },
+  {
+    "id": "chat_13",
+    "description": "계상기준 — 설계변경 시 재계상 의무",
+    "question": "공사 중 설계변경으로 대상액이 바뀌면 산안비를 다시 계상해야 하나요?",
+    "expected_intent": "계상기준",
+    "expected_keywords": ["조정 계상", "대상액"]
+  },
+  {
+    "id": "chat_14",
+    "description": "도급귀속 — 하청업체 집행 가능 여부",
+    "question": "하청업체가 산안비를 직접 사용할 수 있나요?",
+    "expected_intent": "도급귀속",
+    "expected_keywords": ["도급인", "수급인"]
+  },
+  {
+    "id": "chat_15",
+    "description": "도급귀속 — 공동도급 현장 귀속 (경계: 적법성판단)",
+    "question": "공동도급 현장에서 산안비는 어떻게 귀속되나요?",
+    "expected_intent": "도급귀속",
+    "expected_keywords": ["도급인"]
+  },
+  {
+    "id": "chat_16",
+    "description": "경계 케이스 — 계상기준 (총액 산정 방식)",
+    "question": "산안비 총액은 공사 규모에 따라 어떻게 산정되나요?",
+    "expected_intent": "계상기준",
+    "expected_keywords": ["대상액", "비율"]
+  }
+]
