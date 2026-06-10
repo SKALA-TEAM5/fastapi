@@ -87,12 +87,22 @@ def _format_chat_history(messages: list) -> str:
     return "\n".join(lines) if lines else "없음"
 
 
+def _clean_source(src: str) -> str:
+    """출처 문자열에서 노이즈 제거."""
+    src = re.sub(r"^법제처 Open API\s*[—-]\s*", "", src)  # 앞 prefix 제거
+    src = re.sub(r"-[0-9a-f]{8,}$", "", src)             # 해시값 제거
+    src = re.sub(r"\(최종\w*\)", "", src)                  # (최종), (최종본) 제거
+    src = re.sub(r"\(\d{8}\)", "", src)                   # (20250212) 날짜 제거
+    src = re.sub(r"\[API\]", "", src)                     # [API] 제거
+    return src.strip()
+
+
 def _format_docs(docs) -> str:
     """Document 리스트를 프롬프트용 문자열로 변환."""
     if not docs:
         return "관련 법령 근거 없음"
     return "\n\n---\n\n".join(
-        f"[출처: {doc.metadata.get('source', doc.metadata.get('title', '알 수 없음'))}]\n{doc.page_content}"
+        f"[출처: {_clean_source(doc.metadata.get('source', doc.metadata.get('title', '알 수 없음')))}]\n{doc.page_content}"
         for doc in docs
     )
 
@@ -114,8 +124,10 @@ def _extract_sources(docs) -> list[str]:
     sources = []
     for doc in docs:
         src = doc.metadata.get("source") or doc.metadata.get("title") or doc.metadata.get("law_name")
-        if src and src not in sources:
-            sources.append(src)
+        if src:
+            src = _clean_source(src)
+            if src and src not in sources:
+                sources.append(src)
     return sources
 
 
