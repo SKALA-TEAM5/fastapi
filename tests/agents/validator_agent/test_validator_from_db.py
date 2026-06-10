@@ -2,9 +2,10 @@
 DB에서 직접 usage_statement 데이터를 가져와 validator를 테스트하는 스크립트.
 
 사용법:
-  uv run python -m tests.agents.validator_agent.test_validator_from_db
-  uv run python -m tests.agents.validator_agent.test_validator_from_db --id 1
-  uv run python -m tests.agents.validator_agent.test_validator_from_db --id 1 --verbose
+  ./.venv/bin/python -m tests.agents.validator_agent.test_validator_from_db
+  ./.venv/bin/python -m tests.agents.validator_agent.test_validator_from_db --id 1
+  ./.venv/bin/python -m tests.agents.validator_agent.test_validator_from_db --id 1 --full-payload
+  ./.venv/bin/python -m tests.agents.validator_agent.test_validator_from_db --id 1 --verbose
 """
 
 import argparse
@@ -20,8 +21,16 @@ from langchain_openai import ChatOpenAI
 
 from src.agents.validator_agent.agent import summarize_audit_response, validate_usage_statement
 from src.core import llm_config
+from src.schemas.classifier import CATEGORIES
 from src.schemas.validator import AuditResponse
-from src.services.orchestrator_service import _legal_item_results_from_audit
+from src.services.orchestrator_service import (
+    _legal_basis_by_citation,
+    _legal_citations_from_results,
+    _legal_frontend_categories,
+    _legal_item_results_from_audit,
+    _legal_payload_item_results,
+    _linked_files_by_item_id,
+)
 
 load_dotenv()
 
@@ -180,8 +189,8 @@ def _validator_input_from_v1(v1_input: dict) -> dict:
 def _agent_logs_from_response(
     *,
     v1_input: dict,
-    summary_response,
     item_results: list[dict],
+    categories: list[dict],
     result_code: str,
     reason: str,
     todos: list[dict],
@@ -190,10 +199,6 @@ def _agent_logs_from_response(
     """DB에 쓰지 않고 orchestrator _run_legal_agent()의 upsert row payload를 만든다."""
     project_id = int(v1_input["project"]["id"])
     usage_statement_id = int(v1_input["usage_statement"]["id"])
-    category_results = [
-        result.model_dump(mode="json", by_alias=False)
-        for result in summary_response.results
-    ]
 
     return {
         "project_id": project_id,
@@ -207,15 +212,86 @@ def _agent_logs_from_response(
             "event": "legal_completed",
             "summary": reason,
             "payload": {
-                "she_user_id": None,
                 "usage_statement_id": usage_statement_id,
-                "category_results": category_results,
                 "results": item_results,
                 "todos": todos,
+                "categories": categories,
             },
         },
         "model_name": model_name,
         "token": None,
+    }
+
+
+def _preview_text(value, limit: int = 120) -> str:
+    text = " ".join(str(value or "").split())
+    if len(text) <= limit:
+        return text
+    return text[:limit].rstrip() + "..."
+
+
+def _agent_log_summary(agent_log: dict) -> dict:
+    payload = ((agent_log.get("details") or {}).get("payload") or {})
+    categories_summary = []
+    for category in payload.get("categories") or []:
+        item_summaries = []
+        for item in category.get("items") or []:
+            basis_summaries = []
+            for basis in item.get("legalBasis") or []:
+                original_text = basis.get("originalText") or ""
+                basis_summaries.append(
+                    {
+                        "lawName": basis.get("lawName"),
+                        "article": basis.get("article"),
+                        "clause": basis.get("clause"),
+                        "originalTextLength": len(original_text),
+                        "originalTextPreview": _preview_text(original_text),
+                        "summary": basis.get("summary"),
+                    }
+                )
+            item_summaries.append(
+                {
+                    "usageStatementItemId": item.get("usageStatementItemId"),
+                    "itemName": item.get("itemName"),
+                    "amount": item.get("amount"),
+                    "recognizedAmount": item.get("recognizedAmount"),
+                    "disputedAmount": item.get("disputedAmount"),
+                    "decision": item.get("decision"),
+                    "reviewReason": _preview_text(item.get("reviewReason"), limit=180),
+                    "problemFileCount": len(item.get("problemFiles") or []),
+                    "problemFileNames": [
+                        file.get("originalFilename")
+                        for file in (item.get("problemFiles") or [])
+                        if isinstance(file, dict)
+                    ],
+                    "legalBasis": basis_summaries,
+                }
+            )
+        categories_summary.append(
+            {
+                "categoryCode": category.get("categoryCode"),
+                "categoryName": category.get("categoryName"),
+                "decision": category.get("decision"),
+                "itemCount": len(category.get("items") or []),
+                "items": item_summaries,
+            }
+        )
+
+    return {
+        "project_id": agent_log.get("project_id"),
+        "usage_statement_id": agent_log.get("usage_statement_id"),
+        "agent_type_code": agent_log.get("agent_type_code"),
+        "status_code": agent_log.get("status_code"),
+        "result_code": agent_log.get("result_code"),
+        "reason": agent_log.get("reason"),
+        "payload": {
+            "usage_statement_id": payload.get("usage_statement_id"),
+            "resultCount": len(payload.get("results") or []),
+            "todoCount": len(payload.get("todos") or []),
+            "categoryCount": len(payload.get("categories") or []),
+            "todos": payload.get("todos") or [],
+            "categories": categories_summary,
+        },
     }
 
 
@@ -226,6 +302,7 @@ def main() -> None:
     parser.add_argument("--id", type=int, default=1, help="usage_statement id (기본값: 1)")
     parser.add_argument("--model", default="gpt-4o-mini")
     parser.add_argument("--verbose", "-v", action="store_true")
+    parser.add_argument("--full-payload", action="store_true", help="agent_logs payload 전체 JSON 출력")
     parser.add_argument(
         "--force-cpu-reranker",
         action="store_true",
@@ -242,7 +319,7 @@ def main() -> None:
         os.environ["RAG_FORCE_CPU"] = "true"
         import torch
         torch.backends.mps.is_available = lambda: False
-    if args.debug_timing:
+    if args.verbose or args.debug_timing:
         os.environ["VALIDATOR_TIMING_LOGS"] = "true"
         logging.basicConfig(
             level=logging.INFO,
@@ -295,28 +372,46 @@ def main() -> None:
     for row in v1_input.get("usage_statement_items", []):
         items_by_code.setdefault(row["category_code"], []).append(row)
 
-    category_rows = {
-        code: [{"행ID": r["id"], **r} for r in rows]
-        for code, rows in items_by_code.items()
-    }
+    category_rows = {}
+    for code, rows in items_by_code.items():
+        category_rows[code] = [
+            {
+                "행ID": row.get("source_row_id") or row["id"],
+                "사용일자": row.get("used_on"),
+                "항목명": row.get("item_name"),
+                "단위": row.get("unit"),
+                "수량": row.get("quantity"),
+                "단가": row.get("unit_price"),
+                "금액": row.get("total_amount"),
+                "비고": row.get("remark") or "",
+            }
+            for row in rows
+        ]
 
     item_results = _legal_item_results_from_audit(
         audit_response=response,
         summary_response=summary_response,
         category_rows=category_rows,
     )
+    linked_files_by_item_id = _linked_files_by_item_id(args.id)
+    legal_basis_by_source_id = _legal_basis_by_citation(_legal_citations_from_results(item_results))
+    categories = _legal_frontend_categories(
+        item_results=item_results,
+        category_rows=category_rows,
+        linked_files_by_item_id=linked_files_by_item_id,
+        legal_basis_by_source_id=legal_basis_by_source_id,
+    )
+    payload_item_results = _legal_payload_item_results(item_results)
 
     # orchestrator와 동일한 result_code 계산
     review_count = sum(1 for row in item_results if row["status"] != "적절")
-    category_issue_count = sum(
-        1 for s in summary_response.results
-        if s.status in {"부적절", "검토필요"}
-    )
-    result_code = "hil" if (review_count or category_issue_count) else "success"
+    result_code = "hil" if review_count else "success"
     reason = "법령 검토 결과 특이사항 없음" if review_count == 0 else f"법령 검토 결과 보고서 반영 대상 {review_count}건"
     todos = [
         {
             "usage_statement_item_id": row.get("item_id"),
+            "category_code": row.get("category_code"),
+            "category_name": CATEGORIES.get(str(row.get("category_code") or "")),
             "reason": f"법령 검토 필요: {row.get('reason') or row.get('status')}",
         }
         for row in item_results
@@ -324,8 +419,8 @@ def main() -> None:
     ]
     agent_log = _agent_logs_from_response(
         v1_input=v1_input,
-        summary_response=summary_response,
-        item_results=item_results,
+        item_results=payload_item_results,
+        categories=categories,
         result_code=result_code,
         reason=reason,
         todos=todos,
@@ -333,15 +428,20 @@ def main() -> None:
     )
 
     print(f"[결과] result_code={result_code} | {reason}")
-    print(f"  항목 이슈: {review_count}건 / 카테고리 이슈: {category_issue_count}건")
+    print(f"  항목 이슈: {review_count}건")
     print("\n[item_results]")
-    print(json.dumps(item_results, ensure_ascii=False, indent=2, default=str))
+    print(json.dumps(payload_item_results, ensure_ascii=False, indent=2, default=str))
     if todos:
         print("\n[todos]")
         print(json.dumps(todos, ensure_ascii=False, indent=2, default=str))
 
-    print("\n[agent_logs payload]")
-    print(json.dumps(agent_log, ensure_ascii=False, indent=2, default=str))
+    if args.full_payload:
+        print("\n[agent_logs payload full]")
+        print(json.dumps(agent_log, ensure_ascii=False, indent=2, default=str))
+    else:
+        print("\n[agent_logs payload summary]")
+        print(json.dumps(_agent_log_summary(agent_log), ensure_ascii=False, indent=2, default=str))
+        print("\n  전체 JSON은 --full-payload 옵션으로 출력할 수 있습니다.")
     if args.debug_timing:
         print(f"\n[timing][test.total] elapsed={perf_counter() - total_started:.3f}s")
 
