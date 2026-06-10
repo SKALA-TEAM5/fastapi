@@ -14,6 +14,7 @@ from __future__ import annotations
 from collections import Counter
 from datetime import date
 import os
+import re
 from typing import Any, cast
 from uuid import uuid4
 
@@ -26,6 +27,7 @@ from src.agents.safety_doc_agent.agent import check_missing_evidence
 from src.agents.classifier_agent.agent import review_usage_statement
 from src.agents.validator_agent.agent import summarize_audit_response, validate_usage_statement
 from src.core.config import (
+    LEGAL_DATABASE_URL,
     VISION_AGENT_BASE_URL,
     VISION_AGENT_REVIEW_PATH,
     VISION_AGENT_TIMEOUT_SECONDS,
@@ -58,6 +60,8 @@ from src.schemas.orchestrator import (
 )
 from src.services.minio_client import create_presigned_file_url
 from src.services.usage_statement_pipeline_service import parse_usage_statement, run_link_pipeline
+
+_LEGAL_ORIGINAL_TEXT_MAX_LENGTH = 600
 
 
 def parse_and_classify_usage_statement(file_id: int) -> OrchestratorActionResponse:
@@ -1007,24 +1011,17 @@ def _run_legal_agent(
             summary_response=summary_response,
             category_rows=category_rows,
         )
-        linked_file_names_by_item_id = _linked_file_names_by_item_id(usage_statement_id)
+        linked_files_by_item_id = _linked_files_by_item_id(usage_statement_id)
+        legal_basis_by_source_id = _legal_basis_by_citation(_legal_citations_from_results(item_results))
         frontend_categories = _legal_frontend_categories(
-            summary_response=summary_response,
             item_results=item_results,
             category_rows=category_rows,
-            linked_file_names_by_item_id=linked_file_names_by_item_id,
+            linked_files_by_item_id=linked_files_by_item_id,
+            legal_basis_by_source_id=legal_basis_by_source_id,
         )
-        category_results = [
-            result.model_dump(mode="json", by_alias=False)
-            for result in summary_response.results
-        ]
+        payload_item_results = _legal_payload_item_results(item_results)
         review_count = sum(1 for row in item_results if row["status"] != "적절")
-        # exceeded/shortfall은 항목 status에 반영 안 하므로 카테고리 레벨에서 별도 체크
-        category_issue_count = sum(
-            1 for s in summary_response.results
-            if s.status in {"부적절", "검토필요"}
-        )
-        result_code = "hil" if (review_count or category_issue_count) else "success"
+        result_code = "hil" if review_count else "success"
         reason = "법령 검토 결과 특이사항 없음" if review_count == 0 else f"법령 검토 결과 보고서 반영 대상 {review_count}건"
         todos = [
             {
@@ -1047,10 +1044,8 @@ def _run_legal_agent(
                 "event": "legal_completed",
                 "summary": reason,
                 "payload": {
-                    "she_user_id": she_user_id,
                     "usage_statement_id": usage_statement_id,
-                    "category_results": category_results,
-                    "results": item_results,
+                    "results": payload_item_results,
                     "todos": todos,
                     "categories": frontend_categories,
                 },
@@ -1260,10 +1255,7 @@ def _legal_item_results_from_audit(
         item_rows = category_rows.get(category_code) or []
         for raw_item, judgment in zip(item_rows, category_result.items):
             status = _legal_status_from_judgment(judgment, summary.status if summary else category_result.status)
-            citations = (
-                [{"legal_basis": law, "summary": None} for law in judgment.referenced_laws]
-                or source_citations
-            )
+            citations = _legal_item_citations(judgment, source_citations)
             results.append(
                 {
                     "item_id": raw_item["행ID"],
@@ -1278,63 +1270,125 @@ def _legal_item_results_from_audit(
 
 def _legal_frontend_categories(
     *,
-    summary_response,
     item_results: list[dict[str, Any]],
     category_rows: dict[str, list[dict[str, Any]]],
-    linked_file_names_by_item_id: dict[int, list[str]],
+    linked_files_by_item_id: dict[int, list[dict[str, Any]]],
+    legal_basis_by_source_id: dict[str, dict[str, Any]],
 ) -> list[dict[str, Any]]:
-    item_results_by_category: dict[str, list[dict[str, Any]]] = {}
+    item_results_by_id: dict[int, dict[str, Any]] = {}
     for item_result in item_results:
-        category_code = str(item_result.get("category_code") or "")
-        item_results_by_category.setdefault(category_code, []).append(item_result)
+        item_id = _int_or_none(item_result.get("item_id"))
+        if item_id is not None:
+            item_results_by_id[item_id] = item_result
 
     categories: list[dict[str, Any]] = []
-    for summary in summary_response.results:
-        category_code = str(summary.category_code)
+    for category_code, rows in category_rows.items():
+        category_items: list[dict[str, Any]] = []
+        category_decisions: list[str] = []
         rows = category_rows.get(category_code) or []
-        category_item_results = item_results_by_category.get(category_code) or []
-        usage_amount = sum(_number_or_none(row.get("금액")) or 0 for row in rows)
-        decision = _frontend_legal_decision(str(summary.status))
-        issue_item_ids = {
-            item_result.get("item_id")
-            for item_result in category_item_results
-            if str(item_result.get("status") or "") != "적절"
-        }
-        disputed_amount = sum(
-            _number_or_none(row.get("금액")) or 0
-            for row in rows
-            if row.get("행ID") in issue_item_ids
-        )
-        if decision != "appropriate" and disputed_amount == 0:
-            disputed_amount = usage_amount
-        recognized_amount = max(0, usage_amount - disputed_amount)
+        for row in rows:
+            item_id = _int_or_none(row.get("행ID"))
+            item_result = item_results_by_id.get(item_id) if item_id is not None else None
+            status = str((item_result or {}).get("status") or "적절")
+            decision = _frontend_legal_decision(status)
+            category_decisions.append(decision)
+            amount = _number_or_none(row.get("금액")) or 0
+            recognized_amount = amount if decision == "appropriate" else 0
+            disputed_amount = 0 if decision == "appropriate" else amount
+            review_reason = str((item_result or {}).get("reason") or "")
+            category_items.append(
+                {
+                    "usageStatementItemId": item_id,
+                    "itemName": row.get("항목명") or "",
+                    "usedOn": row.get("사용일자"),
+                    "amount": amount,
+                    "recognizedAmount": recognized_amount,
+                    "disputedAmount": disputed_amount,
+                    "decision": decision,
+                    "reviewReason": review_reason,
+                    "problemFiles": linked_files_by_item_id.get(item_id, []) if item_id is not None else [],
+                    "legalBasis": _legal_basis_payload(
+                        (item_result or {}).get("citations") or [],
+                        legal_basis_by_source_id,
+                    ),
+                }
+            )
+
         categories.append(
             {
-                "categoryId": _category_id_number(category_code),
-                "categoryName": CATEGORIES.get(category_code, category_code),
                 "categoryCode": category_code,
-                "usageAmount": usage_amount,
-                "recognizedAmount": recognized_amount,
-                "disputedAmount": disputed_amount,
-                "decision": decision,
-                "riskLevel": _frontend_legal_risk_level(decision),
-                "legalBasis": _frontend_legal_basis(summary, category_item_results),
-                "issues": _frontend_legal_issues(
-                    category_item_results,
-                    str(summary.reason),
-                    linked_file_names_by_item_id,
-                ),
+                "categoryName": CATEGORIES.get(category_code, category_code),
+                "decision": _aggregate_frontend_legal_decision(category_decisions),
+                "items": category_items,
             }
         )
     return categories
 
 
-def _linked_file_names_by_item_id(usage_statement_id: int) -> dict[int, list[str]]:
+def _legal_payload_item_results(item_results: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    payload_results: list[dict[str, Any]] = []
+    for item_result in item_results:
+        payload_results.append(
+            {
+                "item_id": item_result.get("item_id"),
+                "category_code": item_result.get("category_code"),
+                "status": item_result.get("status"),
+                "reason": item_result.get("reason") or "",
+                "citations": [
+                    {"legal_basis": str(citation.get("legal_basis") or "")}
+                    for citation in (item_result.get("citations") or [])
+                    if isinstance(citation, dict) and str(citation.get("legal_basis") or "").strip()
+                ],
+            }
+        )
+    return payload_results
+
+
+def _legal_item_citations(judgment, fallback_citations: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    qdrant_citations = [
+        citation
+        for citation in (getattr(judgment, "qdrant_citations", []) or [])
+        if isinstance(citation, dict)
+    ]
+    if getattr(judgment, "judgment_source", "") == "llm_fallback" and qdrant_citations:
+        return qdrant_citations
+
+    source_ids = [
+        str(source_id)
+        for source_id in (getattr(judgment, "source_ids", []) or [])
+        if source_id and str(source_id) != "llm_fallback"
+    ]
+    referenced_laws = [str(law) for law in (getattr(judgment, "referenced_laws", []) or []) if law]
+    if source_ids:
+        citations = [
+            {
+                "source_id": source_id,
+                "legal_basis": referenced_laws[index] if index < len(referenced_laws) else "",
+                "summary": None,
+                "judgment_source": getattr(judgment, "judgment_source", ""),
+            }
+            for index, source_id in enumerate(source_ids)
+        ]
+        return citations + qdrant_citations
+    if referenced_laws:
+        return [
+            {
+                "legal_basis": law,
+                "summary": None,
+                "judgment_source": getattr(judgment, "judgment_source", ""),
+            }
+            for law in referenced_laws
+        ]
+    return fallback_citations
+
+
+def _linked_files_by_item_id(usage_statement_id: int) -> dict[int, list[dict[str, Any]]]:
     with get_connection() as conn:
         with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
             cur.execute(
                 """
                 SELECT efl.usage_statement_item_id AS item_id,
+                       f.id AS file_id,
                        f.original_filename
                 FROM evidence_file_links efl
                 JOIN usage_statement_items usi ON usi.id = efl.usage_statement_item_id
@@ -1346,14 +1400,181 @@ def _linked_file_names_by_item_id(usage_statement_id: int) -> dict[int, list[str
             )
             rows = cur.fetchall()
 
-    result: dict[int, list[str]] = {}
+    result: dict[int, list[dict[str, Any]]] = {}
     for row in rows:
         item_id = _int_or_none(row.get("item_id"))
+        file_id = _int_or_none(row.get("file_id"))
         filename = str(row.get("original_filename") or "").strip()
-        if item_id is None or not filename:
+        if item_id is None or file_id is None or not filename:
             continue
-        result.setdefault(item_id, []).append(filename)
+        result.setdefault(item_id, []).append(
+            {
+                "fileId": file_id,
+                "originalFilename": filename,
+            }
+        )
     return result
+
+
+def _legal_citations_from_results(item_results: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    return [
+        citation
+        for row in item_results
+        for citation in (row.get("citations") or [])
+        if isinstance(citation, dict)
+    ]
+
+
+def _legal_basis_by_citation(citations: list[dict[str, Any]]) -> dict[str, dict[str, Any]]:
+    source_ids = sorted(
+        {
+            str(citation.get("source_id"))
+            for citation in citations
+            if citation.get("source_id") and str(citation.get("source_id")) != "llm_fallback"
+        }
+    )
+    legal_basis_values = sorted(
+        {
+            str(citation.get("legal_basis") or "").strip()
+            for citation in citations
+            if str(citation.get("legal_basis") or "").strip()
+        }
+    )
+    if not source_ids and not legal_basis_values:
+        return {}
+    conn = psycopg2.connect(LEGAL_DATABASE_URL)
+    try:
+        with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+            cur.execute(
+                """
+                SELECT id, source_name, article_no, paragraph_no, item_no, body, legal_basis
+                FROM legal_rag.legal_master
+                WHERE id = ANY(%(source_ids)s)
+                   OR legal_basis = ANY(%(legal_basis_values)s)
+                """,
+                {
+                    "source_ids": source_ids,
+                    "legal_basis_values": legal_basis_values,
+                },
+            )
+            rows = cur.fetchall()
+    finally:
+        conn.close()
+
+    result: dict[str, dict[str, Any]] = {}
+    for row in rows:
+        basis = dict(row)
+        aliases = {
+            str(row.get("id") or ""),
+            str(row.get("legal_basis") or ""),
+            _join_clause_parts(row.get("source_name"), row.get("legal_basis")),
+            _join_clause_parts(row.get("source_name"), row.get("article_no")),
+            _join_clause_parts(row.get("source_name"), row.get("article_no"), row.get("paragraph_no"), row.get("item_no")),
+        }
+        for alias in aliases:
+            if alias and alias not in result:
+                result[alias] = basis
+    return result
+
+
+def _legal_basis_payload(
+    citations: list[dict[str, Any]],
+    legal_basis_by_source_id: dict[str, dict[str, Any]],
+) -> list[dict[str, Any]]:
+    payload: list[dict[str, Any]] = []
+    seen_keys: set[str] = set()
+    for citation in citations:
+        if not isinstance(citation, dict):
+            continue
+        source_id = str(citation.get("source_id") or "")
+        legal_basis = str(citation.get("legal_basis") or "")
+        is_qdrant_citation = source_id.startswith("qdrant:")
+        basis = None if is_qdrant_citation else (
+            legal_basis_by_source_id.get(source_id) or _lookup_legal_basis(legal_basis, legal_basis_by_source_id)
+        )
+        legal_basis = legal_basis or str((basis or {}).get("legal_basis") or "")
+        law_name, article, clause = _split_legal_basis(legal_basis)
+        if basis:
+            law_name = str(basis.get("source_name") or law_name or "산업안전보건관리비 계상 및 사용기준")
+            article = str(basis.get("article_no") or article or "")
+            clause = _join_clause_parts(basis.get("paragraph_no"), basis.get("item_no")) or clause
+        citation_original_text = _limit_original_text(str(citation.get("original_text") or ""))
+        fallback_original_text = _limit_original_text(str((basis or {}).get("body") or ""))
+        original_text = citation_original_text if is_qdrant_citation else (fallback_original_text or citation_original_text)
+        if not original_text:
+            continue
+        key = source_id or legal_basis or str(citation)
+        if key in seen_keys:
+            continue
+        seen_keys.add(key)
+        payload.append(
+            {
+                "lawName": law_name or "산업안전보건관리비 계상 및 사용기준",
+                "article": article,
+                "clause": clause,
+                "originalText": original_text,
+                "summary": str(citation.get("summary") or ""),
+            }
+        )
+    return payload
+
+
+def _lookup_legal_basis(legal_basis: str, candidates: dict[str, dict[str, Any]]) -> dict[str, Any] | None:
+    if not legal_basis:
+        return None
+    law_name, article, clause = _split_legal_basis(legal_basis)
+    lookup_keys = [
+        legal_basis,
+        _join_clause_parts(law_name, legal_basis),
+        _join_clause_parts(law_name, article),
+        _join_clause_parts(law_name, article, clause),
+    ]
+    for key in lookup_keys:
+        if key and key in candidates:
+            return candidates[key]
+    return None
+
+
+def _limit_original_text(text: str) -> str:
+    if len(text) <= _LEGAL_ORIGINAL_TEXT_MAX_LENGTH:
+        return text
+    return text[:_LEGAL_ORIGINAL_TEXT_MAX_LENGTH].rstrip() + "...(원문 일부)"
+
+
+def _aggregate_frontend_legal_decision(decisions: list[str]) -> str:
+    if any(decision == "inappropriate" for decision in decisions):
+        return "inappropriate"
+    if any(decision == "conditional" for decision in decisions):
+        return "conditional"
+    return "appropriate"
+
+
+def _join_clause_parts(*parts: Any) -> str:
+    return " ".join(str(part).strip() for part in parts if str(part or "").strip())
+
+
+def _split_legal_basis(value: str) -> tuple[str, str, str]:
+    text = " ".join(str(value or "").split())
+    if not text:
+        return "", "", ""
+
+    article_match = re.search(r"제\s*\d+\s*조(?:의\s*\d+)?|별표\s*\d+(?:의\s*\d+)?", text)
+    article = article_match.group(0).replace(" ", "") if article_match else ""
+    article = re.sub(r"(별표)(\d)", r"\1 \2", article)
+
+    clause_parts: list[str] = []
+    paragraph_match = re.search(r"제\s*\d+\s*항", text)
+    item_match = re.search(r"제\s*\d+\s*호", text)
+    if paragraph_match:
+        clause_parts.append(paragraph_match.group(0).replace(" ", ""))
+    if item_match:
+        clause_parts.append(item_match.group(0).replace(" ", ""))
+
+    law_name = text
+    if article_match:
+        law_name = text[: article_match.start()].strip()
+    law_name = law_name.strip("「」 ,")
+    return law_name, article, " ".join(clause_parts)
 
 
 def _category_id_number(category_code: str) -> int:

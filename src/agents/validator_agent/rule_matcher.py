@@ -11,6 +11,7 @@
 # --------------------------------------------------------------------------
 from __future__ import annotations
 
+import hashlib
 import re
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
@@ -54,6 +55,7 @@ class ItemRuleBundle:
     item_exception_text: str = ""
     judgment_tier: str = "rdb"  # "rdb" | "llm" — 항목 판정에 사용된 계층
     reason_text: str = ""       # LLM이 생성한 사용자 표시용 사유
+    qdrant_citations: list[dict] = field(default_factory=list)
 
     @property
     def top_allowed(self) -> ValidatorRuleMatch | None:
@@ -252,6 +254,54 @@ def _llm_item_fallback(
     return match, result.reason_text or ""
 
 
+def _qdrant_citations_from_docs(*, docs, referenced_laws: list[str], judgment_source: str) -> list[dict]:
+    for doc in docs or []:
+        original_text = _clean_qdrant_original_text(str(getattr(doc, "page_content", "") or ""))
+        if not original_text:
+            continue
+        metadata = dict(getattr(doc, "metadata", {}) or {})
+        source = str(metadata.get("source") or metadata.get("source_name") or metadata.get("title") or "").strip()
+        source_key = source or hashlib.sha1(original_text[:300].encode("utf-8")).hexdigest()[:12]
+        legal_basis = _primary_qdrant_legal_basis(referenced_laws=referenced_laws, metadata=metadata, source=source)
+        return [
+            {
+                "source_id": f"qdrant:{source_key}",
+                "legal_basis": legal_basis,
+                "summary": "Qdrant 검색 원문 보조 근거" if judgment_source == "qdrant_support" else None,
+                "judgment_source": judgment_source,
+                "original_text": original_text,
+            }
+        ]
+    return []
+
+
+def _clean_qdrant_original_text(value: str) -> str:
+    text = _LEGAL_CITE_RE.sub("", value or "")
+    cleaned_lines: list[str] = []
+    for raw_line in text.replace("\r\n", "\n").replace("\r", "\n").splitlines():
+        line = " ".join(raw_line.split())
+        if not line:
+            if cleaned_lines and cleaned_lines[-1]:
+                cleaned_lines.append("")
+            continue
+        if " > " in line:
+            line = line.split(" > ")[-1].strip()
+        cleaned_lines.append(line)
+    return "\n".join(cleaned_lines).strip()
+
+
+def _primary_qdrant_legal_basis(*, referenced_laws: list[str], metadata: dict, source: str) -> str:
+    for law in referenced_laws or []:
+        text = str(law or "").strip()
+        if text:
+            return text
+    for key in ("legal_basis", "law_name", "source_name", "title"):
+        text = str(metadata.get(key) or "").strip()
+        if text:
+            return text
+    return source
+
+
 def _process_single_item(
     *,
     item: "CategoryItemRow",
@@ -293,11 +343,17 @@ def _process_single_item(
     # 2. 강한 허용 RDB → LLM 판단 스킵, 사유만 LLM 생성
     # 3. 애매함 → LLM이 판단 + 사유 동시 생성
     reason_text = ""
+    qdrant_citations: list[dict] = []
 
     if _has_rdb_disallowed_match(matches, block.category_code):
         # 강한 불허 → 판단은 RDB, 사유만 LLM
         judgment_tier = "rdb"
         best = next((m for m in matches if m.allowed is False and m.match_source in _AUTHORITATIVE_SOURCES), None)
+        qdrant_citations = _qdrant_citations_from_docs(
+            docs=(docs or retrieved.category_docs),
+            referenced_laws=best.referenced_laws if best else [],
+            judgment_source="qdrant_support",
+        )
         reason_text = _llm_generate_reason_only(
             item_text=item_text_with_remark,
             category_name=block.category_name,
@@ -310,6 +366,11 @@ def _process_single_item(
         # 강한 허용 → 판단은 RDB, 사유만 LLM
         judgment_tier = "rdb"
         best = next((m for m in matches if m.allowed is True and m.match_source in _AUTHORITATIVE_SOURCES), None)
+        qdrant_citations = _qdrant_citations_from_docs(
+            docs=(docs or retrieved.category_docs),
+            referenced_laws=best.referenced_laws if best else [],
+            judgment_source="qdrant_support",
+        )
         reason_text = _llm_generate_reason_only(
             item_text=item_text_with_remark,
             category_name=block.category_name,
@@ -327,6 +388,11 @@ def _process_single_item(
             retrieved_context=context_text,
         )
         if llm_match is not None:
+            qdrant_citations = _qdrant_citations_from_docs(
+                docs=(docs or retrieved.category_docs),
+                referenced_laws=llm_match.referenced_laws,
+                judgment_source="llm_fallback",
+            )
             if _has_rdb_match(matches, block.category_code):
                 matches = matches + [llm_match]
             else:
@@ -340,6 +406,7 @@ def _process_single_item(
         item_exception_text=item_exception_text,
         judgment_tier=judgment_tier,
         reason_text=reason_text,
+        qdrant_citations=qdrant_citations,
     )
 
 

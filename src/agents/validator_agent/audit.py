@@ -332,6 +332,8 @@ def _build_item_judgment(bundle: ItemRuleBundle, *, category_name: str) -> ItemJ
         reasoning=reasoning,
         evidence_snippets=_build_item_evidence_snippets(bundle=bundle, best=best),
         referenced_laws=referenced_laws,
+        source_ids=[best.source_id] if best is not None and best.source_id else [],
+        qdrant_citations=bundle.qdrant_citations,
         category_limit_pct=None,
         category_limit_rule="",
         needs_human_review=needs_review,
