@@ -13,6 +13,7 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
 from src.api.routers import (
+    chatbot,
     link,
     orchestrator,
     parse,
@@ -55,6 +56,7 @@ app.include_router(parse.router)
 app.include_router(link.router)
 app.include_router(receipts.router)
 app.include_router(tax_invoices.router)
+app.include_router(chatbot.router)
 
 
 if __name__ == "__main__":
