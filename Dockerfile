@@ -37,12 +37,17 @@ RUN --mount=type=cache,target=/root/.cache/uv \
 RUN --mount=type=cache,target=/root/.cache/uv \
     uv sync --frozen --no-dev
 
-# Preload local embedding and legal reranker models into the image so the first
-# orchestrator legal run does not download them from HuggingFace at runtime.
+# Save local embedding and legal reranker models into the image so runtime
+# offline mode never needs to resolve HuggingFace model metadata.
 RUN .venv/bin/python -c "\
 from sentence_transformers import CrossEncoder, SentenceTransformer; \
-SentenceTransformer('jhgan/ko-sroberta-multitask'); \
-CrossEncoder('BAAI/bge-reranker-v2-m3', backend='onnx')"
+SentenceTransformer('jhgan/ko-sroberta-multitask').save('/app/models/ko-sroberta-multitask'); \
+CrossEncoder('BAAI/bge-reranker-v2-m3', backend='onnx').save_pretrained('/app/models/bge-reranker-v2-m3-onnx')"
+
+RUN HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 .venv/bin/python -c "\
+from sentence_transformers import CrossEncoder, SentenceTransformer; \
+SentenceTransformer('/app/models/ko-sroberta-multitask'); \
+CrossEncoder('/app/models/bge-reranker-v2-m3-onnx', backend='onnx')"
 
 COPY src ./src
 
