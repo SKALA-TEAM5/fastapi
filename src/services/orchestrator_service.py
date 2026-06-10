@@ -548,16 +548,27 @@ def _run_safety_doc_agent(
             _dict_or_empty(row.get("result")).get("model_name")
             for row in item_results
         ) or "safety_doc_agent"
-        todos = [
-            {
-                "usage_statement_item_id": row["item_id"],
-                **_todo_context_from_safety_doc_result(row),
-                "reason": "필수 증빙 누락: "
-                + ", ".join((_dict_or_empty(row.get("result")).get("evidence_status") or {}).get("missing_evidences") or []),
-            }
-            for row in item_results
-            if ((_dict_or_empty(row.get("result")).get("evidence_status") or {}).get("missing_evidences") or [])
-        ]
+        todos = []
+        for row in item_results:
+            missing_evidences = (
+                (_dict_or_empty(row.get("result")).get("evidence_status") or {}).get("missing_evidences")
+                or []
+            )
+            if not missing_evidences:
+                continue
+            todo_context = _todo_context_from_safety_doc_result(row)
+            missing_text = ", ".join(missing_evidences)
+            item_name = _first_string([todo_context.get("usage_statement_item_name")])
+            reason_prefix = f"{item_name} 필수 증빙 누락" if item_name else "필수 증빙 누락"
+            todos.append(
+                {
+                    "usage_statement_item_id": row["item_id"],
+                    **todo_context,
+                    "title": missing_text,
+                    "evidence_type_codes": missing_evidences,
+                    "reason": f"{reason_prefix}: {missing_text}",
+                }
+            )
         upsert_agent_log(
             project_id=project_id,
             usage_statement_id=usage_statement_id,
@@ -653,16 +664,26 @@ def _run_link_agent(
             file_ids=target_file_ids,
             status_code="success" if result_code == "success" else "fail",
         )
-        todos = [
-            {
-                "usage_statement_item_id": int(row.get("line_id")),
-                **item_contexts.get(int(row.get("line_id")), {}),
-                "reason": f"증빙 매칭 검토 필요: {row.get('match_status')}",
-            }
-            for row in (result.get("match_results") or [])
-            if str(row.get("line_id") or "").isdigit()
-            and row.get("match_status") in {"review_needed", "unmatched", "rejected"}
-        ]
+        todos = []
+        for row in result.get("match_results") or []:
+            if not str(row.get("line_id") or "").isdigit():
+                continue
+            if row.get("match_status") not in {"review_needed", "unmatched", "rejected"}:
+                continue
+            item_id = int(row.get("line_id"))
+            todo_context = item_contexts.get(item_id, {})
+            item_name = _first_string([todo_context.get("usage_statement_item_name")])
+            status_text = str(row.get("match_status") or "review_needed")
+            reason_prefix = f"{item_name} 증빙 매칭 검토 필요" if item_name else "증빙 매칭 검토 필요"
+            todos.append(
+                {
+                    "usage_statement_item_id": item_id,
+                    **todo_context,
+                    "title": "영수증/세금계산서",
+                    "match_status": status_text,
+                    "reason": f"{reason_prefix}: {status_text}",
+                }
+            )
         upsert_agent_log(
             project_id=project_id,
             usage_statement_id=usage_statement_id,
