@@ -10,6 +10,8 @@
 # 4. rewrite_query()   : LLM 기반 검색 쿼리 재작성
 # --------------------------------------------------------------------------
 import logging
+import os
+from pathlib import Path
 from threading import Lock
 from typing import NamedTuple
 
@@ -32,9 +34,15 @@ MAX_RETRY = 3
 
 _kiwi = Kiwi()
 _RERANK_MODEL = "BAAI/bge-reranker-v2-m3"
+_RERANK_LOCAL_PATH = "/app/models/bge-reranker-v2-m3-onnx"
 _TOP_N = 5
 _BATCH_SIZE = 8
 _PDF_SOURCE_TYPES = {"law_notice", "commentary", "appendix_disallowed"}
+
+
+def _resolve_rerank_model_path() -> str:
+    local_path = os.getenv("RERANK_MODEL_PATH", _RERANK_LOCAL_PATH).strip()
+    return local_path if local_path and Path(local_path).exists() else _RERANK_MODEL
 
 
 class _RetrieverCache(NamedTuple):
@@ -122,16 +130,17 @@ def _get_rerank_model() -> CrossEncoder:
         with _rerank_model_lock:
             if _rerank_model is None:
                 import platform
+                model_path = _resolve_rerank_model_path()
                 if platform.system() == "Linux":
                     # K8s (x86 Linux): ONNX Runtime으로 3-4배 빠른 추론
-                    log.info(f"ReRanker 로드 중 (ONNX/cpu): {_RERANK_MODEL}")
-                    _rerank_model = CrossEncoder(_RERANK_MODEL, backend="onnx")
+                    log.info(f"ReRanker 로드 중 (ONNX/cpu): {model_path}")
+                    _rerank_model = CrossEncoder(model_path, backend="onnx")
                 else:
                     # Mac: CoreML 간섭 문제로 PyTorch 사용
                     import torch
                     device = "mps" if torch.backends.mps.is_available() else "cpu"
-                    log.info(f"ReRanker 로드 중 ({device}): {_RERANK_MODEL}")
-                    _rerank_model = CrossEncoder(_RERANK_MODEL)
+                    log.info(f"ReRanker 로드 중 ({device}): {model_path}")
+                    _rerank_model = CrossEncoder(model_path)
                 log.info("ReRanker 로드 완료")
     return _rerank_model
 
