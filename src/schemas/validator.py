@@ -50,6 +50,8 @@ class ItemJudgment(BaseModel):
     reasoning: str = Field(description="판정 근거")
     evidence_snippets: List[str] = Field(default=[])
     referenced_laws: List[str] = Field(default=[])
+    source_ids: List[str] = Field(default=[], description="판정에 사용한 legal_master source id 목록")
+    qdrant_citations: List[dict] = Field(default=[], description="항목 판단 또는 사유 생성에 사용한 Qdrant 원문 근거")
     category_limit_pct: Optional[float] = Field(default=None)
     category_limit_rule: str = Field(default="")
     needs_human_review: bool = Field(default=False)
