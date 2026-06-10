@@ -57,6 +57,9 @@ class AgentLogSnapshot(BaseModel):
 class SupplementTodoSnapshot(BaseModel):
     agent_type_code: str
     usage_statement_item_id: int | None = None
+    category_code: str | None = None
+    category_name: str | None = None
+    usage_statement_item_name: str | None = None
     file_id: int | None = None
     reason: str
     status_code: str = "open"

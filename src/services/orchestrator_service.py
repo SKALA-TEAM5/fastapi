@@ -547,6 +547,7 @@ def _run_safety_doc_agent(
         todos = [
             {
                 "usage_statement_item_id": row["item_id"],
+                **_todo_context_from_safety_doc_result(row),
                 "reason": "필수 증빙 누락: "
                 + ", ".join((_dict_or_empty(row.get("result")).get("evidence_status") or {}).get("missing_evidences") or []),
             }
@@ -630,6 +631,7 @@ def _run_link_agent(
     )
 
     try:
+        item_contexts = _usage_statement_item_context_index(usage_statement_id)
         result = run_link_pipeline(
             usage_statement_id=usage_statement_id,
             receipt_file_ids=receipt_file_ids,
@@ -650,6 +652,7 @@ def _run_link_agent(
         todos = [
             {
                 "usage_statement_item_id": int(row.get("line_id")),
+                **item_contexts.get(int(row.get("line_id")), {}),
                 "reason": f"증빙 매칭 검토 필요: {row.get('match_status')}",
             }
             for row in (result.get("match_results") or [])
@@ -876,6 +879,7 @@ def _run_vision_agent(
     }
 
     try:
+        file_contexts = _evidence_file_todo_context_index(usage_statement_id)
         response = requests.post(
             _vision_agent_review_url(),
             json=payload,
@@ -884,7 +888,14 @@ def _run_vision_agent(
         response.raise_for_status()
         body = response.json()
 
-        todos = body.get("todos") or []
+        todos = [
+            {
+                **todo,
+                **file_contexts.get(_int_or_none(todo.get("file_id")) or -1, {}),
+            }
+            for todo in (body.get("todos") or [])
+            if isinstance(todo, dict)
+        ]
         status_code = str(body.get("status_code") or "success").lower()
         if status_code == "failed":
             status_code = "fail"
@@ -1018,6 +1029,8 @@ def _run_legal_agent(
         todos = [
             {
                 "usage_statement_item_id": row.get("item_id"),
+                "category_code": row.get("category_code"),
+                "category_name": CATEGORIES.get(str(row.get("category_code") or "")),
                 "reason": f"법령 검토 필요: {row.get('reason') or row.get('status')}",
             }
             for row in item_results
@@ -1565,8 +1578,130 @@ def _openai_model_name() -> str:
     return os.getenv("OPENAI_MODEL", "gpt-4o-mini").strip() or "gpt-4o-mini"
 
 
+def _todo_context_from_safety_doc_result(row: dict[str, Any]) -> dict[str, Any]:
+    result = _dict_or_empty(row.get("result"))
+    input_from_db_views = _dict_or_empty(result.get("input_from_db_views"))
+    item_context = _dict_or_empty(input_from_db_views.get("item_context"))
+    if not item_context:
+        return {}
+
+    category_code = _first_string([item_context.get("category_code")])
+    return {
+        "category_code": category_code,
+        "category_name": _first_string([item_context.get("category_name")])
+        or (CATEGORIES.get(category_code) if category_code else None),
+        "usage_statement_item_name": _first_string([item_context.get("item_name")]),
+    }
+
+
+def _usage_statement_item_context_index(usage_statement_id: int) -> dict[int, dict[str, Any]]:
+    with get_connection() as conn:
+        with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+            cur.execute(
+                """
+                SELECT
+                    usi.id AS item_id,
+                    usi.category_code,
+                    uc.name AS category_name,
+                    usi.item_name
+                FROM usage_statement_items usi
+                LEFT JOIN usage_categories uc
+                  ON uc.code = usi.category_code
+                WHERE usi.usage_statement_id = %(usage_statement_id)s
+                ORDER BY usi.id
+                """,
+                {"usage_statement_id": usage_statement_id},
+            )
+            rows = cur.fetchall()
+
+    contexts: dict[int, dict[str, Any]] = {}
+    for row in rows:
+        item_id = _int_or_none(row.get("item_id"))
+        if item_id is None:
+            continue
+        category_code = _first_string([row.get("category_code")])
+        contexts[item_id] = {
+            "category_code": category_code,
+            "category_name": _first_string([row.get("category_name")])
+            or (CATEGORIES.get(category_code) if category_code else None),
+            "usage_statement_item_name": _first_string([row.get("item_name")]),
+        }
+    return contexts
+
+
+def _evidence_file_todo_context_index(usage_statement_id: int) -> dict[int, dict[str, Any]]:
+    item_contexts = _usage_statement_item_context_index(usage_statement_id)
+    if not item_contexts:
+        return {}
+
+    with get_connection() as conn:
+        with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+            cur.execute(
+                """
+                SELECT
+                    efl.file_id,
+                    efl.usage_statement_item_id
+                FROM evidence_file_links efl
+                JOIN usage_statement_items usi
+                  ON usi.id = efl.usage_statement_item_id
+                WHERE usi.usage_statement_id = %(usage_statement_id)s
+                ORDER BY efl.file_id, efl.usage_statement_item_id
+                """,
+                {"usage_statement_id": usage_statement_id},
+            )
+            rows = cur.fetchall()
+
+    contexts: dict[int, dict[str, Any]] = {}
+    for row in rows:
+        file_id = _int_or_none(row.get("file_id"))
+        item_id = _int_or_none(row.get("usage_statement_item_id"))
+        if file_id is None or item_id is None or file_id in contexts:
+            continue
+        item_context = item_contexts.get(item_id)
+        if not item_context:
+            continue
+        contexts[file_id] = {
+            "usage_statement_item_id": item_id,
+            **item_context,
+        }
+    return contexts
+
+
+def _build_todo_context_index(logs: dict[str, dict[str, Any]]) -> dict[int, dict[str, Any]]:
+    context_by_item_id: dict[int, dict[str, Any]] = {}
+    for log in logs.values():
+        payload = _dict_or_empty(_dict_or_empty(log.get("details")).get("payload"))
+
+        for row in payload.get("item_results") or []:
+            if not isinstance(row, dict):
+                continue
+            item_id = _int_or_none(row.get("item_id"))
+            if item_id is None:
+                continue
+            context = _todo_context_from_safety_doc_result(row)
+            if context:
+                context_by_item_id[item_id] = {**context_by_item_id.get(item_id, {}), **context}
+
+        for row in payload.get("results") or []:
+            if not isinstance(row, dict):
+                continue
+            item_id = _int_or_none(row.get("item_id"))
+            if item_id is None:
+                continue
+            category_code = _first_string([row.get("category_code")])
+            if category_code:
+                context_by_item_id[item_id] = {
+                    **context_by_item_id.get(item_id, {}),
+                    "category_code": category_code,
+                    "category_name": CATEGORIES.get(category_code),
+                }
+
+    return context_by_item_id
+
+
 def _build_status_todos(logs: dict[str, dict[str, Any]]) -> list[SupplementTodoSnapshot]:
     todos: list[SupplementTodoSnapshot] = []
+    context_by_item_id = _build_todo_context_index(logs)
     for agent_type_code, log in sorted(logs.items()):
         if log.get("result_code") != "hil":
             continue
@@ -1578,10 +1713,19 @@ def _build_status_todos(logs: dict[str, dict[str, Any]]) -> list[SupplementTodoS
             reason = todo.get("reason")
             if not reason:
                 continue
+            item_id = _int_or_none(todo.get("usage_statement_item_id"))
+            context = context_by_item_id.get(item_id or -1, {})
+            category_code = _first_string([todo.get("category_code"), context.get("category_code")])
             todos.append(
                 SupplementTodoSnapshot(
                     agent_type_code=agent_type_code,
-                    usage_statement_item_id=todo.get("usage_statement_item_id"),
+                    usage_statement_item_id=item_id,
+                    category_code=category_code,
+                    category_name=_first_string([todo.get("category_name"), context.get("category_name")])
+                    or (CATEGORIES.get(category_code) if category_code else None),
+                    usage_statement_item_name=_first_string(
+                        [todo.get("usage_statement_item_name"), context.get("usage_statement_item_name")]
+                    ),
                     file_id=todo.get("file_id"),
                     reason=reason,
                     status_code=todo.get("status_code") or "open",
