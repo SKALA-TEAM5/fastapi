@@ -145,20 +145,45 @@ class PostgresReportRepository(ReportRepository):
         return _group_agent_logs_by_item(rows)
 
     def list_action_requests(self, project_id: int, usage_statement_id: int) -> list[dict]:
-        return self._fetch_all(
+        rows = self._fetch_all(
             """
-            SELECT ar.id, ar.usage_statement_item_id, ar.title, ar.reason,
-                   ar.status_code, ar.due_date, assignee.real_name AS assignee_name,
-                   ar.created_at, ar.closed_at AS resolved_at
-            FROM action_requests ar
-            LEFT JOIN users assignee
-              ON assignee.id = ar.assignee_user_id
-            WHERE ar.project_id = %(project_id)s
-              AND ar.usage_statement_id = %(usage_statement_id)s
-            ORDER BY ar.created_at, ar.id
+            SELECT id, agent_type_code, reason, details, created_at
+            FROM agent_logs
+            WHERE project_id = %(project_id)s
+              AND usage_statement_id = %(usage_statement_id)s
+              AND status_code = 'success'
+              AND result_code = 'hil'
+              AND details ? 'payload'
+            ORDER BY created_at, id
             """,
             {"project_id": project_id, "usage_statement_id": usage_statement_id},
         )
+        action_requests: list[dict] = []
+        for row in rows:
+            payload = _json_dict(row.get("details")).get("payload")
+            if not isinstance(payload, dict):
+                continue
+            todos = payload.get("todos")
+            if not isinstance(todos, list):
+                continue
+            for index, todo in enumerate(todos, start=1):
+                if not isinstance(todo, dict):
+                    continue
+                reason = str(todo.get("reason") or row.get("reason") or "보완 요청")
+                action_requests.append(
+                    {
+                        "id": int(row["id"]) * 1000 + index,
+                        "usage_statement_item_id": _item_id(todo),
+                        "title": str(todo.get("title") or todo.get("usage_statement_item_name") or "보완 요청"),
+                        "reason": reason,
+                        "status_code": str(todo.get("status_code") or "open"),
+                        "due_date": None,
+                        "assignee_name": todo.get("assignee_name") or todo.get("assignee"),
+                        "created_at": row["created_at"],
+                        "resolved_at": None,
+                    }
+                )
+        return action_requests
 
     def _list_agent_results(self, usage_statement_id: int) -> tuple[dict[int, dict], dict[int, dict], dict[str, dict]]:
         rows = self._fetch_all(
