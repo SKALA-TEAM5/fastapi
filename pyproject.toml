@@ -10,6 +10,7 @@ dependencies = [
   "chromadb>=0.6.0",
   "docling>=2.90.0",
   "fastapi>=0.116.0",
+  "google-genai>=1.0.0",
   "kiwipiepy>=0.23.1",
   "langchain>=1.2.15",
   "langchain-classic>=1.0.0",
