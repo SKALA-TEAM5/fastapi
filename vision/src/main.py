@@ -187,7 +187,7 @@ async def vision_review(request: VisionReviewRequest) -> VisionReviewResponse:
     for photo in request.photos:
         try:
             if not _is_supported_target_equipment(photo.target_equipment):
-                result = _target_missing_result(photo)
+                result = _unsupported_target_result(photo)
             else:
                 image = _load_source_image(photo.presigned_url)
                 result = _review_target_photo(photo, image)
@@ -363,7 +363,7 @@ def _review_target_photo(photo: VisionReviewPhoto, image: Any) -> dict[str, Any]
         response.annotated_image_url = _annotated_image_url(output_path)
         return _safety_net_target_result(photo, response)
 
-    return _target_missing_result(photo)
+    return _unsupported_target_result(photo)
 
 
 def _review_photo(photo: VisionReviewPhoto, image: Any, review_type: str) -> dict[str, Any]:
@@ -438,17 +438,17 @@ def _photo_context(photo: VisionReviewPhoto) -> dict[str, Any]:
     }
 
 
-def _target_missing_result(photo: VisionReviewPhoto) -> dict[str, Any]:
-    reason = "검증 대상 보호구를 특정할 수 없습니다."
+def _unsupported_target_result(photo: VisionReviewPhoto) -> dict[str, Any]:
+    reason = "Vision 검증 대상 항목이 아니므로 자동 검출을 생략했습니다."
     return {
         "file_id": photo.file_id,
         "original_filename": photo.original_filename,
         "storage_key": photo.storage_key,
         "evidence_type_code": photo.evidence_type_code,
         **_photo_context(photo),
-        "review_type": "target_missing",
-        "status": "needs_review",
-        "is_appropriate": None,
+        "review_type": "unsupported",
+        "status": "appropriate",
+        "is_appropriate": True,
         "message": reason,
         "model_name": None,
         "source_image_url": None,
@@ -457,8 +457,8 @@ def _target_missing_result(photo: VisionReviewPhoto) -> dict[str, Any]:
             "model_name": None,
             "image_width": None,
             "image_height": None,
-            "status": "needs_review",
-            "is_appropriate": None,
+            "status": "appropriate",
+            "is_appropriate": True,
             "message": reason,
             "reviews": [],
             "detections": [],

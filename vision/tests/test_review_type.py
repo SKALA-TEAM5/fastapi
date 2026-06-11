@@ -1,4 +1,4 @@
-from src.main import _review_type
+from src.main import _review_type, _unsupported_target_result
 from src.core.config import Settings
 from src.schemas.vision import Detection, VisionReviewPhoto
 from src.services.vision_detection_service import VisionDetectionService
@@ -26,6 +26,17 @@ def test_item_photo_uses_ppe_model():
 
 def test_safety_net_filename_uses_safety_net_model():
     assert _review_type(make_photo("site_photo", "safety-net.jpg")) == "safety-net"
+
+
+def test_unsupported_target_result_is_appropriate_without_detections():
+    photo = make_photo("site_photo")
+
+    result = _unsupported_target_result(photo)
+
+    assert result["review_type"] == "unsupported"
+    assert result["status"] == "appropriate"
+    assert result["is_appropriate"] is True
+    assert result["result"]["detections"] == []
 
 
 def test_target_ppe_review_uses_only_target_equipment():

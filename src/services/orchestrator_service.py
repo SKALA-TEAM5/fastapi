@@ -45,6 +45,7 @@ from src.repositories.orchestrator_repository import (
     select_evidence_agents,
     update_file_details,
     update_file_statuses,
+    update_file_statuses_by_id,
     upsert_agent_log,
 )
 from src.repositories.db import get_connection
@@ -65,9 +66,12 @@ _LEGAL_ORIGINAL_TEXT_MAX_LENGTH = 600
 _TARGET_EQUIPMENT_KEYWORDS: tuple[tuple[str, tuple[str, ...]], ...] = (
     ("safety_helmet", ("안전모", "헬멧")),
     ("safety_shoes", ("안전화",)),
-    ("safety_belt", ("안전벨트", "안전대")),
+    ("safety_belt", ("안전벨트", "안전대", "안전띠")),
     ("safety_net", ("안전망",)),
 )
+_VISION_ALLOWED_CATEGORY_CODES: set[str] | None = {"CAT_02", "CAT_03"}
+# 모든 카테고리의 연결된 사진을 Vision 대상으로 실행하려면 아래 설정을 사용합니다.
+# _VISION_ALLOWED_CATEGORY_CODES = None
 
 
 def parse_and_classify_usage_statement(file_id: int) -> OrchestratorActionResponse:
@@ -820,11 +824,16 @@ def _vision_file_details(
 
         nested_result = _as_dict(row.get("result")) or row
         detections = _as_list(nested_result.get("detections"))
+        is_appropriate = (
+            row.get("is_appropriate")
+            if row.get("is_appropriate") is not None
+            else row.get("isAppropriate", nested_result.get("is_appropriate", nested_result.get("isAppropriate")))
+        )
         result[file_id] = {
             "vision_validation": {
                 "usage_statement_id": usage_statement_id,
                 "status_code": str(body.get("status_code") or "success").lower(),
-                "result_code": result_code,
+                "result_code": "success" if is_appropriate is True else result_code,
                 "reason": str(row.get("reason") or row.get("message") or reason),
                 "original_filename": (
                     row.get("original_filename")
@@ -833,16 +842,42 @@ def _vision_file_details(
                 ),
                 "image_width": nested_result.get("image_width") or nested_result.get("imageWidth"),
                 "image_height": nested_result.get("image_height") or nested_result.get("imageHeight"),
-                "is_appropriate": (
-                    row.get("is_appropriate")
-                    if row.get("is_appropriate") is not None
-                    else row.get("isAppropriate", nested_result.get("is_appropriate", nested_result.get("isAppropriate")))
-                ),
+                "is_appropriate": is_appropriate,
                 "detections": detections,
             }
         }
 
     return result
+
+
+def _vision_file_statuses(
+    *,
+    body: dict[str, Any],
+    details: dict[str, Any],
+) -> dict[int, str]:
+    statuses: dict[int, str] = {}
+    for row in _vision_result_rows(body, details):
+        raw_file_id = row.get("file_id") or row.get("fileId")
+        file_id = _int_or_none(raw_file_id)
+        if file_id is None:
+            continue
+        nested_result = _as_dict(row.get("result")) or row
+        is_appropriate = (
+            row.get("is_appropriate")
+            if row.get("is_appropriate") is not None
+            else row.get("isAppropriate", nested_result.get("is_appropriate", nested_result.get("isAppropriate")))
+        )
+        statuses[file_id] = "success" if is_appropriate is True else "fail"
+    return statuses
+
+
+def _is_vision_allowed_file_context(file_context: dict[str, Any] | None) -> bool:
+    if not file_context:
+        return False
+    if _VISION_ALLOWED_CATEGORY_CODES is None:
+        return True
+    category_code = _first_string([file_context.get("category_code")])
+    return category_code in _VISION_ALLOWED_CATEGORY_CODES
 
 
 def _run_vision_agent(
@@ -854,8 +889,15 @@ def _run_vision_agent(
     photo_files = list_evidence_files_by_type(project_id, SITE_PHOTO_TYPES)
     if not photo_files:
         return {"status_code": "skipped", "result_code": None, "reason": "현장사진 파일 없음"}
-    photo_file_ids = [int(file_info["id"]) for file_info in photo_files if file_info.get("id") is not None]
     file_contexts = _evidence_file_todo_context_index(usage_statement_id)
+    vision_photo_files = [
+        file_info
+        for file_info in photo_files
+        if _is_vision_allowed_file_context(file_contexts.get(_int_or_none(file_info.get("id")) or -1))
+    ]
+    if not vision_photo_files:
+        return {"status_code": "skipped", "result_code": None, "reason": "Vision 검증 대상 현장사진 없음"}
+    photo_file_ids = [int(file_info["id"]) for file_info in vision_photo_files if file_info.get("id") is not None]
 
     photos = [
         {
@@ -868,7 +910,7 @@ def _run_vision_agent(
             "presigned_url": create_presigned_file_url(file_info["storage_key"]),
             **file_contexts.get(_int_or_none(file_info.get("id")) or -1, {}),
         }
-        for file_info in photo_files
+        for file_info in vision_photo_files
     ]
 
     upsert_agent_log(
@@ -939,11 +981,6 @@ def _run_vision_agent(
             body.get("reason")
             or ("현장사진 검토 보완 필요" if result_code == "hil" else "현장사진 검토 적정")
         )
-        update_file_statuses(
-            project_id=project_id,
-            file_ids=photo_file_ids,
-            status_code="success" if result_code == "success" else "fail",
-        )
         usage_tokens = _usage_tokens_from_usage(body.get("usage") or body.get("token_usage") or body)
         token = _int_or_none(body.get("token") or body.get("token_usage"))
         if token is None:
@@ -964,6 +1001,10 @@ def _run_vision_agent(
                 "vision_response": vision_response,
                 "todos": todos,
             }
+        )
+        update_file_statuses_by_id(
+            project_id=project_id,
+            statuses_by_file_id=_vision_file_statuses(body=body, details=details),
         )
         update_file_details(
             project_id=project_id,
@@ -1834,7 +1875,16 @@ def _target_equipment_from_item_context(item_context: dict[str, Any]) -> str | N
         )
         if value
     )
+    category_code = _first_string([item_context.get("category_code")])
+    if category_code == "CAT_02":
+        allowed_targets = {"safety_net"}
+    elif category_code == "CAT_03":
+        allowed_targets = {"safety_helmet", "safety_shoes", "safety_belt"}
+    else:
+        allowed_targets = None
     for target_equipment, keywords in _TARGET_EQUIPMENT_KEYWORDS:
+        if allowed_targets is not None and target_equipment not in allowed_targets:
+            continue
         if any(keyword in haystack for keyword in keywords):
             return target_equipment
     return None
