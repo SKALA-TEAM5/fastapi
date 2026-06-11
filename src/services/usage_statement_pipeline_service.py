@@ -531,9 +531,8 @@ def run_link_pipeline(
                 tmp_path = _fetch_and_save_temp(file_info["storage_key"], suffix)
                 tmp_paths.append(tmp_path)
 
-                raw = call_clova_receipt(tmp_path, CLOVA_OCR_SECRET, CLOVA_OCR_URL)
-                ocr_result = parse_clova_response(raw)
-                ocr_result = validate_ocr_result(ocr_result)
+                from src.ocr import ocr_engine as _ocr_engine
+                ocr_result = _ocr_engine.parse_receipt(tmp_path)
                 ocr_result["source_file"] = file_info["original_filename"]
 
                 receipt_file_id_map[ocr_result.get("receipt_id", "")] = fid
@@ -554,7 +553,16 @@ def run_link_pipeline(
                 tmp_path = _fetch_and_save_temp(file_info["storage_key"], suffix)
                 tmp_paths.append(tmp_path)
 
-                parse_tax_invoice(tmp_path, secret=CLOVA_OCR_SECRET, url=CLOVA_OCR_URL)
+                ti_result = parse_tax_invoice(tmp_path, secret=CLOVA_OCR_SECRET, url=CLOVA_OCR_URL)
+                ti_result["doc_type"]    = "tax_invoice"
+                ti_result["source_file"] = file_info["original_filename"]
+                if "vendor" not in ti_result:
+                    sup = ti_result.get("supplier") or {}
+                    ti_result["vendor"] = sup.get("company_name")
+                if "date" not in ti_result:
+                    ti_result["date"] = ti_result.get("issue_date")
+                receipt_ocr_results.append(ti_result)
+
                 time.sleep(0.2)
 
             # ── 2-way 매칭 ────────────────────────────────────────────────
