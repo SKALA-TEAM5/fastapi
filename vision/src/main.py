@@ -29,6 +29,15 @@ settings.output_dir.mkdir(parents=True, exist_ok=True)
 app.mount("/vision-results", StaticFiles(directory=str(settings.output_dir)), name="vision-results")
 app.mount("/vision-files", StaticFiles(directory=str(settings.input_dir)), name="vision-files")
 
+PPE_TARGET_EQUIPMENT = {"safety_helmet", "safety_shoes", "safety_belt"}
+SAFETY_NET_TARGET_EQUIPMENT = "safety_net"
+TARGET_EQUIPMENT_LABELS = {
+    "safety_helmet": "안전모",
+    "safety_shoes": "안전화",
+    "safety_belt": "안전벨트",
+    "safety_net": "안전망",
+}
+
 
 @app.get("/health")
 def health() -> dict[str, Any]:
@@ -177,15 +186,18 @@ async def vision_review(request: VisionReviewRequest) -> VisionReviewResponse:
 
     for photo in request.photos:
         try:
-            image = _load_source_image(photo.presigned_url)
-            review_type = _review_type(photo)
-            result = _review_photo(photo, image, review_type)
+            if not _is_supported_target_equipment(photo.target_equipment):
+                result = _target_missing_result(photo)
+            else:
+                image = _load_source_image(photo.presigned_url)
+                result = _review_target_photo(photo, image)
         except Exception as exc:
             results.append(
                 {
                     "file_id": photo.file_id,
                     "original_filename": photo.original_filename,
                     "storage_key": photo.storage_key,
+                    **_photo_context(photo),
                     "status": "error",
                     "is_appropriate": None,
                     "message": str(exc),
@@ -207,12 +219,7 @@ async def vision_review(request: VisionReviewRequest) -> VisionReviewResponse:
 
         results.append(result)
         if result["is_appropriate"] is not True:
-            todos.append(
-                VisionReviewTodo(
-                    file_id=photo.file_id,
-                    reason=result["message"],
-                )
-            )
+            todos.append(_todo_from_result(photo, result))
 
     if todos:
         result_code = "hil"
@@ -233,6 +240,18 @@ async def vision_review(request: VisionReviewRequest) -> VisionReviewResponse:
             "usage_statement_id": request.usage_statement_id,
             "results": results,
         },
+    )
+
+
+def _todo_from_result(photo: VisionReviewPhoto, result: dict[str, Any]) -> VisionReviewTodo:
+    return VisionReviewTodo(
+        file_id=photo.file_id,
+        reason=str(result.get("message") or "현장사진 검토가 필요합니다."),
+        usage_statement_item_id=photo.usage_statement_item_id,
+        category_code=photo.category_code,
+        category_name=photo.category_name,
+        usage_statement_item_name=photo.usage_statement_item_name,
+        target_equipment=photo.target_equipment,
     )
 
 
@@ -317,6 +336,36 @@ def _review_type(photo: VisionReviewPhoto) -> str:
     return "combined"
 
 
+def _is_supported_target_equipment(target_equipment: str | None) -> bool:
+    target = (target_equipment or "").strip()
+    return target in PPE_TARGET_EQUIPMENT or target == SAFETY_NET_TARGET_EQUIPMENT
+
+
+def _review_target_photo(photo: VisionReviewPhoto, image: Any) -> dict[str, Any]:
+    target_equipment = (photo.target_equipment or "").strip()
+    if target_equipment in PPE_TARGET_EQUIPMENT:
+        response = vision_service.detect_target_ppe(image, target_equipment)
+        source_id = str(photo.file_id)
+        response.source_id = source_id
+        response.source_uri = photo.presigned_url
+        response.source_image_url = _source_image_url(photo.presigned_url)
+        return _photo_result(photo, "ppe", response.status, response.is_appropriate, response.message, response)
+
+    if target_equipment == SAFETY_NET_TARGET_EQUIPMENT:
+        response = vision_service.detect_safety_net(image)
+        source_id = str(photo.file_id)
+        response.source_id = source_id
+        response.source_uri = photo.presigned_url
+        response.source_image_url = _source_image_url(photo.presigned_url)
+        output_path = _named_annotated_output_path(source_id, "safety-net")
+        save_annotated_image(image, [], output_path, response.safety_net_review)
+        response.annotated_image_path = str(output_path)
+        response.annotated_image_url = _annotated_image_url(output_path)
+        return _safety_net_target_result(photo, response)
+
+    return _target_missing_result(photo)
+
+
 def _review_photo(photo: VisionReviewPhoto, image: Any, review_type: str) -> dict[str, Any]:
     if review_type == "ppe":
         response = vision_service.detect_ppe(image)
@@ -367,10 +416,91 @@ def _photo_result(
         "original_filename": photo.original_filename,
         "storage_key": photo.storage_key,
         "evidence_type_code": photo.evidence_type_code,
+        **_photo_context(photo),
         "review_type": review_type,
         "status": status,
         "is_appropriate": is_appropriate,
         "message": message,
+        "model_name": payload.get("model_name"),
+        "source_image_url": payload.get("source_image_url"),
+        "annotated_image_url": payload.get("annotated_image_url"),
+        "result": payload,
+    }
+
+
+def _photo_context(photo: VisionReviewPhoto) -> dict[str, Any]:
+    return {
+        "usage_statement_item_id": photo.usage_statement_item_id,
+        "usage_statement_item_name": photo.usage_statement_item_name,
+        "category_code": photo.category_code,
+        "category_name": photo.category_name,
+        "target_equipment": photo.target_equipment,
+    }
+
+
+def _target_missing_result(photo: VisionReviewPhoto) -> dict[str, Any]:
+    reason = "검증 대상 보호구를 특정할 수 없습니다."
+    return {
+        "file_id": photo.file_id,
+        "original_filename": photo.original_filename,
+        "storage_key": photo.storage_key,
+        "evidence_type_code": photo.evidence_type_code,
+        **_photo_context(photo),
+        "review_type": "target_missing",
+        "status": "needs_review",
+        "is_appropriate": None,
+        "message": reason,
+        "model_name": None,
+        "source_image_url": None,
+        "annotated_image_url": None,
+        "result": {
+            "model_name": None,
+            "image_width": None,
+            "image_height": None,
+            "status": "needs_review",
+            "is_appropriate": None,
+            "message": reason,
+            "reviews": [],
+            "detections": [],
+        },
+    }
+
+
+def _safety_net_target_result(
+    photo: VisionReviewPhoto,
+    response: SafetyNetDetectionResponse,
+) -> dict[str, Any]:
+    review = response.safety_net_review
+    equipment_label = TARGET_EQUIPMENT_LABELS[SAFETY_NET_TARGET_EQUIPMENT]
+    status = (
+        "appropriate"
+        if review.is_appropriate is True
+        else "not_appropriate"
+        if review.is_appropriate is False
+        else "needs_review"
+    )
+    payload = response.model_dump()
+    payload["reviews"] = [
+        {
+            "equipment": SAFETY_NET_TARGET_EQUIPMENT,
+            "equipment_label": equipment_label,
+            "status": review.status,
+            "is_appropriate": review.is_appropriate,
+            "confidence": review.confidence,
+            "reason": review.reason,
+        }
+    ]
+    payload["detections"] = []
+    return {
+        "file_id": photo.file_id,
+        "original_filename": photo.original_filename,
+        "storage_key": photo.storage_key,
+        "evidence_type_code": photo.evidence_type_code,
+        **_photo_context(photo),
+        "review_type": "safety-net",
+        "status": status,
+        "is_appropriate": review.is_appropriate,
+        "message": review.reason,
         "model_name": payload.get("model_name"),
         "source_image_url": payload.get("source_image_url"),
         "annotated_image_url": payload.get("annotated_image_url"),

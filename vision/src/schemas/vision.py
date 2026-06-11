@@ -96,6 +96,11 @@ class VisionReviewPhoto(BaseModel):
     mime_type: Optional[str] = None
     size_bytes: Optional[int] = None
     presigned_url: str
+    usage_statement_item_id: Optional[int] = None
+    usage_statement_item_name: Optional[str] = None
+    category_code: Optional[str] = None
+    category_name: Optional[str] = None
+    target_equipment: Optional[str] = None
 
 
 class VisionReviewRequest(BaseModel):
@@ -107,6 +112,11 @@ class VisionReviewRequest(BaseModel):
 class VisionReviewTodo(BaseModel):
     file_id: int
     reason: str
+    usage_statement_item_id: Optional[int] = None
+    category_code: Optional[str] = None
+    category_name: Optional[str] = None
+    usage_statement_item_name: Optional[str] = None
+    target_equipment: Optional[str] = None
 
 
 class VisionReviewResponse(BaseModel):

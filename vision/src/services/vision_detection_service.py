@@ -52,6 +52,26 @@ class VisionDetectionService:
             detections=detections,
         )
 
+    def detect_target_ppe(self, image: Image.Image, target_equipment: str) -> PpeDetectionResponse:
+        detections = self._detect_ppe_boxes(image)
+        target_detections = [
+            detection
+            for detection in detections
+            if detection.equipment == target_equipment
+        ]
+        review = self._build_target_review(target_equipment, target_detections)
+
+        return PpeDetectionResponse(
+            model_name=self.settings.model_name,
+            image_width=image.width,
+            image_height=image.height,
+            status=self._status_from_review(review),
+            is_appropriate=review.is_appropriate,
+            message=review.reason,
+            reviews=[review],
+            detections=target_detections,
+        )
+
     def detect_safety_net(self, image: Image.Image) -> SafetyNetDetectionResponse:
         review = self._classify_safety_net(image)
         return SafetyNetDetectionResponse(
@@ -206,6 +226,39 @@ class VisionDetectionService:
             )
 
         return reviews
+
+    def _build_target_review(
+        self,
+        target_equipment: str,
+        detections: list[Detection],
+    ) -> EquipmentReview:
+        equipment_label = self.settings.equipment_labels.get(target_equipment, target_equipment)
+        if not detections:
+            return EquipmentReview(
+                equipment=target_equipment,
+                equipment_label=equipment_label,
+                status="unknown",
+                is_appropriate=None,
+                confidence=None,
+                reason=f"{equipment_label}가 확인되지 않았습니다.",
+            )
+
+        best = max(detections, key=lambda detection: detection.confidence)
+        return EquipmentReview(
+            equipment=target_equipment,
+            equipment_label=equipment_label,
+            status="detected",
+            is_appropriate=True,
+            confidence=best.confidence,
+            reason=f"{equipment_label}가 {len(detections)}건 확인되었습니다.",
+        )
+
+    def _status_from_review(self, review: EquipmentReview) -> str:
+        if review.is_appropriate is True:
+            return "appropriate"
+        if review.is_appropriate is False:
+            return "not_appropriate"
+        return "needs_review"
 
     def _classify_safety_net(self, image: Image.Image) -> SafetyNetReview:
         model = self.load_safety_net_model()
