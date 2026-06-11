@@ -62,6 +62,12 @@ from src.services.minio_client import create_presigned_file_url
 from src.services.usage_statement_pipeline_service import parse_usage_statement, run_link_pipeline
 
 _LEGAL_ORIGINAL_TEXT_MAX_LENGTH = 600
+_TARGET_EQUIPMENT_KEYWORDS: tuple[tuple[str, tuple[str, ...]], ...] = (
+    ("safety_helmet", ("안전모", "헬멧")),
+    ("safety_shoes", ("안전화",)),
+    ("safety_belt", ("안전벨트", "안전대")),
+    ("safety_net", ("안전망",)),
+)
 
 
 def parse_and_classify_usage_statement(file_id: int) -> OrchestratorActionResponse:
@@ -767,6 +773,8 @@ def _vision_result_rows(body: dict[str, Any], details: dict[str, Any]) -> list[d
     candidates: list[Any] = [
         *(_as_list(body.get("results"))),
         *(_as_list(_as_dict(body.get("result")).get("results"))),
+        *(_as_list(_as_dict(body.get("details")).get("results"))),
+        *(_as_list(details.get("results"))),
         *(_as_list(_as_dict(details.get("result")).get("results"))),
     ]
     payload = _as_dict(details.get("payload"))
@@ -847,6 +855,7 @@ def _run_vision_agent(
     if not photo_files:
         return {"status_code": "skipped", "result_code": None, "reason": "현장사진 파일 없음"}
     photo_file_ids = [int(file_info["id"]) for file_info in photo_files if file_info.get("id") is not None]
+    file_contexts = _evidence_file_todo_context_index(usage_statement_id)
 
     photos = [
         {
@@ -857,6 +866,7 @@ def _run_vision_agent(
             "mime_type": file_info.get("mime_type"),
             "size_bytes": file_info.get("size_bytes"),
             "presigned_url": create_presigned_file_url(file_info["storage_key"]),
+            **file_contexts.get(_int_or_none(file_info.get("id")) or -1, {}),
         }
         for file_info in photo_files
     ]
@@ -904,7 +914,6 @@ def _run_vision_agent(
     }
 
     try:
-        file_contexts = _evidence_file_todo_context_index(usage_statement_id)
         response = requests.post(
             _vision_agent_review_url(),
             json=payload,
@@ -1816,6 +1825,21 @@ def _first_string(values) -> str | None:
     return None
 
 
+def _target_equipment_from_item_context(item_context: dict[str, Any]) -> str | None:
+    haystack = " ".join(
+        value
+        for value in (
+            _first_string([item_context.get("usage_statement_item_name"), item_context.get("item_name")]),
+            _first_string([item_context.get("category_name")]),
+        )
+        if value
+    )
+    for target_equipment, keywords in _TARGET_EQUIPMENT_KEYWORDS:
+        if any(keyword in haystack for keyword in keywords):
+            return target_equipment
+    return None
+
+
 def _openai_model_name() -> str:
     return os.getenv("OPENAI_MODEL", "gpt-4o-mini").strip() or "gpt-4o-mini"
 
@@ -1868,6 +1892,9 @@ def _usage_statement_item_context_index(usage_statement_id: int) -> dict[int, di
             or (CATEGORIES.get(category_code) if category_code else None),
             "usage_statement_item_name": _first_string([row.get("item_name")]),
         }
+        target_equipment = _target_equipment_from_item_context(contexts[item_id])
+        if target_equipment:
+            contexts[item_id]["target_equipment"] = target_equipment
     return contexts
 
 
