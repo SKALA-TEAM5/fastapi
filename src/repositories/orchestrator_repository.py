@@ -397,7 +397,9 @@ def upsert_agent_log(
                         reason = %(reason)s,
                         details = %(details)s::jsonb,
                         model_name = COALESCE(%(model_name)s, model_name),
-                        token = COALESCE(%(token)s, token)
+                        token = COALESCE(%(token)s, token),
+                        token_current = COALESCE(%(token)s, token_current),
+                        token_cumulative = COALESCE(token_cumulative, 0) + COALESCE(%(token)s, 0)
                     WHERE id = %(log_id)s
                     """,
                     {
@@ -416,11 +418,13 @@ def upsert_agent_log(
                 """
                 INSERT INTO agent_logs
                     (project_id, usage_statement_id, agent_type_code,
-                     status_code, result_code, reason, details, model_name, token)
+                     status_code, result_code, reason, details, model_name, token,
+                     token_current, token_cumulative)
                 VALUES
                     (%(project_id)s, %(usage_statement_id)s, %(agent_type_code)s,
                      %(status_code)s, %(result_code)s, %(reason)s, %(details)s::jsonb,
-                     %(model_name)s, %(token)s)
+                     %(model_name)s, %(token)s,
+                     %(token)s, COALESCE(%(token)s, 0))
                 RETURNING id
                 """,
                 {
@@ -444,7 +448,7 @@ def upsert_agent_log(
 def insert_agent_usage_record(
     *,
     project_id: int,
-    usage_statement_id: int,
+    usage_statement_id: int | None,
     agent_type_code: str,
     model_name: str | None = None,
     token: int | None = None,
@@ -508,7 +512,7 @@ def _resolve_usage_record_user_id(
     cur,
     *,
     project_id: int,
-    usage_statement_id: int,
+    usage_statement_id: int | None,
     requested_by_user_id: int | None,
 ) -> int | None:
     if requested_by_user_id is not None:
@@ -523,6 +527,9 @@ def _resolve_usage_record_user_id(
         row = cur.fetchone()
         if row:
             return int(row[0])
+
+    if usage_statement_id is None:
+        return None
 
     cur.execute(
         """

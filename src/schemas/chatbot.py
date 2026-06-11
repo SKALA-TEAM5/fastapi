@@ -36,6 +36,10 @@ class ChatRequest(BaseModel):
         default=None,
         description="대화 세션 ID. 미전달 시 서버에서 UUID를 생성하고 session_id 이벤트로 반환한다.",
     )
+    user_id: Optional[int] = Field(
+        default=None,
+        description="요청 사용자 ID. Spring에서 JWT 기반으로 주입한다.",
+    )
 
     @field_validator("question")
     @classmethod

@@ -30,6 +30,7 @@ import uuid
 from typing import AsyncGenerator
 
 from src.agents.chatbot_agent.agent import get_compiled_graph
+from src.repositories.orchestrator_repository import insert_agent_usage_record
 
 log = logging.getLogger(__name__)
 
@@ -81,11 +82,13 @@ async def _stream_events(
     graph,
     initial_state: dict,
     config: dict,
+    usage: dict,
 ) -> AsyncGenerator[str, None]:
     """astream_events를 소비하며 SSE 이벤트를 yield한다.
 
     - 전체 타임아웃: _STREAM_TOTAL_TIMEOUT 초
     - 토큰 간 타임아웃: _STREAM_TOKEN_TIMEOUT 초
+    - usage: 토큰 누적용 mutable dict {"input_tokens": int, "output_tokens": int, "model_name": str | None}
     """
     async def _next_event(ait):
         return await ait.__anext__()
@@ -146,10 +149,22 @@ async def _stream_events(
             if sources:
                 yield _sse("sources", sources)
 
+        # LLM 호출 완료 시 토큰 누적
+        elif ev_type == "on_chat_model_end":
+            output = data.get("output", {})
+            meta = output.usage_metadata if hasattr(output, "usage_metadata") else {}
+            if meta:
+                usage["input_tokens"]  += meta.get("input_tokens", 0)
+                usage["output_tokens"] += meta.get("output_tokens", 0)
+            if not usage["model_name"]:
+                resp_meta = output.response_metadata if hasattr(output, "response_metadata") else {}
+                usage["model_name"] = resp_meta.get("model_name")
+
 
 async def stream_chat(
     question: str,
     session_id: str | None = None,
+    user_id: int | None = None,
 ) -> AsyncGenerator[str, None]:
     """챗봇 그래프를 실행하고 SSE 이벤트를 스트리밍한다.
 
@@ -201,8 +216,10 @@ async def stream_chat(
             "messages":       [],
         }
 
+        usage: dict = {"input_tokens": 0, "output_tokens": 0, "model_name": None}
+
         try:
-            async for sse_event in _stream_events(graph, initial_state, config):
+            async for sse_event in _stream_events(graph, initial_state, config, usage):
                 yield sse_event
 
         except asyncio.TimeoutError as e:
@@ -212,5 +229,20 @@ async def stream_chat(
         except Exception as e:
             log.error(f"[chatbot_service] 스트리밍 오류: {e}", exc_info=True)
             yield _sse("error", "일시적인 오류가 발생했습니다. 다시 시도해 주세요.")
+
+        # 토큰이 수집됐고 user_id가 있으면 agent_usage_records에 기록 (fire-and-forget)
+        if user_id is not None and (usage["input_tokens"] > 0 or usage["output_tokens"] > 0):
+            asyncio.create_task(
+                asyncio.to_thread(
+                    insert_agent_usage_record,
+                    project_id=999,
+                    usage_statement_id=None,
+                    agent_type_code="chatbot",
+                    model_name=usage["model_name"],
+                    input_tokens=usage["input_tokens"],
+                    output_tokens=usage["output_tokens"],
+                    requested_by_user_id=user_id,
+                )
+            )
 
         yield _DONE_SIGNAL
