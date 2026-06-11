@@ -62,6 +62,11 @@ from src.schemas.orchestrator import (
 from src.services.minio_client import create_presigned_file_url
 from src.services.usage_statement_pipeline_service import parse_usage_statement, run_link_pipeline
 
+try:
+    from langchain_community.callbacks import get_openai_callback
+except ImportError:
+    get_openai_callback = None  # type: ignore
+
 _LEGAL_ORIGINAL_TEXT_MAX_LENGTH = 600
 _TARGET_EQUIPMENT_KEYWORDS: tuple[tuple[str, tuple[str, ...]], ...] = (
     ("safety_helmet", ("안전모", "헬멧")),
@@ -75,7 +80,13 @@ _VISION_ALLOWED_CATEGORY_CODES: set[str] | None = {"CAT_02", "CAT_03"}
 
 
 def parse_and_classify_usage_statement(file_id: int) -> OrchestratorActionResponse:
-    result = parse_usage_statement(file_id)
+    if get_openai_callback is not None:
+        with get_openai_callback() as _classi_cb:
+            result = parse_usage_statement(file_id)
+        _classi_usage = {"input_tokens": _classi_cb.prompt_tokens, "output_tokens": _classi_cb.completion_tokens}
+    else:
+        result = parse_usage_statement(file_id)
+        _classi_usage = {"input_tokens": None, "output_tokens": None}
     usage_statement_id = _int_or_none(result.get("usage_statement_id"))
     project_id = _int_or_none(result.get("project_id"))
     if project_id is not None and usage_statement_id is not None:
@@ -86,6 +97,7 @@ def parse_and_classify_usage_statement(file_id: int) -> OrchestratorActionRespon
             if classifier_changed_count
             else "세부내역 분류 이동 없음"
         )
+        _classi_token = (_classi_usage["input_tokens"] or 0) + (_classi_usage["output_tokens"] or 0)
         upsert_agent_log(
             project_id=project_id,
             usage_statement_id=usage_statement_id,
@@ -95,12 +107,15 @@ def parse_and_classify_usage_statement(file_id: int) -> OrchestratorActionRespon
             reason=summary,
             details=classifier_details,
             model_name="classifier_agent",
+            token=_classi_token or None,
         )
         _record_agent_usage(
             project_id=project_id,
             usage_statement_id=usage_statement_id,
             agent_type_code="classi",
             model_name=_openai_model_name(),
+            input_tokens=_classi_usage["input_tokens"],
+            output_tokens=_classi_usage["output_tokens"],
         )
         mark_orchestrator(
             project_id=project_id,
@@ -134,17 +149,33 @@ def classify_existing_usage_statement(
             payload={"item_id": request.item_id, "item_name": request.item_name},
         )
         submitted_category = request.category_code or ""
-        review_response = review_usage_statement(
-            usage_statement_id=request.usage_statement_id,
-            rows=[
-                {
-                    "row_id": 1,
-                    "given_category_code": submitted_category,
-                    "item_name": request.item_name,
-                }
-            ],
-            basic_info={},
-        )
+        if get_openai_callback is not None:
+            with get_openai_callback() as _classi_cb:
+                review_response = review_usage_statement(
+                    usage_statement_id=request.usage_statement_id,
+                    rows=[
+                        {
+                            "row_id": 1,
+                            "given_category_code": submitted_category,
+                            "item_name": request.item_name,
+                        }
+                    ],
+                    basic_info={},
+                )
+            _classi_usage = {"input_tokens": _classi_cb.prompt_tokens, "output_tokens": _classi_cb.completion_tokens}
+        else:
+            review_response = review_usage_statement(
+                usage_statement_id=request.usage_statement_id,
+                rows=[
+                    {
+                        "row_id": 1,
+                        "given_category_code": submitted_category,
+                        "item_name": request.item_name,
+                    }
+                ],
+                basic_info={},
+            )
+            _classi_usage = {"input_tokens": None, "output_tokens": None}
         review_map = {result.row_id: result for result in review_response.results}
         review = review_map.get(1)
 
@@ -198,6 +229,7 @@ def classify_existing_usage_statement(
                 ],
             },
         }
+        _classi_token = (_classi_usage["input_tokens"] or 0) + (_classi_usage["output_tokens"] or 0)
         upsert_agent_log(
             project_id=request.project_id,
             usage_statement_id=request.usage_statement_id,
@@ -207,12 +239,15 @@ def classify_existing_usage_statement(
             reason=summary,
             details=details,
             model_name="classifier_agent",
+            token=_classi_token or None,
         )
         _record_agent_usage(
             project_id=request.project_id,
             usage_statement_id=request.usage_statement_id,
             agent_type_code="classi",
             model_name=_openai_model_name(),
+            input_tokens=_classi_usage["input_tokens"],
+            output_tokens=_classi_usage["output_tokens"],
         )
         mark_orchestrator(
             project_id=request.project_id,
@@ -1072,7 +1107,13 @@ def _run_legal_agent(
 
     try:
         document, category_rows = _build_validator_document(project_id, usage_statement_id)
-        audit_response = validate_usage_statement(document=document)
+        if get_openai_callback is not None:
+            with get_openai_callback() as _legal_cb:
+                audit_response = validate_usage_statement(document=document)
+            _legal_usage = {"input_tokens": _legal_cb.prompt_tokens, "output_tokens": _legal_cb.completion_tokens}
+        else:
+            audit_response = validate_usage_statement(document=document)
+            _legal_usage = {"input_tokens": None, "output_tokens": None}
         summary_response = summarize_audit_response(
             response=audit_response,
             usage_statement_id=usage_statement_id,
@@ -1104,6 +1145,7 @@ def _run_legal_agent(
             for row in item_results
             if row["status"] != "적절"
         ]
+        _legal_token = (_legal_usage["input_tokens"] or 0) + (_legal_usage["output_tokens"] or 0)
         upsert_agent_log(
             project_id=project_id,
             usage_statement_id=usage_statement_id,
@@ -1122,12 +1164,15 @@ def _run_legal_agent(
                 },
             },
             model_name="validator_agent",
+            token=_legal_token or None,
         )
         _record_agent_usage(
             project_id=project_id,
             usage_statement_id=usage_statement_id,
             agent_type_code="legal",
             model_name=_openai_model_name(),
+            input_tokens=_legal_usage["input_tokens"],
+            output_tokens=_legal_usage["output_tokens"],
             requested_by_user_id=she_user_id,
         )
         return {

@@ -48,7 +48,7 @@ router = APIRouter(prefix="/chat", tags=["챗봇"])
 )
 async def chat(req: ChatRequest) -> StreamingResponse:
     return StreamingResponse(
-        stream_chat(question=req.question, session_id=req.session_id),
+        stream_chat(question=req.question, session_id=req.session_id, user_id=req.user_id),
         media_type="text/event-stream",
         headers={
             "Cache-Control": "no-cache",
