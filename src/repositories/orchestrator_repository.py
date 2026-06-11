@@ -258,6 +258,33 @@ def update_file_statuses(
             )
 
 
+def update_file_statuses_by_id(
+    *,
+    project_id: int,
+    statuses_by_file_id: dict[int, str],
+) -> None:
+    if not statuses_by_file_id:
+        return
+
+    with get_connection() as conn:
+        with conn.cursor() as cur:
+            for file_id, status_code in statuses_by_file_id.items():
+                cur.execute(
+                    """
+                    UPDATE files
+                    SET status_code = %(status_code)s
+                    WHERE project_id = %(project_id)s
+                      AND id = %(file_id)s
+                      AND deleted_at IS NULL
+                    """,
+                    {
+                        "project_id": project_id,
+                        "file_id": file_id,
+                        "status_code": status_code,
+                    },
+                )
+
+
 def update_file_details(
     *,
     project_id: int,
