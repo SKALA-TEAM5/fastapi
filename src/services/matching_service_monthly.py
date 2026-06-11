@@ -523,6 +523,59 @@ def _check_rejection(usage_item: dict, receipt: dict) -> Optional[str]:
 
 
 # ══════════════════════════════════════════════════════════════
+# 3-a-2. Gate 2 금액 보정 (거래명세표 VAT)
+# ══════════════════════════════════════════════════════════════
+
+def _resolve_gate2_amount(receipt: dict, usage_amount) -> int | None:
+    """
+    Gate 2 금액 비교를 위한 거래명세표 VAT 보정 함수.
+
+    delivery_statement의 경우 VLM이 total_amount를 공급가액(VAT 미포함)으로
+    반환할 수 있어 사용내역서 금액(VAT 포함)과 ~9.1% 차이가 발생한다.
+    3단계 보정을 시도해 Gate 2 통과 여부를 판정한다.
+
+      1순위: raw total_amount 그대로 (이미 VAT 포함이거나 정상 금액)
+      2순위: raw + tax_amount (VLM이 세액 필드를 별도 반환한 경우)
+      3순위: raw × 1.1 (세액 필드 없을 때 10% VAT 추정)
+
+    delivery_statement 외 doc_type은 raw 그대로 반환 (보정 없음).
+    """
+    raw = receipt.get("total_amount")
+    if raw is None:
+        return None
+
+    doc_type = receipt.get("doc_type")
+    if doc_type != "delivery_statement" or usage_amount is None:
+        return raw
+
+    try:
+        u, r = int(usage_amount), int(raw)
+    except (TypeError, ValueError):
+        return raw
+
+    def _within_gate(a: int, b: int) -> bool:
+        return max(a, b) > 0 and abs(a - b) / max(a, b) <= GATE_AMOUNT_PCT
+
+    # 1순위: raw 그대로
+    if _within_gate(u, r):
+        return r
+
+    # 2순위: raw + tax_amount
+    tax = receipt.get("tax_amount")
+    if tax is not None:
+        candidate = r + int(tax)
+        if _within_gate(u, candidate):
+            return candidate
+
+    # 3순위: raw × 1.1 추정
+    candidate_vat = int(r * 1.1)
+    if _within_gate(u, candidate_vat):
+        return candidate_vat
+
+    return r  # 보정 불가 → Gate 2 탈락
+
+
+# ══════════════════════════════════════════════════════════════
 # 3-b. Hard Gate 검사 (날짜·금액·업체명)
 # ══════════════════════════════════════════════════════════════
 
@@ -554,8 +607,10 @@ def _check_hard_gates(
             )
 
     # ── Gate 2: 금액 ─────────────────────────────────────────
+    # delivery_statement는 VLM이 공급가액만 반환할 수 있으므로
+    # _resolve_gate2_amount()로 VAT 보정 후 비교
     usage_amount   = usage_item.get("amount")
-    receipt_amount = receipt.get("total_amount")
+    receipt_amount = _resolve_gate2_amount(receipt, usage_amount)
     if usage_amount is not None and receipt_amount is not None:
         try:
             a1, a2 = int(usage_amount), int(receipt_amount)
@@ -641,6 +696,10 @@ def _get_item_vat_total(item: dict, doc_type: Optional[str] = None) -> Optional[
     if doc_type in ("tax_invoice", "delivery_statement"):
         return round(supply * (1 + VAT_RATE))
 
+    # 임금명세서: ③합계확인 보수총액은 VAT 없음 → amount 직접 사용
+    if doc_type == "wage_statement":
+        return supply
+
     # 일반 영수증: amount 자체가 부가세 포함
     return supply
 
@@ -701,7 +760,7 @@ def _expand_to_item_receipts(receipt: dict) -> list[dict]:
     items    = receipt.get("items", [])
 
     # 단품이거나 미지원 유형이면 확장 안 함
-    if doc_type not in ("delivery_statement", "tax_invoice") or len(items) <= 1:
+    if doc_type not in ("delivery_statement", "tax_invoice", "wage_statement") or len(items) <= 1:
         return [receipt]
 
     expanded: list[dict] = []
@@ -1143,11 +1202,20 @@ def match_all_usage_to_receipts(
     # ── 임금명세서 → Step 2 풀에 포함 (세금계산서 검증 제외) ──
     # 임금명세서는 세금계산서가 발행되지 않으므로 사전검증 대상에서 제외.
     # Gate 3(업체명)도 자동 면제 (_check_hard_gates 참조).
+    # ③합계확인에 구분별 breakdown(items)이 있으면 품목별 가상 영수증으로 확장 →
+    # 사용내역서 line_item(안전관리자 인건비 / 안전보건담당자 업무수당 등)과 1:1 매칭.
     # tax_invoice_status = "exempt" : 세금계산서 검증 대상이 아님을 명시
-    wage_as_evidence = [
-        {**w, "tax_invoice_status": "exempt", "matched_tax_invoice": None, "ti_failed_gates": []}
-        for w in wage_docs
-    ]
+    expanded_wage: list[dict] = []
+    for w in wage_docs:
+        base = {**w, "tax_invoice_status": "exempt", "matched_tax_invoice": None, "ti_failed_gates": []}
+        sub = _expand_to_item_receipts(base)
+        if len(sub) > 1:
+            logger.info(
+                "임금명세서 분리 [%s]: %d구분 → %d건",
+                w.get("source_file"), len(w.get("items", [])), len(sub),
+            )
+        expanded_wage.extend(sub)
+    wage_as_evidence = expanded_wage
 
     step2_pool = verified_docs + ti_as_evidence + wage_as_evidence
 

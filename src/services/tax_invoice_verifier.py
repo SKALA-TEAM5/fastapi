@@ -79,7 +79,7 @@ def verify_one_receipt(
     영수증/거래명세표 1건을 세금계산서 목록과 비교하여 유효성 판정.
 
     Args:
-        receipt      : doc_type이 "receipt" 또는 "transaction_statement"인 딕셔너리
+        receipt      : doc_type이 "receipt" 또는 "delivery_statement"인 딕셔너리
         tax_invoices : doc_type이 "tax_invoice"인 딕셔너리 목록
 
     Returns:
@@ -188,7 +188,7 @@ def verify_receipts_against_tax_invoices(
         "ti_failed_gates"      : [실패 사유]  (unverified 시)
 
     Args:
-        receipts      : doc_type이 "receipt" 또는 "transaction_statement"인 목록
+        receipts      : doc_type이 "receipt" 또는 "delivery_statement"인 목록
         tax_invoices  : doc_type이 "tax_invoice"인 목록
 
     Returns:

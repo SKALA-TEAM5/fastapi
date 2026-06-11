@@ -60,12 +60,12 @@ from src.ocr.parse_usage_statement import (
     parse_pdf,
     print_summary as print_usage_summary,
 )
-from src.ocr.clova_ocr_receipt import (
-    process_single as ocr_single,
-    CLOVA_SECRET,
-    CLOVA_URL,
-    SUPPORTED_EXTS,
-)
+from src.ocr.clova_ocr_receipt import SUPPORTED_EXTS
+from src.ocr import ocr_engine
+try:
+    from src.ocr.clova_ocr_receipt import CLOVA_SECRET, CLOVA_URL
+except ImportError:
+    CLOVA_SECRET, CLOVA_URL = "", ""
 from src.ocr.parse_tax_invoice import (
     parse_tax_invoice,
     process_folder as tax_invoice_process_folder,
@@ -119,8 +119,8 @@ def step1_parse_usage(pdf_path: str, output_dir: Path) -> dict:
 def step2_ocr_receipts(
     receipts_dir: str,
     output_dir: Path,
-    secret: str,
-    url: str,
+    secret: str = "",
+    url: str = "",
 ) -> list[dict]:
     """
     Step 2: 영수증 이미지 폴더 배치 OCR
@@ -153,7 +153,8 @@ def step2_ocr_receipts(
     results = []
     for i, img in enumerate(images, 1):
         print(f"  [{i}/{len(images)}]", end=" ")
-        result = ocr_single(str(img), secret, url, str(ocr_out_dir))
+        result = ocr_engine.parse_receipt(str(img))
+        result["source_file"] = img.name
         results.append(result)
         if i < len(images):
             time.sleep(0.3)
@@ -400,12 +401,14 @@ def main():
     secret = args.secret or CLOVA_SECRET
     url    = args.url    or CLOVA_URL
 
-    if not secret:
-        print("[오류] CLOVA OCR Secret Key가 없습니다. --secret 또는 환경변수 CLOVA_OCR_SECRET을 설정하세요.")
-        sys.exit(1)
-    if not url:
-        print("[오류] CLOVA OCR URL이 없습니다. --url 또는 환경변수 CLOVA_OCR_URL을 설정하세요.")
-        sys.exit(1)
+    # CLOVA 설정은 OCR_ENGINE=clova 일 때만 필수
+    if ocr_engine.get_engine_name() == "clova":
+        if not secret:
+            print("[오류] CLOVA OCR Secret Key가 없습니다. --secret 또는 환경변수 CLOVA_OCR_SECRET을 설정하세요.")
+            sys.exit(1)
+        if not url:
+            print("[오류] CLOVA OCR URL이 없습니다. --url 또는 환경변수 CLOVA_OCR_URL을 설정하세요.")
+            sys.exit(1)
 
     print("\n" + "═" * 60)
     print("  산업안전관리비 AI 검증 시스템 — 통합 파이프라인")

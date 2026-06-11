@@ -42,14 +42,10 @@ from pathlib import Path
 from fastapi import APIRouter, File, HTTPException, UploadFile, status
 
 from src.schemas.ocr import ReceiptOCRResponse, ReceiptValidation
-from src.core.config import CLOVA_OCR_SECRET, CLOVA_OCR_URL
-from src.ocr.clova_ocr_receipt import (
-    SUPPORTED_EXTS,
-    call_clova_receipt,
-    parse_clova_response,
-    validate_result,
-)
-from src.ocr.parse_tax_invoice import parse_from_pdf, parse_from_image
+from src.core.config import CLOVA_OCR_SECRET, CLOVA_OCR_URL, OCR_ENGINE
+from src.ocr.clova_ocr_receipt import SUPPORTED_EXTS
+from src.ocr.parse_tax_invoice import parse_from_pdf
+from src.ocr import ocr_engine
 
 router = APIRouter(prefix="/receipts", tags=["영수증 OCR"])
 
@@ -91,7 +87,7 @@ def _classify_document(file_bytes: bytes, suffix: str, filename: str) -> str:
     if any(kw in filename_lower for kw in _WAGE_KEYWORDS):
         return "wage_statement"
     if any(kw in filename_lower for kw in _TRANSACTION_KEYWORDS):
-        return "transaction_statement"
+        return "delivery_statement"
 
     # ② PDF이면 텍스트를 직접 뽑아서 키워드 검색
     if suffix in _PDF_EXT:
@@ -106,7 +102,7 @@ def _classify_document(file_bytes: bytes, suffix: str, filename: str) -> str:
             if any(kw in text for kw in _WAGE_KEYWORDS):
                 return "wage_statement"
             if any(kw in text for kw in _TRANSACTION_KEYWORDS):
-                return "transaction_statement"
+                return "delivery_statement"
         except Exception:
             pass  # pdfplumber 실패 시 기본값으로 계속 진행
 
@@ -120,7 +116,7 @@ def _classify_document(file_bytes: bytes, suffix: str, filename: str) -> str:
 # 헬퍼 2 — 거래명세표 / 임금명세서 파싱 결과 → 공통 응답 스키마 매핑
 # ──────────────────────────────────────────────────────────────────────
 
-def _map_transaction_statement(parsed: dict, filename: str, doc_type: str = "transaction_statement") -> dict:
+def _map_transaction_statement(parsed: dict, filename: str, doc_type: str = "delivery_statement") -> dict:
     """
     parse_tax_invoice.py 의 출력(거래명세표·임금명세서 공통 구조)을
     ReceiptOCRResponse 스키마로 변환한다.
@@ -132,10 +128,46 @@ def _map_transaction_statement(parsed: dict, filename: str, doc_type: str = "tra
       합계금액                  → total_amount
 
     Args:
-        doc_type: "transaction_statement" 또는 "wage_statement"
+        doc_type: "delivery_statement" 또는 "wage_statement"
     """
-    sup  = parsed.get("supplier") or {}
-    val  = parsed.get("validation") or {}
+    val      = parsed.get("validation") or {}
+
+    # ── 임금명세서 전용 매핑 ──────────────────────────────
+    # VLM이 wage_statement 전용 스키마로 반환:
+    #   vendor, date, total_amount, items[{item_name, amount}]
+    # items.amount = ③합계확인 보수총액 (VAT 없음, 직접 사용)
+    if doc_type == "wage_statement":
+        items = []
+        for item in (parsed.get("items") or []):
+            items.append({
+                "item_name":  item.get("item_name") or item.get("name") or "",
+                "count":      None,
+                "unit_price": None,
+                "amount":     item.get("amount"),
+                "roi_box":    None,
+            })
+        return {
+            "receipt_id":   f"rec_{uuid.uuid4().hex[:8]}",
+            "source_file":  filename or "unknown",
+            "doc_type":     "wage_statement",
+            "infer_result": parsed.get("infer_result") or (
+                "SUCCESS" if (val.get("is_valid") or val.get("has_required_fields")) else "PARTIAL"
+            ),
+            "vendor":       parsed.get("vendor"),
+            "date":         parsed.get("date"),
+            "total_amount": parsed.get("total_amount"),
+            "items":        items,
+            "validation": {
+                "is_valid":        val.get("is_valid", False),
+                "items_sum_match": None,
+                "warnings":        val.get("warnings") or [],
+            },
+        }
+
+    # ── 거래명세표 매핑 ───────────────────────────────────
+    sup      = parsed.get("supplier") or {}
+    _store   = parsed.get("store") or {}    # VLM 스키마 fallback
+    _payment = parsed.get("payment") or {}
 
     items = []
     for item in (parsed.get("items") or []):
@@ -155,21 +187,23 @@ def _map_transaction_statement(parsed: dict, filename: str, doc_type: str = "tra
             "count":      item.get("count") or item.get("quantity"),
             "unit_price": item.get("unit_price"),
             "amount":     amount,
-            "roi_box":    None,  # 거래명세표·임금명세서는 ROI 미지원
+            "roi_box":    None,
         })
 
     return {
         "receipt_id":   f"rec_{uuid.uuid4().hex[:8]}",
         "source_file":  filename or "unknown",
         "doc_type":     doc_type,
-        "infer_result": "SUCCESS" if parsed.get("validation", {}).get("is_valid") else "PARTIAL",
-        "vendor":       sup.get("company_name"),
-        "date":         parsed.get("issue_date"),
+        "infer_result": parsed.get("infer_result") or (
+            "SUCCESS" if (val.get("is_valid") or val.get("has_required_fields")) else "PARTIAL"
+        ),
+        "vendor":       sup.get("company_name") or _store.get("name"),
+        "date":         parsed.get("issue_date") or _payment.get("date"),
         "total_amount": parsed.get("total_amount"),
         "items":        items,
         "validation": {
             "is_valid":        val.get("is_valid", False),
-            "items_sum_match": None,  # 거래명세표·임금명세서는 품목 합산 검증 별도 로직
+            "items_sum_match": None,
             "warnings":        val.get("warnings") or [],
         },
     }
@@ -285,10 +319,10 @@ async def ocr_receipt(
         #   PDF → pdfplumber 직접 추출
         #   이미지 → CLOVA 일반 OCR + 정규식
         # ══════════════════════════════════════════════════════
-        if doc_type in ("transaction_statement", "wage_statement"):
+        if doc_type in ("delivery_statement", "wage_statement"):
 
-            # 이미지 문서는 CLOVA 설정이 필요
-            if suffix in _IMAGE_EXT and (not CLOVA_OCR_URL or not CLOVA_OCR_SECRET):
+            # 이미지 + CLOVA 엔진 조합일 때만 설정 확인
+            if suffix in _IMAGE_EXT and OCR_ENGINE == "clova" and (not CLOVA_OCR_URL or not CLOVA_OCR_SECRET):
                 raise HTTPException(
                     status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
                     detail="이미지 문서 처리를 위한 CLOVA 환경변수가 설정되지 않았습니다.",
@@ -298,7 +332,7 @@ async def ocr_receipt(
                 if suffix in _PDF_EXT:
                     parsed = parse_from_pdf(tmp_path)
                 else:
-                    parsed = parse_from_image(tmp_path, CLOVA_OCR_SECRET, CLOVA_OCR_URL)
+                    parsed = ocr_engine.parse_document_image(tmp_path, type_hint=doc_type)
             except Exception as e:
                 raise HTTPException(
                     status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
@@ -313,25 +347,16 @@ async def ocr_receipt(
         #   카드 승인일시를 날짜 기준으로 사용.
         # ══════════════════════════════════════════════════════
         else:
-            # 영수증은 이미지만 지원 (PDF 영수증은 거의 없음)
-            if not CLOVA_OCR_URL or not CLOVA_OCR_SECRET:
-                raise HTTPException(
-                    status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-                    detail="CLOVA_OCR_URL 또는 CLOVA_OCR_SECRET 환경변수가 설정되지 않았습니다.",
-                )
-
+            # 영수증: OCR_ENGINE 설정에 따라 CLOVA 또는 VLM 자동 선택
             try:
-                raw = call_clova_receipt(tmp_path, CLOVA_OCR_SECRET, CLOVA_OCR_URL)
+                parsed = ocr_engine.parse_receipt(tmp_path)
             except Exception as e:
                 raise HTTPException(
                     status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-                    detail=f"CLOVA OCR API 호출 실패: {e}",
+                    detail=f"OCR 처리 실패: {e}",
                 )
 
-            parsed = parse_clova_response(raw)
             parsed["source_file"] = file.filename or "unknown"
-            parsed = validate_result(parsed)
-
             mapped = _map_receipt(parsed, file.filename or "unknown")
 
     finally:
