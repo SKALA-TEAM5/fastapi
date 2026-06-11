@@ -63,6 +63,23 @@ except ImportError:
 
 
 # ══════════════════════════════════════════════
+# 0. doc_type 정규화 맵
+#    VLM이 반환하는 raw doc_type → 매칭 엔진이 기대하는 값으로 통일
+#    "trade_statement" / "transaction_statement" → "delivery_statement"
+# ══════════════════════════════════════════════
+
+_NORMALIZE_DOC_TYPE: dict[str, str] = {
+    "trade_statement":       "delivery_statement",
+    "transaction_statement": "delivery_statement",
+    "receipt":               "receipt",
+    "tax_invoice":           "tax_invoice",
+    "wage_statement":        "wage_statement",
+    "site_photo":            "site_photo",
+    "unknown":               "unknown",
+}
+
+
+# ══════════════════════════════════════════════
 # 1. VLM 프롬프트 (Gemini / OpenAI 공통)
 # ══════════════════════════════════════════════
 
@@ -158,7 +175,50 @@ _USER_PROMPT_TEMPLATE = """\
 """
 
 
+_WAGE_STATEMENT_PROMPT = """\
+이미지를 분석하여 다음 JSON 스키마로 임금명세서(근로내용 확인신고서) 정보를 추출해주세요.
+
+사용자가 선택한 문서 유형 힌트: wage_statement
+
+추출 JSON 스키마:
+{
+  "doc_type": "wage_statement",
+  "infer_result": "SUCCESS | PARTIAL | FAILED",
+  "vendor": "공통사업장(하수급인) 명칭",
+  "date": "지급월 (YYYY-MM-DD 형식, 해당 월 말일 기준. 예: 2026년 4월 → 2026-04-30)",
+  "total_amount": 총 보수총액 합계(정수, 원 단위) 또는 null,
+  "items": [
+    {
+      "item_name": "구분명 (예: 안전관리자 인건비, 안전보건담당자 업무수당)",
+      "amount": 해당 구분 보수총액(정수, 원 단위) 또는 null
+    }
+  ],
+  "confidence": 0.0~1.0 사이 신뢰도,
+  "fail_reason": "FAILED 시 실패 사유, 그 외 null"
+}
+
+── 추출 규칙 ──────────────────────────────────
+- vendor  : 문서 상단 '공통사업장(하수급인) 정보'의 '명칭' 필드
+- date    : '지급월' 필드 → 해당 월 말일을 YYYY-MM-DD 형식으로 반환
+            예) 2026년 4월 → 2026-04-30
+- total_amount : '③ 합계 확인' 표의 '총 합계' 행 '보수총액' 열 값
+- items   : '③ 합계 확인' 표의 각 구분행
+  · item_name : 구분명에서 인원수 제거 후 역할명만 추출
+                예) '안전관리자 3명 합계'  → '안전관리자 인건비'
+                    '안전보건담당자 1명'   → '안전보건담당자 업무수당'
+  · amount    : 해당 구분의 '보수총액' 열 값
+- 금액는 숫자만 추출 (원, 쉼표, 공백 제거)
+- items가 없으면 빈 배열 []
+- infer_result 판정:
+    SUCCESS = vendor·date·total_amount 모두 추출 성공
+    PARTIAL = 일부 필드만 추출
+    FAILED  = 판독 불가
+"""
+
+
 def _build_user_prompt(type_hint: str) -> str:
+    if type_hint == "wage_statement":
+        return _WAGE_STATEMENT_PROMPT
     return _USER_PROMPT_TEMPLATE.format(type_hint=type_hint)
 
 
@@ -488,7 +548,9 @@ def parse_vision_response(
         # VLM 전용 메타
         "model_used": vlm_raw.get("model_used", _model),
         "confidence": vlm_raw.get("confidence"),
-        "doc_type":   vlm_raw.get("doc_type"),
+        "doc_type": _NORMALIZE_DOC_TYPE.get(
+            vlm_raw.get("doc_type") or "", vlm_raw.get("doc_type")
+        ),
     }
 
     # FAILED인 경우 실패 사유 추가
