@@ -67,7 +67,8 @@ async def run_report_agent(request: ReportAgentRunRequest) -> ReportAgentRunResp
         if request.context is None:
             with get_connection() as conn:
                 repo = PostgresReportRepository(conn)
-                report_no = request.report_no or default_report_no(request.project_id, request.usage_statement_id, written_date)
+                project = repo.get_project(request.project_id)
+                report_no = request.report_no or default_report_no(project.get("contract_no") or request.project_id, request.usage_statement_id, written_date)
                 context = build_report_context(
                     repo,
                     project_id=request.project_id,
