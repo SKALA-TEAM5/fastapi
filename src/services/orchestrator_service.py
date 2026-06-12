@@ -181,9 +181,62 @@ def classify_existing_usage_statement(
 
         _classi_token = (_classi_usage["input_tokens"] or 0) + (_classi_usage["output_tokens"] or 0)
 
-        # llm(unclassified) 판정 시 INSERT 차단
+        # llm(unclassified) 판정 시 INSERT 차단, hil로 적재
         if "llm(unclassified)" in (reason or ""):
-            raise ValueError(f"분류할 수 없는 항목입니다: {item_name}")
+            summary = "분류 불가 항목 — 수동 분류 필요"
+            details = {
+                "event": "classification_checked",
+                "payload": {
+                    "changes": [],
+                    "results": [{
+                        "reason": reason,
+                        "row_id": 1,
+                        "status": "appropriate",
+                        "item_name": item_name,
+                        "original_category_code": submitted_category,
+                        "final_category_code": updated_category,
+                    }],
+                    "kept_count": 1,
+                    "changed_count": 0,
+                },
+                "summary": summary,
+            }
+            upsert_agent_log(
+                project_id=request.project_id,
+                usage_statement_id=request.usage_statement_id,
+                agent_type_code="classi",
+                status_code="success",
+                result_code="fail",
+                reason=summary,
+                details=details,
+                model_name="classifier_agent",
+                token=_classi_token,
+            )
+            _record_agent_usage(
+                project_id=request.project_id,
+                usage_statement_id=request.usage_statement_id,
+                agent_type_code="classi",
+                model_name=_openai_model_name(),
+                token=_classi_token,
+                input_tokens=_classi_usage["input_tokens"],
+                output_tokens=_classi_usage["output_tokens"],
+            )
+            mark_orchestrator(
+                project_id=request.project_id,
+                usage_statement_id=request.usage_statement_id,
+                event="classi_completed",
+                status_code="success",
+                result_code="fail",
+                reason=summary,
+                payload={"item_id": request.item_id, "details": details},
+            )
+            return OrchestratorActionResponse(
+                status="success",
+                message=summary,
+                usage_statement_id=request.usage_statement_id,
+                target_agents=["classi"],
+                result=details,
+            )
 
         # usage_statement_items INSERT
         with get_connection() as conn:
