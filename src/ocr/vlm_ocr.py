@@ -581,7 +581,7 @@ def parse_vision_response(
             insert_agent_usage_record(
                 project_id=project_id,
                 usage_statement_id=usage_statement_id,
-                agent_type_code="vision",
+                agent_type_code="vlm",
                 model_name=_model,
                 input_tokens=input_tokens,
                 output_tokens=output_tokens,
@@ -620,7 +620,7 @@ def get_cached_vision_result(conn, file_id: int) -> dict | None:
     sql = """
         SELECT details
         FROM agent_logs
-        WHERE agent_type_code = 'vision'
+        WHERE agent_type_code = 'vlm'
           AND status_code     = 'completed'
           AND (details->>'file_id')::int = %(file_id)s
         ORDER BY created_at DESC
