@@ -39,12 +39,20 @@ def get_engine_name() -> str:
     return OCR_ENGINE  # "clova" | "vlm"
 
 
-def parse_receipt(file_path: str) -> dict:
+def parse_receipt(
+    file_path: str,
+    project_id: int | None = None,
+    usage_statement_id: int | None = None,
+) -> dict:
     """
     영수증 이미지 파싱.
 
     OCR_ENGINE=clova → CLOVA OCR 영수증 특화 모델
     OCR_ENGINE=vlm   → vlm_ocr.parse_vision_response (type_hint="receipt")
+
+    Args:
+        project_id:         토큰 사용량 기록용 프로젝트 ID (VLM 전용, 선택)
+        usage_statement_id: 토큰 사용량 기록용 사용내역서 ID (VLM 전용, 선택)
 
     Returns:
         parse_clova_response() / parse_vision_response() 와 동일한 스키마
@@ -53,10 +61,15 @@ def parse_receipt(file_path: str) -> dict:
 
     if OCR_ENGINE == "clova":
         return _clova_parse_receipt(file_path)
-    return _vlm_parse_receipt(file_path)
+    return _vlm_parse_receipt(file_path, project_id=project_id, usage_statement_id=usage_statement_id)
 
 
-def parse_document_image(file_path: str, type_hint: str = "receipt") -> dict:
+def parse_document_image(
+    file_path: str,
+    type_hint: str = "receipt",
+    project_id: int | None = None,
+    usage_statement_id: int | None = None,
+) -> dict:
     """
     거래명세표 / 임금명세서 / 세금계산서 이미지 파싱.
 
@@ -66,13 +79,15 @@ def parse_document_image(file_path: str, type_hint: str = "receipt") -> dict:
     Args:
         type_hint: VLM에 전달할 문서 유형 힌트
                    ("tax_invoice" | "receipt" | "transaction_statement")
+        project_id:         토큰 사용량 기록용 프로젝트 ID (VLM 전용, 선택)
+        usage_statement_id: 토큰 사용량 기록용 사용내역서 ID (VLM 전용, 선택)
     """
     logger.debug("parse_document_image engine=%s hint=%s file=%s",
                  OCR_ENGINE, type_hint, Path(file_path).name)
 
     if OCR_ENGINE == "clova":
         return _clova_parse_document(file_path)
-    return _vlm_parse_document(file_path, type_hint)
+    return _vlm_parse_document(file_path, type_hint, project_id=project_id, usage_statement_id=usage_statement_id)
 
 
 # ══════════════════════════════════════════════
@@ -100,14 +115,29 @@ def _clova_parse_document(file_path: str) -> dict:
 # 내부 구현 — VLM
 # ══════════════════════════════════════════════
 
-def _vlm_parse_receipt(file_path: str) -> dict:
+def _vlm_parse_receipt(
+    file_path: str,
+    project_id: int | None = None,
+    usage_statement_id: int | None = None,
+) -> dict:
     from src.ocr.vlm_ocr import parse_vision_response
     from src.ocr.receipt_validator import validate_result
-    parsed = parse_vision_response(file_path, type_hint="receipt")
+    parsed = parse_vision_response(
+        file_path, type_hint="receipt",
+        project_id=project_id, usage_statement_id=usage_statement_id,
+    )
     parsed["source_file"] = Path(file_path).name
     return validate_result(parsed)
 
 
-def _vlm_parse_document(file_path: str, type_hint: str) -> dict:
+def _vlm_parse_document(
+    file_path: str,
+    type_hint: str,
+    project_id: int | None = None,
+    usage_statement_id: int | None = None,
+) -> dict:
     from src.ocr.vlm_ocr import parse_vision_response
-    return parse_vision_response(file_path, type_hint=type_hint)
+    return parse_vision_response(
+        file_path, type_hint=type_hint,
+        project_id=project_id, usage_statement_id=usage_statement_id,
+    )
