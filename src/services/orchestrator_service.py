@@ -746,13 +746,6 @@ def _run_link_agent(
             },
             model_name="link_pipeline",
         )
-        _record_agent_usage(
-            project_id=project_id,
-            usage_statement_id=usage_statement_id,
-            agent_type_code="link",
-            model_name="link_pipeline",
-            requested_by_user_id=requested_by_user_id,
-        )
         return {
             "status_code": "success",
             "result_code": result_code,
