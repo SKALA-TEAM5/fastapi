@@ -597,6 +597,7 @@ def _run_safety_doc_agent(
             _dict_or_empty(row.get("result")).get("model_name")
             for row in item_results
         ) or "safety_doc_agent"
+        evidence_type_names = _evidence_type_name_map()
         todos = []
         for row in item_results:
             missing_evidences = (
@@ -606,16 +607,14 @@ def _run_safety_doc_agent(
             if not missing_evidences:
                 continue
             todo_context = _todo_context_from_safety_doc_result(row)
-            missing_text = ", ".join(missing_evidences)
-            item_name = _first_string([todo_context.get("usage_statement_item_name")])
-            reason_prefix = f"{item_name} 필수 증빙 누락" if item_name else "필수 증빙 누락"
+            missing_text = ", ".join(_evidence_type_display_name(code, evidence_type_names) for code in missing_evidences)
             todos.append(
                 {
                     "usage_statement_item_id": row["item_id"],
                     **todo_context,
                     "title": missing_text,
                     "evidence_type_codes": missing_evidences,
-                    "reason": f"{reason_prefix}: {missing_text}",
+                    "reason": f"필수 증빙 누락: {missing_text}",
                 }
             )
         upsert_agent_log(
@@ -784,6 +783,43 @@ def _int_or_none(value: Any) -> int | None:
 
 def _dict_or_empty(value: Any) -> dict[str, Any]:
     return value if isinstance(value, dict) else {}
+
+
+_FALLBACK_EVIDENCE_TYPE_NAMES = {
+    "appointment_report": "선임 신고서",
+    "pay_stub": "급여명세서",
+    "wage_statement": "임금명세서",
+    "receipt": "영수증",
+    "tax_invoice": "세금계산서",
+    "site_photo": "현장사진",
+    "education_certificate": "교육 이수증",
+    "attendance_list": "참석자 명단",
+}
+
+
+def _evidence_type_name_map() -> dict[str, str]:
+    try:
+        with get_connection() as conn:
+            with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+                cur.execute("SELECT code, name FROM service.evidence_types")
+                return {
+                    str(row.get("code") or ""): str(row.get("name") or "")
+                    for row in cur.fetchall()
+                    if row.get("code") and row.get("name")
+                }
+    except Exception:
+        return {}
+
+
+def _evidence_type_display_name(code: Any, evidence_type_names: dict[str, str]) -> str:
+    normalized_code = str(code or "").strip()
+    if not normalized_code:
+        return ""
+    return (
+        evidence_type_names.get(normalized_code)
+        or _FALLBACK_EVIDENCE_TYPE_NAMES.get(normalized_code)
+        or normalized_code.replace("_", " ")
+    )
 
 
 def _aggregate_orchestrator_result_code(results: dict[str, Any]) -> str:
