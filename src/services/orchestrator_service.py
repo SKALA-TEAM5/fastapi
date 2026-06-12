@@ -183,7 +183,7 @@ def classify_existing_usage_statement(
 
         # llm(unclassified) 판정 시 INSERT 차단, hil로 적재
         if "llm(unclassified)" in (reason or ""):
-            summary = "분류 불가 항목 — 수동 분류 필요"
+            summary = "해당 항목은 산업안전보건관리비 9개 항목으로 분류하기 어렵습니다. 항목명을 다시 확인해 주세요."
             details = {
                 "event": "classification_checked",
                 "payload": {
