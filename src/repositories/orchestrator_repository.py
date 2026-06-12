@@ -46,6 +46,7 @@ MODEL_USAGE_PRICES_USD_PER_1M: dict[str, tuple[Decimal, Decimal, Decimal]] = {
     "text-embedding-3-small": (Decimal("0.02"), Decimal("0.02"), Decimal("0")),
     "gemini-2.5-flash": (Decimal("0.30"), Decimal("0.03"), Decimal("2.50")),
     "gemini-2.5-flash-lite": (Decimal("0.10"), Decimal("0.01"), Decimal("0.40")),
+    "gemini-3.1-flash-lite": (Decimal("0.25"), Decimal("0.025"), Decimal("1.50")),
     "claude-sonnet-4.6": (Decimal("3.00"), Decimal("0.30"), Decimal("15.00")),
     "claude-sonnet-4-6": (Decimal("3.00"), Decimal("0.30"), Decimal("15.00")),
 }

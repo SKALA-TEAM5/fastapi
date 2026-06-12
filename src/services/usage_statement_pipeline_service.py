@@ -532,7 +532,11 @@ def run_link_pipeline(
                 tmp_paths.append(tmp_path)
 
                 from src.ocr import ocr_engine as _ocr_engine
-                ocr_result = _ocr_engine.parse_receipt(tmp_path)
+                ocr_result = _ocr_engine.parse_receipt(
+                    tmp_path,
+                    project_id=project_id,
+                    usage_statement_id=usage_statement_id,
+                )
                 ocr_result["source_file"] = file_info["original_filename"]
 
                 receipt_file_id_map[ocr_result.get("receipt_id", "")] = fid
