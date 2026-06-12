@@ -772,22 +772,30 @@ def _run_link_agent(
         )
         todos = []
         for row in result.get("match_results") or []:
-            if not str(row.get("line_id") or "").isdigit():
+            usage_item = _as_dict(row.get("usage_item"))
+            line_id = row.get("line_id") or usage_item.get("line_id")
+            line_id_text = str(line_id or "")
+            if not line_id_text.isdigit():
                 continue
             if row.get("match_status") not in {"review_needed", "unmatched", "rejected"}:
                 continue
-            item_id = int(row.get("line_id"))
+            item_id = int(line_id_text)
             todo_context = item_contexts.get(item_id, {})
             item_name = _first_string([todo_context.get("usage_statement_item_name")])
             status_text = str(row.get("match_status") or "review_needed")
+            status_label = {
+                "review_needed": "검토 필요",
+                "unmatched": "매칭 실패",
+                "rejected": "반려",
+            }.get(status_text, status_text)
             reason_prefix = f"{item_name} 증빙 매칭 검토 필요" if item_name else "증빙 매칭 검토 필요"
             todos.append(
                 {
                     "usage_statement_item_id": item_id,
                     **todo_context,
-                    "title": "영수증/세금계산서",
+                    "title": "증빙 매칭 검토",
                     "match_status": status_text,
-                    "reason": f"{reason_prefix}: {status_text}",
+                    "reason": f"{reason_prefix}: {status_label}",
                 }
             )
         upsert_agent_log(
