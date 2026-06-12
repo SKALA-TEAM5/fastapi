@@ -26,7 +26,7 @@
         {
           "rows": [
             ["보고서 번호", "{{draft.report_no}}", "검토 일자", "{{draft.written_date_label}}"],
-            ["현장명", "{{draft.site_name}}", "현장코드", "{{draft.basic_info.현장코드}}"],
+            ["현장명", "{{draft.site_name}}", "프로젝트 번호", "{{draft.basic_info.프로젝트 번호}}"],
             ["발주처", "{{draft.basic_info.발주처}}", "시공사", "{{draft.basic_info.시공사}}"],
             ["계약금액", "{{draft.basic_info.계약금액}}", "공사기간", "{{draft.basic_info.공사기간}}"],
             ["법정 계상액", "{{draft.basic_info.법정 계상액}}", "검토자", "{{draft.reviewer_label}}"],
