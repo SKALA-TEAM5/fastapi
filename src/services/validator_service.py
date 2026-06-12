@@ -39,6 +39,7 @@ import json
 import logging
 import re
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from contextvars import copy_context
 from typing import Any
 
 try:
@@ -111,17 +112,13 @@ def validate_usage_statement_service(
 ) -> AuditResponse:
     parsed = parse_usage_statement(document)
 
+    # get_openai_callback은 호출부(orchestrator)에서 래핑한다.
+    # 여기서 중첩 래핑 시 copy_context()가 inner_cb를 복사해
+    # outer_cb(orchestrator)가 0을 캡처하는 문제가 발생하므로 제거.
+    response = _validate_blocks(
+        parsed.base_amount, parsed.blocks, collection=collection
+    )
     total_tokens: int | None = None
-    if get_openai_callback is not None:
-        with get_openai_callback() as cb:
-            response = _validate_blocks(
-                parsed.base_amount, parsed.blocks, collection=collection
-            )
-        total_tokens = cb.total_tokens or None
-    else:
-        response = _validate_blocks(
-            parsed.base_amount, parsed.blocks, collection=collection
-        )
 
     if project_id is not None and usage_statement_id is not None:
         _write_legal_agent_log(
@@ -514,6 +511,7 @@ def _validate_blocks(base_amount: float, blocks, *, collection: str) -> AuditRes
     with ThreadPoolExecutor(max_workers=min(max(len(blocks), 1), 2)) as executor:
         futures = {
             executor.submit(
+                copy_context().run,
                 _validate_category_block,
                 block,
                 collection,

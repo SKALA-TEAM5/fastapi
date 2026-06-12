@@ -14,6 +14,7 @@ from __future__ import annotations
 import hashlib
 import re
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from contextvars import copy_context
 from dataclasses import dataclass, field
 
 # Qdrant 문서에 삽입된 내부 마커 — LLM 입력 및 응답에 유출되지 않도록 제거
@@ -424,9 +425,13 @@ def match_category_rules(
     n_workers = min(max(len(block.items), 1), 2)
     item_bundles: list[ItemRuleBundle] = [None] * len(block.items)  # type: ignore[list-item]
 
+    # copy_context()로 get_openai_callback ContextVar를 스레드에 전파한다.
+    # 미전파 시 _llm_generate_reason_only / _llm_item_fallback 호출 토큰이
+    # 외부 콜백(orchestrator)에 집계되지 않아 token=0으로 잘못 기록된다.
     with ThreadPoolExecutor(max_workers=n_workers) as executor:
         future_to_idx = {
             executor.submit(
+                copy_context().run,
                 _process_single_item,
                 item=item,
                 block=block,
