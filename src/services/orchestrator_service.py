@@ -107,13 +107,14 @@ def parse_and_classify_usage_statement(file_id: int) -> OrchestratorActionRespon
             reason=summary,
             details=classifier_details,
             model_name="classifier_agent",
-            token=_classi_token or None,
+            token=_classi_token,
         )
         _record_agent_usage(
             project_id=project_id,
             usage_statement_id=usage_statement_id,
             agent_type_code="classi",
             model_name=_openai_model_name(),
+            token=_classi_token,
             input_tokens=_classi_usage["input_tokens"],
             output_tokens=_classi_usage["output_tokens"],
         )
@@ -239,13 +240,14 @@ def classify_existing_usage_statement(
             reason=summary,
             details=details,
             model_name="classifier_agent",
-            token=_classi_token or None,
+            token=_classi_token,
         )
         _record_agent_usage(
             project_id=request.project_id,
             usage_statement_id=request.usage_statement_id,
             agent_type_code="classi",
             model_name=_openai_model_name(),
+            token=_classi_token,
             input_tokens=_classi_usage["input_tokens"],
             output_tokens=_classi_usage["output_tokens"],
         )
@@ -1164,13 +1166,14 @@ def _run_legal_agent(
                 },
             },
             model_name="validator_agent",
-            token=_legal_token or None,
+            token=_legal_token,
         )
         _record_agent_usage(
             project_id=project_id,
             usage_statement_id=usage_statement_id,
             agent_type_code="legal",
             model_name=_openai_model_name(),
+            token=_legal_token,
             input_tokens=_legal_usage["input_tokens"],
             output_tokens=_legal_usage["output_tokens"],
             requested_by_user_id=she_user_id,

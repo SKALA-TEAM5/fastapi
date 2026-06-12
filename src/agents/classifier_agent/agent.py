@@ -12,6 +12,7 @@ import json
 import logging
 import re
 from concurrent.futures import ThreadPoolExecutor
+from contextvars import copy_context
 from dataclasses import dataclass
 from typing import Any
 
@@ -883,8 +884,6 @@ def review_usage_statement(
         basic_info=basic_info,
     )
 
-    total_tokens: int | None = None
-
     if not request.rows:
         results: list[RowReviewResult] = []
     else:
@@ -894,7 +893,8 @@ def review_usage_statement(
             with ThreadPoolExecutor(max_workers=max_workers) as executor:
                 return list(
                     executor.map(
-                        lambda row: _review_single_usage_statement_row(
+                        lambda row: copy_context().run(
+                            _review_single_usage_statement_row,
                             row=row,
                             basic_info=request.basic_info,
                             collection=collection,
@@ -903,12 +903,9 @@ def review_usage_statement(
                     )
                 )
 
-        if get_openai_callback is not None:
-            with get_openai_callback() as cb:
-                results = _run()
-            total_tokens = cb.total_tokens or None
-        else:
-            results = _run()
+        results = _run()
+
+    total_tokens: int | None = None
 
     # agent_logs INSERT (project_id + int usage_statement_id 있을 때만)
     _uid = request.usage_statement_id
