@@ -305,6 +305,9 @@ def call_vision_gemini(
             contents=[img, prompt],
         )
         raw_text = response.text
+        usage = response.usage_metadata
+        input_tokens  = getattr(usage, "prompt_token_count", None)
+        output_tokens = getattr(usage, "candidates_token_count", None)
 
     except Exception as e:
         return {"error": f"Gemini API 호출 실패: {e}", "model_used": _model}
@@ -316,7 +319,9 @@ def call_vision_gemini(
             "model_used": _model,
         }
 
-    parsed_json["model_used"] = _model
+    parsed_json["model_used"]    = _model
+    parsed_json["input_tokens"]  = input_tokens
+    parsed_json["output_tokens"] = output_tokens
     return parsed_json
 
 
@@ -400,7 +405,9 @@ def call_vision_openai(
             max_tokens=1500,
             temperature=0,
         )
-        raw_text = response.choices[0].message.content.strip()
+        raw_text      = response.choices[0].message.content.strip()
+        input_tokens  = getattr(response.usage, "prompt_tokens", None)
+        output_tokens = getattr(response.usage, "completion_tokens", None)
 
     except Exception as e:
         return {"error": f"OpenAI API 호출 실패: {e}", "model_used": _model}
@@ -412,7 +419,9 @@ def call_vision_openai(
             "model_used": _model,
         }
 
-    parsed_json["model_used"] = _model
+    parsed_json["model_used"]    = _model
+    parsed_json["input_tokens"]  = input_tokens
+    parsed_json["output_tokens"] = output_tokens
     return parsed_json
 
 
@@ -458,6 +467,8 @@ def parse_vision_response(
     type_hint: str = "unknown",
     model: str | None = None,
     provider: str | None = None,
+    project_id: int | None = None,
+    usage_statement_id: int | None = None,
 ) -> dict:
     """
     VLM을 호출하고 결과를 CLOVA 호환 표준 JSON으로 반환한다.
@@ -467,10 +478,12 @@ def parse_vision_response(
       이 함수 하나로 대체할 수 있다.
 
     Args:
-        image_path: 로컬 이미지 경로
-        type_hint:  사용자가 업로드 시 선택한 문서 유형
-        model:      사용할 모델 (None이면 각 프로바이더 기본값)
-        provider:   "gemini" | "openai" (None이면 VLM_PROVIDER 환경변수 사용)
+        image_path:         로컬 이미지 경로
+        type_hint:          사용자가 업로드 시 선택한 문서 유형
+        model:              사용할 모델 (None이면 각 프로바이더 기본값)
+        provider:           "gemini" | "openai" (None이면 VLM_PROVIDER 환경변수 사용)
+        project_id:         토큰 사용량 기록용 프로젝트 ID (선택)
+        usage_statement_id: 토큰 사용량 기록용 사용내역서 ID (선택)
 
     Returns:
         표준 JSON dict + "validation" 키 (validate_result 결과 포함)
@@ -556,6 +569,26 @@ def parse_vision_response(
     # FAILED인 경우 실패 사유 추가
     if infer_result == "FAILED":
         result["error"] = vlm_raw.get("fail_reason", "VLM 판독 실패")
+
+    # ── 토큰 사용량 기록 (project_id + usage_statement_id 있을 때만) ──
+    input_tokens  = vlm_raw.get("input_tokens")
+    output_tokens = vlm_raw.get("output_tokens")
+    result["input_tokens"]  = input_tokens
+    result["output_tokens"] = output_tokens
+    if project_id is not None and usage_statement_id is not None:
+        try:
+            from src.repositories.orchestrator_repository import insert_agent_usage_record
+            insert_agent_usage_record(
+                project_id=project_id,
+                usage_statement_id=usage_statement_id,
+                agent_type_code="vision",
+                model_name=_model,
+                input_tokens=input_tokens,
+                output_tokens=output_tokens,
+            )
+        except Exception as _e:
+            import logging as _logging
+            _logging.getLogger(__name__).warning("VLM 토큰 사용량 기록 실패: %s", _e)
 
     # ── validate_result 재사용 (CLOVA와 동일한 후처리 검증) ──
     return validate_result(result)
