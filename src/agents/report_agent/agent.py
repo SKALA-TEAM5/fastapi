@@ -41,6 +41,7 @@ RESULT_TO_DECISION: dict[str, DecisionCode] = {
     "ok": "appropriate",
     "appropriate": "appropriate",
     "pass": "appropriate",
+    "success": "appropriate",
     "warning": "needs_review",
     "needs_review": "needs_review",
     "conditional": "needs_review",
