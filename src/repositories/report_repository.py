@@ -24,7 +24,7 @@ class PostgresReportRepository(ReportRepository):
     def get_project(self, project_id: int) -> dict:
         row = self._fetch_one(
             """
-            SELECT id, construction_company, project_name, site_location,
+            SELECT id, contract_no, construction_company, project_name, site_location,
                    representative_name, contract_amount, construction_start_date,
                    construction_end_date, client_name, appropriated_amount
             FROM projects
@@ -395,5 +395,6 @@ def _legal_citation(source: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-def default_report_no(project_id: int, usage_statement_id: int, written_date: date) -> str:
-    return f"AR-{written_date:%Y%m%d}-{project_id}-{usage_statement_id}"
+def default_report_no(project_ref: int | str, usage_statement_id: int, written_date: date) -> str:
+    normalized_project_ref = str(project_ref or "").strip()
+    return f"AR-{written_date:%Y%m%d}-{normalized_project_ref}-{usage_statement_id}"

@@ -1302,7 +1302,8 @@ def _run_report_agent(
     try:
         with get_connection() as conn:
             repo = PostgresReportRepository(conn)
-            report_no = default_report_no(project_id, usage_statement_id, written_date)
+            project = repo.get_project(project_id)
+            report_no = default_report_no(project.get("contract_no") or project_id, usage_statement_id, written_date)
             usage_statement = repo.get_usage_statement(usage_statement_id)
             context = build_report_context(
                 repo,
