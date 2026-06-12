@@ -33,6 +33,7 @@ from src.core.config import (
     VISION_AGENT_TIMEOUT_SECONDS,
 )
 from src.schemas.classifier import CATEGORIES
+from src.services.classi_service import _insert_usage_statement_item
 from src.repositories.orchestrator_repository import (
     SITE_PHOTO_TYPES,
     list_evidence_files_by_type,
@@ -146,40 +147,27 @@ def classify_existing_usage_statement(
             event="classi_started",
             status_code="running",
             result_code=None,
-            reason="classi 재분류를 시작했습니다.",
-            payload={"item_id": request.item_id, "item_name": request.item_name},
+            reason="classi를 시작했습니다.",
+            payload={"item_name": request.item_name},
         )
         submitted_category = request.category_code or ""
         if get_openai_callback is not None:
             with get_openai_callback() as _classi_cb:
                 review_response = review_usage_statement(
                     usage_statement_id=request.usage_statement_id,
-                    rows=[
-                        {
-                            "row_id": 1,
-                            "given_category_code": submitted_category,
-                            "item_name": request.item_name,
-                        }
-                    ],
+                    rows=[{"row_id": 1, "given_category_code": submitted_category, "item_name": request.item_name}],
                     basic_info={},
                 )
             _classi_usage = {"input_tokens": _classi_cb.prompt_tokens, "output_tokens": _classi_cb.completion_tokens}
         else:
             review_response = review_usage_statement(
                 usage_statement_id=request.usage_statement_id,
-                rows=[
-                    {
-                        "row_id": 1,
-                        "given_category_code": submitted_category,
-                        "item_name": request.item_name,
-                    }
-                ],
+                rows=[{"row_id": 1, "given_category_code": submitted_category, "item_name": request.item_name}],
                 basic_info={},
             )
             _classi_usage = {"input_tokens": None, "output_tokens": None}
-        review_map = {result.row_id: result for result in review_response.results}
-        review = review_map.get(1)
 
+        review = {r.row_id: r for r in review_response.results}.get(1)
         if review is None:
             updated_category = submitted_category
             status = "appropriate"
@@ -191,18 +179,34 @@ def classify_existing_usage_statement(
             reason = review.reason
             item_name = review.item_name
 
+        _classi_token = (_classi_usage["input_tokens"] or 0) + (_classi_usage["output_tokens"] or 0)
+
+        # usage_statement_items INSERT
+        with get_connection() as conn:
+            item_id = _insert_usage_statement_item(
+                conn,
+                usage_statement_id=request.usage_statement_id,
+                category_code=updated_category,
+                used_on=str(request.used_on) if request.used_on else str(date.today()),
+                item_name=item_name,
+                unit=request.unit,
+                quantity=float(request.quantity or 0),
+                unit_price=float(request.unit_price or 0),
+                total_amount=int(request.total_amount or 0),
+            )
+
         changes: list[dict[str, Any]] = []
         if updated_category != submitted_category:
-            changes.append(
-                {
-                    "row_id": 1,
-                    "item_id": request.item_id,
-                    "item_name": item_name,
-                    "before": {"category_code": submitted_category},
-                    "after": {"category_code": updated_category},
-                    "reason": reason,
-                }
-            )
+            changes.append({
+                "row_id": 1,
+                "item_id": item_id,
+                "item_name": item_name,
+                "from_category_code": submitted_category,
+                "from_category_name": CATEGORIES.get(submitted_category, submitted_category),
+                "to_category_code": updated_category,
+                "to_category_name": CATEGORIES.get(updated_category, updated_category),
+                "reason": reason,
+            })
 
         changed_count = len(changes)
         summary = (
@@ -217,20 +221,17 @@ def classify_existing_usage_statement(
                 "changed_count": changed_count,
                 "kept_count": 0 if changed_count else 1,
                 "changes": changes,
-                "results": [
-                    {
-                        "row_id": 1,
-                        "item_id": request.item_id,
-                        "item_name": item_name,
-                        "original_category_code": submitted_category,
-                        "final_category_code": updated_category,
-                        "status": status,
-                        "reason": reason,
-                    }
-                ],
+                "results": [{
+                    "row_id": 1,
+                    "item_id": item_id,
+                    "item_name": item_name,
+                    "original_category_code": submitted_category,
+                    "final_category_code": updated_category,
+                    "status": status,
+                    "reason": reason,
+                }],
             },
         }
-        _classi_token = (_classi_usage["input_tokens"] or 0) + (_classi_usage["output_tokens"] or 0)
         upsert_agent_log(
             project_id=request.project_id,
             usage_statement_id=request.usage_statement_id,
@@ -258,7 +259,7 @@ def classify_existing_usage_statement(
             status_code="success",
             result_code="success",
             reason=summary,
-            payload={"item_id": request.item_id, "details": details},
+            payload={"item_id": item_id, "details": details},
         )
         return OrchestratorActionResponse(
             status="success",
