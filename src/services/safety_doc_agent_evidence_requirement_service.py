@@ -9,7 +9,13 @@ from langsmith import traceable
 from openai import OpenAI
 
 from src.agents.safety_doc_agent.config import Settings
-from src.prompts.safety_doc_agent_evidence_requirement_prompt import SYSTEM_PROMPT, build_user_prompt
+from src.prompts.safety_doc_agent_evidence_requirement_prompt import (
+    ALLOWED_BATCH_EVIDENCE_TYPES,
+    BATCH_SYSTEM_PROMPT,
+    SYSTEM_PROMPT,
+    build_batch_user_prompt,
+    build_user_prompt,
+)
 from src.repositories.safety_doc_agent_evidence_repository import EvidenceRepository
 from src.schemas.safety_doc_agent_evidence import (
     AIEvidenceRequirementInput,
@@ -48,6 +54,32 @@ class EvidenceRequirementService:
             evidence_type_definitions=evidence_types,
             reference_contexts=reference_contexts,
         )
+
+    def build_batch_ai_inputs(self, item_ids: list[int]) -> list[AIEvidenceRequirementInput]:
+        """전체 항목 문맥을 모으고 증빙 정의·참고 문맥 조회를 한 번으로 제한한다."""
+
+        if not item_ids:
+            return []
+
+        allowed_codes = set(ALLOWED_BATCH_EVIDENCE_TYPES)
+        evidence_types = [
+            evidence_type
+            for evidence_type in self.repository.list_evidence_types()
+            if evidence_type.code in allowed_codes
+        ]
+        item_contexts = [self.repository.get_item_context(item_id) for item_id in item_ids]
+        reference_contexts = self._search_reference_contexts_for_items(item_contexts)
+
+        return [
+            AIEvidenceRequirementInput(
+                item_context=item_context,
+                linked_files=self.repository.list_linked_file_contexts(item_context.item_id),
+                available_evidence_types=[evidence_type.code for evidence_type in evidence_types],
+                evidence_type_definitions=evidence_types,
+                reference_contexts=reference_contexts,
+            )
+            for item_context in item_contexts
+        ]
 
     def _search_reference_contexts(self, item_context) -> list[dict]:
         query = " ".join(
@@ -89,6 +121,58 @@ class EvidenceRequirementService:
             )
         return contexts
 
+    def _search_reference_contexts_for_items(self, item_contexts: list) -> list[dict]:
+        if not item_contexts:
+            return []
+
+        query = " ".join(
+            filter(
+                None,
+                (
+                    " ".join(
+                        str(part or "").strip()
+                        for part in (
+                            item_context.category_name,
+                            item_context.item_name,
+                            item_context.remark,
+                        )
+                        if str(part or "").strip()
+                    )
+                    for item_context in item_contexts
+                ),
+            )
+        )
+        if not query or self.settings.reference_top_k <= 0:
+            return []
+
+        try:
+            hits = search_reference_vector_db(
+                query=query,
+                collection_name=self.settings.reference_collection,
+                top_k=self.settings.reference_top_k,
+            )
+        except Exception as exc:
+            log.warning(
+                "safety-doc batch reference search skipped: collection=%s error=%s",
+                self.settings.reference_collection,
+                exc,
+            )
+            return []
+
+        return [
+            {
+                "score": hit.get("score"),
+                "title": (hit.get("payload") or {}).get("title")
+                or (hit.get("payload") or {}).get("section")
+                or (hit.get("payload") or {}).get("source"),
+                "text": (hit.get("payload") or {}).get("text")
+                or (hit.get("payload") or {}).get("content")
+                or (hit.get("payload") or {}).get("body"),
+                "metadata": (hit.get("payload") or {}).get("metadata") or {},
+            }
+            for hit in hits
+        ]
+
     @traceable(name="evidence_requirement_inference", run_type="chain")
     def infer_required_evidences(self, item_id: int) -> AIEvidenceRequirementOutput:
         """LLM을 호출하고 응답을 구조화된 결과로 정리한다."""
@@ -120,6 +204,71 @@ class EvidenceRequirementService:
             reason=payload.get("reason"),
             usage=usage,
         )
+
+    @traceable(name="batch_evidence_requirement_inference", run_type="chain")
+    def infer_required_evidences_batch(
+        self,
+        item_ids: list[int],
+    ) -> tuple[list[AIEvidenceRequirementInput], dict[int, AIEvidenceRequirementOutput]]:
+        """사용내역서의 모든 항목을 한 번의 LLM 호출로 판단한다."""
+
+        ai_inputs = self.build_batch_ai_inputs(item_ids)
+        if not ai_inputs:
+            return [], {}
+
+        response = self.openai_client.responses.create(
+            model=self.settings.chat_model,
+            input=[
+                {"role": "system", "content": [{"type": "input_text", "text": BATCH_SYSTEM_PROMPT}]},
+                {
+                    "role": "user",
+                    "content": [{"type": "input_text", "text": build_batch_user_prompt(ai_inputs)}],
+                },
+            ],
+        )
+        payload = _parse_json_payload(response)
+        usage = _extract_usage(response)
+        expected_item_ids = {item.item_context.item_id for item in ai_inputs}
+        allowed_codes = set(ALLOWED_BATCH_EVIDENCE_TYPES)
+        outputs: dict[int, AIEvidenceRequirementOutput] = {}
+
+        for row in payload.get("results") or []:
+            if not isinstance(row, dict):
+                continue
+            raw_item_id = row.get("item_id")
+            if isinstance(raw_item_id, float) and not raw_item_id.is_integer():
+                continue
+            try:
+                item_id = int(raw_item_id)
+            except (TypeError, ValueError):
+                continue
+            if item_id not in expected_item_ids or item_id in outputs:
+                continue
+            raw_required_evidences = row.get("required_evidences")
+            required_evidences = (
+                raw_required_evidences
+                if isinstance(raw_required_evidences, list)
+                else []
+            )
+            outputs[item_id] = AIEvidenceRequirementOutput(
+                required_evidences=sorted(
+                    {
+                        code
+                        for code in required_evidences
+                        if code in allowed_codes
+                    }
+                ),
+                confidence=row.get("confidence"),
+                reason=row.get("reason"),
+                usage=None,
+            )
+
+        missing_item_ids = sorted(expected_item_ids - outputs.keys())
+        if missing_item_ids:
+            raise ValueError(f"Batch model response omitted item_ids: {missing_item_ids}")
+
+        outputs[item_ids[0]].usage = usage
+        return ai_inputs, outputs
 
     @traceable(name="evidence_requirement_generation", run_type="chain")
     def run(self, item_id: int, *, project_id: int, usage_statement_id: int | None) -> AIEvidenceRequirementOutput:

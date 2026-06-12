@@ -7,7 +7,10 @@ from langsmith.wrappers import wrap_openai
 from openai import OpenAI
 
 from src.agents.safety_doc_agent.config import Settings, load_settings
-from src.prompts.safety_doc_agent_evidence_requirement_prompt import build_user_prompt
+from src.prompts.safety_doc_agent_evidence_requirement_prompt import (
+    ALLOWED_BATCH_EVIDENCE_TYPES,
+    build_user_prompt,
+)
 from src.repositories.safety_doc_agent_evidence_repository import EvidenceRepository
 from src.repositories.safety_doc_agent_postgres_evidence_repository import PostgresEvidenceRepository
 from src.services.safety_doc_agent_evidence_check_service import EvidenceCheckService
@@ -92,6 +95,67 @@ def check_missing_evidence(
         "requirements_after_save": requirements_after_save,
         "evidence_status": evidence_status,
     }
+
+
+def check_missing_evidence_batch(
+    item_ids: list[int],
+    *,
+    settings: Settings | None = None,
+    repository: EvidenceRepository | None = None,
+    openai_client: OpenAI | None = None,
+) -> list[dict]:
+    """전체 항목의 필수 증빙을 한 번에 추론하고 항목별 상태를 저장한다."""
+
+    if not item_ids:
+        return []
+
+    settings = settings or load_settings()
+    repository = repository or PostgresEvidenceRepository(settings)
+    openai_client = openai_client or get_openai_client(settings)
+    requirement_service = EvidenceRequirementService(
+        repository=repository,
+        openai_client=openai_client,
+        settings=settings,
+    )
+    check_service = EvidenceCheckService(repository)
+    ai_inputs, outputs = requirement_service.infer_required_evidences_batch(item_ids)
+    input_by_item_id = {item.item_context.item_id: item for item in ai_inputs}
+    results = []
+
+    for item_id in item_ids:
+        ai_input = input_by_item_id[item_id]
+        ai_output = outputs[item_id]
+        saved_requirements = [
+            asdict(row)
+            for row in repository.replace_active_requirements(item_id, ai_output.required_evidences)
+        ]
+        evidence_status = asdict(check_service.run(item_id))
+        requirements_after_save = [
+            asdict(row)
+            for row in repository.list_active_requirements(item_id)
+        ]
+        results.append(
+            {
+                "db_target": {
+                    "host": settings.db_host,
+                    "port": settings.db_port,
+                    "db_name": settings.db_name,
+                    "db_user": settings.db_user,
+                },
+                "model_name": settings.chat_model,
+                "input_from_db_views": {
+                    "item_context": asdict(ai_input.item_context),
+                    "linked_files": [asdict(linked_file) for linked_file in ai_input.linked_files],
+                    "available_evidence_types": list(ALLOWED_BATCH_EVIDENCE_TYPES),
+                },
+                "ai_response": asdict(ai_output),
+                "saved_requirements": saved_requirements,
+                "requirements_after_save": requirements_after_save,
+                "evidence_status": evidence_status,
+            }
+        )
+
+    return results
 
 
 def get_openai_client(settings: Settings) -> OpenAI:

@@ -23,7 +23,7 @@ import requests
 
 from src.agents.report_agent.agent import ReportAgent
 from src.agents.report_agent.context_builder import build_report_context
-from src.agents.safety_doc_agent.agent import check_missing_evidence
+from src.agents.safety_doc_agent.agent import check_missing_evidence_batch
 from src.agents.classifier_agent.agent import review_usage_statement
 from src.agents.validator_agent.agent import summarize_audit_response, validate_usage_statement
 from src.core.config import (
@@ -572,9 +572,10 @@ def _run_safety_doc_agent(
     )
 
     try:
+        batch_results = check_missing_evidence_batch(item_ids)
         item_results: list[dict[str, Any]] = [
-            {"item_id": item_id, "result": check_missing_evidence(item_id, persist_log=False)}
-            for item_id in item_ids
+            {"item_id": item_id, "result": result}
+            for item_id, result in zip(item_ids, batch_results, strict=True)
         ]
         hil_item_ids = [
             row["item_id"]
