@@ -887,23 +887,14 @@ def review_usage_statement(
     if not request.rows:
         results: list[RowReviewResult] = []
     else:
-        max_workers = min(8, len(request.rows))
-
-        def _run() -> list[RowReviewResult]:
-            with ThreadPoolExecutor(max_workers=max_workers) as executor:
-                return list(
-                    executor.map(
-                        lambda row: copy_context().run(
-                            _review_single_usage_statement_row,
-                            row=row,
-                            basic_info=request.basic_info,
-                            collection=collection,
-                        ),
-                        request.rows,
-                    )
-                )
-
-        results = _run()
+        results = [
+            _review_single_usage_statement_row(
+                row=row,
+                basic_info=request.basic_info,
+                collection=collection,
+            )
+            for row in request.rows
+        ]
 
     total_tokens: int | None = None
 

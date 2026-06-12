@@ -181,6 +181,10 @@ def classify_existing_usage_statement(
 
         _classi_token = (_classi_usage["input_tokens"] or 0) + (_classi_usage["output_tokens"] or 0)
 
+        # llm(unclassified) 판정 시 INSERT 차단
+        if "llm(unclassified)" in (reason or ""):
+            raise ValueError(f"분류할 수 없는 항목입니다: {item_name}")
+
         # usage_statement_items INSERT
         with get_connection() as conn:
             item_id = _insert_usage_statement_item(
@@ -283,6 +287,7 @@ def classify_existing_usage_statement(
                 "payload": {"error_type": type(exc).__name__, "error": str(exc)},
             },
             model_name="classifier_agent",
+            token=locals().get("_classi_token"),
         )
         mark_orchestrator(
             project_id=request.project_id,
