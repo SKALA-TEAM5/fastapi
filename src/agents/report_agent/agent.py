@@ -47,9 +47,12 @@ RESULT_TO_DECISION: dict[str, DecisionCode] = {
     "error": "inappropriate",
     "fail": "inappropriate",
     "inappropriate": "inappropriate",
+    "적정": "appropriate",
     "적절": "appropriate",
+    "부적정": "inappropriate",
     "부적절": "inappropriate",
     "검토필요": "needs_review",
+    "조건부": "needs_review",
 }
 
 DECISION_LABEL = {

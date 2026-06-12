@@ -62,17 +62,15 @@
       "kind": "table",
       "tables": [
         {
-          "headers": ["증빙 유형", "제출", "통과", "오류", "누락", "주요 내용"],
+          "headers": ["증빙 유형", "제출", "통과", "누락"],
           "repeat_for": "evidence_validation_summaries",
           "row_template": [
             "{{item.evidence_type_name}}",
             "{{item.submitted_count|count}}",
             "{{item.passed_count|count}}",
-            "{{item.error_count|count}}",
-            "{{item.missing_count|count}}",
-            "{{item.major_error}}"
+            "{{item.missing_count|count}}"
           ],
-          "empty_row": ["-", "-", "-", "-", "-", "-"]
+          "empty_row": ["-", "-", "-", "-"]
         }
       ]
     },
