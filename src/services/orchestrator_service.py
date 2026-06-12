@@ -1139,12 +1139,7 @@ def _run_legal_agent(
         result_code = "hil" if review_count else "success"
         reason = "법령 검토 결과 특이사항 없음" if review_count == 0 else f"법령 검토 결과 보고서 반영 대상 {review_count}건"
         todos = [
-            {
-                "usage_statement_item_id": row.get("item_id"),
-                "category_code": row.get("category_code"),
-                "category_name": CATEGORIES.get(str(row.get("category_code") or "")),
-                "reason": f"법령 검토 필요: {row.get('reason') or row.get('status')}",
-            }
+            _legal_todo_payload(row, linked_files_by_item_id)
             for row in item_results
             if row["status"] != "적절"
         ]
@@ -1379,7 +1374,9 @@ def _legal_item_results_from_audit(
             results.append(
                 {
                     "item_id": raw_item["행ID"],
+                    "item_name": raw_item.get("항목명") or "",
                     "category_code": category_code,
+                    "category_name": CATEGORIES.get(category_code, category_code),
                     "status": status,
                     "reason": judgment.reason_text or judgment.review_reason or judgment.reasoning or "",
                     "citations": citations,
@@ -1462,6 +1459,27 @@ def _legal_payload_item_results(item_results: list[dict[str, Any]]) -> list[dict
             }
         )
     return payload_results
+
+
+def _legal_todo_payload(
+    row: dict[str, Any],
+    linked_files_by_item_id: dict[int, list[dict[str, Any]]],
+) -> dict[str, Any]:
+    item_id = _int_or_none(row.get("item_id"))
+    category_code = str(row.get("category_code") or "")
+    linked_files = linked_files_by_item_id.get(item_id, []) if item_id is not None else []
+    return {
+        "usage_statement_item_id": item_id,
+        "usage_statement_item_name": row.get("item_name"),
+        "category_code": row.get("category_code"),
+        "category_name": row.get("category_name") or CATEGORIES.get(category_code),
+        "file_ids": [
+            file_info["fileId"]
+            for file_info in linked_files
+            if file_info.get("fileId") is not None
+        ],
+        "reason": row.get("reason") or row.get("status") or "법령 검토가 필요합니다.",
+    }
 
 
 def _legal_item_citations(judgment, fallback_citations: list[dict[str, Any]]) -> list[dict[str, Any]]:
