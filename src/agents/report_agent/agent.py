@@ -125,6 +125,8 @@ class ReportAgent:
             issue_count=len(issues),
         )
 
+        project_ref = str(project.contract_no or "").strip() or str(project.id)
+
         draft = ReportDraft(
             report_no=context.report_no,
             site_name=project.project_name,
@@ -136,7 +138,7 @@ class ReportAgent:
                 "보고서 번호": context.report_no,
                 "검토 일자": self._date_label(context.report_written_date),
                 "현장명": project.project_name,
-                "프로젝트 번호": str(project.id),
+                "프로젝트 번호": project_ref,
                 "발주처": project.client_name or "",
                 "시공사": project.construction_company,
                 "계약금액": self._money(project.contract_amount),

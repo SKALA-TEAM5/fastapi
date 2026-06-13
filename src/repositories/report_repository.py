@@ -239,7 +239,7 @@ def _group_agent_logs_by_item(rows: list[dict]) -> dict[int, list[dict]]:
                 {
                     "id": row["id"],
                     "validation_type_code": row["agent_type_code"],
-                    "result_code": row.get("result_code") or "success",
+                    "result_code": _agent_log_result_code(row, item_details),
                     "details": {
                         "agent_type_code": row["agent_type_code"],
                         "reason": row.get("reason"),
@@ -250,6 +250,36 @@ def _group_agent_logs_by_item(rows: list[dict]) -> dict[int, list[dict]]:
                 }
             )
     return dict(grouped)
+
+
+def _agent_log_result_code(row: dict[str, Any], item_details: dict[str, Any]) -> str:
+    if row.get("agent_type_code") != "legal":
+        return str(row.get("result_code") or "success")
+
+    status = _legal_status(_first_legal_status_value(row, item_details))
+    if status == "적정":
+        return "appropriate"
+    if status == "부적정":
+        return "inappropriate"
+    return "needs_review"
+
+
+def _first_legal_status_value(row: dict[str, Any], item_details: dict[str, Any]) -> str:
+    for value in (
+        item_details.get("status"),
+        item_details.get("result_code"),
+        item_details.get("decision"),
+        item_details.get("판정상태"),
+        item_details.get("판정"),
+        row.get("result_code"),
+        row.get("status"),
+    ):
+        if value is None:
+            continue
+        text = str(value).strip()
+        if text:
+            return text
+    return ""
 
 
 def _iter_agent_log_item_details(details: dict[str, Any]) -> list[tuple[int, dict[str, Any]]]:
@@ -373,13 +403,20 @@ def _classification_status(value: str) -> str:
 
 
 def _legal_status(value: str) -> str:
-    if value in {"적절", "부적절", "검토필요"}:
-        return value
-    if value in {"ok", "appropriate", "pass", "matched", "approved"}:
-        return "적절"
-    if value in {"error", "fail", "inappropriate", "rejected"}:
-        return "부적절"
-    return "검토필요"
+    normalized = value.strip().lower()
+    if normalized in {"적정", "적절"}:
+        return "적정"
+    if normalized in {"부적정", "부적절"}:
+        return "부적정"
+    if normalized in {"조건부", "검토필요"}:
+        return "조건부"
+    if normalized in {"ok", "appropriate", "pass", "matched", "approved", "success"}:
+        return "적정"
+    if normalized in {"error", "fail", "failure", "inappropriate", "rejected"}:
+        return "부적정"
+    if normalized in {"warning", "needs_review", "review", "conditional", "hil", "human_in_loop"}:
+        return "조건부"
+    return "조건부"
 
 
 def _legal_citation(source: dict[str, Any]) -> dict[str, Any]:
