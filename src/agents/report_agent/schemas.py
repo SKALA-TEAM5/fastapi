@@ -22,6 +22,7 @@ LegalValidationStatus = Literal["적절", "부적절", "검토필요"]
 
 class ProjectContext(BaseModel):
     id: int
+    contract_no: str | None = None
     construction_company: str
     project_name: str
     site_location: str
