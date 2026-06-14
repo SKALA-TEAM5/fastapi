@@ -26,7 +26,6 @@ BATCH_SYSTEM_PROMPT = """
 하나의 사용내역서에 포함된 모든 세부 항목을 한 번에 검토하세요.
 각 항목별 필수 증빙은 allowed_evidence_types 안에서만 최소한으로 선택하세요.
 설치·시공 완료 확인은 site_photo, 보호구 착용 확인은 wearing_photo를 사용하세요.
-구매·결제 확인은 품목과 거래 형태에 따라 tax_invoice 또는 receipt를 선택하세요.
 입력으로 받은 모든 item_id를 정확히 한 번씩 결과에 포함하세요.
 반드시 JSON으로만 응답하세요.
 """.strip()

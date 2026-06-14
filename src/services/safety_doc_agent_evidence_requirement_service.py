@@ -3,12 +3,20 @@ from __future__ import annotations
 import json
 import logging
 import re
+import time
 from dataclasses import asdict
 
 from langsmith import traceable
 from openai import OpenAI
 
 from src.agents.safety_doc_agent.config import Settings
+from src.core.metrics import (
+    SAFETY_DOC_CONFIDENCE,
+    SAFETY_DOC_INFERENCE_DURATION,
+    SAFETY_DOC_LLM_FAILURES,
+    SAFETY_DOC_REFERENCE_FAILURES,
+    SAFETY_DOC_TOKENS,
+)
 from src.prompts.safety_doc_agent_evidence_requirement_prompt import (
     ALLOWED_BATCH_EVIDENCE_TYPES,
     BATCH_SYSTEM_PROMPT,
@@ -101,6 +109,7 @@ class EvidenceRequirementService:
                 top_k=self.settings.reference_top_k,
             )
         except Exception as exc:
+            SAFETY_DOC_REFERENCE_FAILURES.labels(mode="single").inc()
             log.warning(
                 "safety-doc reference search skipped: collection=%s error=%s",
                 self.settings.reference_collection,
@@ -152,6 +161,7 @@ class EvidenceRequirementService:
                 top_k=self.settings.reference_top_k,
             )
         except Exception as exc:
+            SAFETY_DOC_REFERENCE_FAILURES.labels(mode="batch").inc()
             log.warning(
                 "safety-doc batch reference search skipped: collection=%s error=%s",
                 self.settings.reference_collection,
@@ -174,22 +184,37 @@ class EvidenceRequirementService:
         ]
 
     @traceable(name="evidence_requirement_inference", run_type="chain")
-    def infer_required_evidences(self, item_id: int) -> AIEvidenceRequirementOutput:
+    def infer_required_evidences(
+        self,
+        item_id: int,
+        *,
+        ai_input: AIEvidenceRequirementInput | None = None,
+    ) -> AIEvidenceRequirementOutput:
         """LLM을 호출하고 응답을 구조화된 결과로 정리한다."""
 
-        ai_input = self.build_ai_input(item_id)
-        response = self.openai_client.responses.create(
-            model=self.settings.chat_model,
-            input=[
-                {"role": "system", "content": [{"type": "input_text", "text": SYSTEM_PROMPT}]},
-                {
-                    "role": "user",
-                    "content": [{"type": "input_text", "text": build_user_prompt(ai_input)}],
-                },
-            ],
-        )
-        payload = _parse_json_payload(response)
-        usage = _extract_usage(response)
+        ai_input = ai_input or self.build_ai_input(item_id)
+        started_at = time.perf_counter()
+        try:
+            response = self.openai_client.responses.create(
+                model=self.settings.chat_model,
+                input=[
+                    {"role": "system", "content": [{"type": "input_text", "text": SYSTEM_PROMPT}]},
+                    {
+                        "role": "user",
+                        "content": [{"type": "input_text", "text": build_user_prompt(ai_input)}],
+                    },
+                ],
+            )
+            payload = _parse_json_payload(response)
+            usage = _extract_usage(response)
+        except Exception:
+            SAFETY_DOC_LLM_FAILURES.labels(mode="single").inc()
+            raise
+        finally:
+            SAFETY_DOC_INFERENCE_DURATION.labels(
+                mode="single",
+                model=self.settings.chat_model,
+            ).observe(time.perf_counter() - started_at)
 
         available_codes = set(ai_input.available_evidence_types)
         required_evidences = [
@@ -198,12 +223,18 @@ class EvidenceRequirementService:
             if code in available_codes
         ]
 
-        return AIEvidenceRequirementOutput(
+        result = AIEvidenceRequirementOutput(
             required_evidences=required_evidences,
             confidence=payload.get("confidence"),
             reason=payload.get("reason"),
             usage=usage,
         )
+        _record_model_observability(
+            mode="single",
+            model=self.settings.chat_model,
+            result=result,
+        )
+        return result
 
     @traceable(name="batch_evidence_requirement_inference", run_type="chain")
     def infer_required_evidences_batch(
@@ -216,18 +247,28 @@ class EvidenceRequirementService:
         if not ai_inputs:
             return [], {}
 
-        response = self.openai_client.responses.create(
-            model=self.settings.chat_model,
-            input=[
-                {"role": "system", "content": [{"type": "input_text", "text": BATCH_SYSTEM_PROMPT}]},
-                {
-                    "role": "user",
-                    "content": [{"type": "input_text", "text": build_batch_user_prompt(ai_inputs)}],
-                },
-            ],
-        )
-        payload = _parse_json_payload(response)
-        usage = _extract_usage(response)
+        started_at = time.perf_counter()
+        try:
+            response = self.openai_client.responses.create(
+                model=self.settings.chat_model,
+                input=[
+                    {"role": "system", "content": [{"type": "input_text", "text": BATCH_SYSTEM_PROMPT}]},
+                    {
+                        "role": "user",
+                        "content": [{"type": "input_text", "text": build_batch_user_prompt(ai_inputs)}],
+                    },
+                ],
+            )
+            payload = _parse_json_payload(response)
+            usage = _extract_usage(response)
+        except Exception:
+            SAFETY_DOC_LLM_FAILURES.labels(mode="batch").inc()
+            raise
+        finally:
+            SAFETY_DOC_INFERENCE_DURATION.labels(
+                mode="batch",
+                model=self.settings.chat_model,
+            ).observe(time.perf_counter() - started_at)
         expected_item_ids = {item.item_context.item_id for item in ai_inputs}
         allowed_codes = set(ALLOWED_BATCH_EVIDENCE_TYPES)
         outputs: dict[int, AIEvidenceRequirementOutput] = {}
@@ -265,9 +306,16 @@ class EvidenceRequirementService:
 
         missing_item_ids = sorted(expected_item_ids - outputs.keys())
         if missing_item_ids:
+            SAFETY_DOC_LLM_FAILURES.labels(mode="batch").inc()
             raise ValueError(f"Batch model response omitted item_ids: {missing_item_ids}")
 
         outputs[item_ids[0]].usage = usage
+        for output in outputs.values():
+            _record_model_observability(
+                mode="batch",
+                model=self.settings.chat_model,
+                result=output,
+            )
         return ai_inputs, outputs
 
     @traceable(name="evidence_requirement_generation", run_type="chain")
@@ -295,6 +343,28 @@ def _total_tokens(usage: dict[str, int] | None) -> int | None:
         return None
     total = usage.get("total_tokens")
     return total if isinstance(total, int) else None
+
+
+def _record_model_observability(
+    *,
+    mode: str,
+    model: str,
+    result: AIEvidenceRequirementOutput,
+) -> None:
+    if isinstance(result.confidence, (int, float)):
+        SAFETY_DOC_CONFIDENCE.labels(mode=mode).observe(float(result.confidence))
+    if not result.usage:
+        return
+    for token_type in (
+        "input_tokens",
+        "output_tokens",
+        "cached_tokens",
+        "reasoning_tokens",
+    ):
+        value = result.usage.get(token_type)
+        if isinstance(value, int) and value >= 0:
+            SAFETY_DOC_TOKENS.labels(model=model, type=token_type).inc(value)
+
 
 def _parse_json_payload(response: object) -> dict:
     """Responses API 응답에서 JSON 객체만 안전하게 추출한다.

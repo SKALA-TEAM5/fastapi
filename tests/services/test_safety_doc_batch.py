@@ -2,9 +2,16 @@ from dataclasses import dataclass
 from types import SimpleNamespace
 
 from src.agents.safety_doc_agent.config import Settings
+from src.agents.safety_doc_agent.agent import (
+    _linked_file_audit_context,
+    check_missing_evidence,
+)
+from src.core.metrics import SAFETY_DOC_LLM_FAILURES
 from src.schemas.safety_doc_agent_evidence import (
+    AIEvidenceRequirementInput,
     EvidenceRequirementItemContext,
     EvidenceType,
+    LinkedEvidenceFileContext,
 )
 from src.services.safety_doc_agent_evidence_requirement_service import EvidenceRequirementService
 
@@ -27,6 +34,7 @@ class FakeResponses:
 
 class FakeRepository:
     def __init__(self):
+        self.context_call_count = 0
         self.contexts = {
             1: _context(1, "CAT_02", "안전난간 설치"),
             2: _context(2, "CAT_03", "안전모 구입"),
@@ -42,6 +50,7 @@ class FakeRepository:
         ]
 
     def get_item_context(self, item_id):
+        self.context_call_count += 1
         return self.contexts[item_id]
 
     def list_linked_file_contexts(self, item_id):
@@ -114,10 +123,88 @@ def test_batch_inference_rejects_missing_items():
         SimpleNamespace(responses=responses),
         _settings(),
     )
+    failure_counter = SAFETY_DOC_LLM_FAILURES.labels(mode="batch")
+    failures_before = failure_counter._value.get()
 
     try:
         service.infer_required_evidences_batch([1, 2])
     except ValueError as exc:
         assert "omitted item_ids: [2]" in str(exc)
+        assert failure_counter._value.get() == failures_before + 1
     else:
         raise AssertionError("Missing batch items must fail the inference")
+
+
+def test_single_inference_reuses_prebuilt_input():
+    repository = FakeRepository()
+    responses = FakeResponses(
+        FakeResponse(
+            output_text=(
+                '{"required_evidences":["receipt"],'
+                '"confidence":0.8,"reason":"결제 확인"}'
+            ),
+            usage=SimpleNamespace(input_tokens=10, output_tokens=5, total_tokens=15),
+        )
+    )
+    service = EvidenceRequirementService(
+        repository,
+        SimpleNamespace(responses=responses),
+        _settings(),
+    )
+    ai_input = AIEvidenceRequirementInput(
+        item_context=repository.contexts[1],
+        linked_files=[],
+        available_evidence_types=["receipt"],
+        evidence_type_definitions=[
+            EvidenceType("receipt", "영수증", "결제 확인"),
+        ],
+    )
+
+    result = service.infer_required_evidences(1, ai_input=ai_input)
+
+    assert result.required_evidences == ["receipt"]
+    assert len(responses.calls) == 1
+
+
+def test_single_agent_builds_item_context_once():
+    repository = FakeRepository()
+    responses = FakeResponses(
+        FakeResponse(
+            output_text=(
+                '{"required_evidences":["receipt"],'
+                '"confidence":0.8,"reason":"결제 확인"}'
+            ),
+            usage=SimpleNamespace(input_tokens=10, output_tokens=5, total_tokens=15),
+        )
+    )
+
+    result = check_missing_evidence(
+        1,
+        dry_run=True,
+        settings=_settings(),
+        repository=repository,
+        openai_client=SimpleNamespace(responses=responses),
+    )
+
+    assert result["input_from_db_views"]["item_context"]["item_id"] == 1
+    assert repository.context_call_count == 1
+
+
+def test_linked_file_audit_context_excludes_file_name_and_storage_key():
+    linked_file = LinkedEvidenceFileContext(
+        item_id=1,
+        file_id=10,
+        original_filename="sensitive-name.jpg",
+        mime_type="image/jpeg",
+        uploaded_evidence_type_code="receipt",
+        linked_evidence_type_code="receipt",
+        storage_key="projects/1/private/sensitive-name.jpg",
+        captured_at="2026-06-01",
+        uploaded_at="2026-06-02",
+    )
+
+    audit_context = _linked_file_audit_context(linked_file)
+
+    assert audit_context["file_id"] == 10
+    assert "original_filename" not in audit_context
+    assert "storage_key" not in audit_context

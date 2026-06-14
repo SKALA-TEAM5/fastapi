@@ -30,6 +30,12 @@ import uuid
 from typing import AsyncGenerator
 
 from src.agents.chatbot_agent.agent import get_compiled_graph
+from src.core.metrics import (
+    finish_agent_run,
+    record_agent_run,
+    record_agent_tokens,
+    start_agent_run,
+)
 from src.repositories.orchestrator_repository import insert_agent_usage_record
 
 log = logging.getLogger(__name__)
@@ -183,6 +189,7 @@ async def stream_chat(
     lock = _get_session_lock(session_id)
     if lock.locked():
         log.warning(f"[chatbot_service] 중복 요청 차단: {session_id}")
+        record_agent_run(agent="chatbot", result="skipped")
         yield _sse("error", "이전 답변을 생성 중입니다. 잠시 후 다시 시도해 주세요.")
         yield _DONE_SIGNAL
         return
@@ -202,47 +209,77 @@ async def stream_chat(
             yield _sse("session_reset", "이전 대화 기록이 만료되었습니다. 새 대화를 시작합니다.")
 
         # ── 5. 그래프 실행 ────────────────────────────────────────────────────
-        graph = get_compiled_graph()
-        config = {"configurable": {"thread_id": session_id}}
-
-        initial_state = {
-            "question":       question,
-            "intent":         "",
-            "retrieved_docs": [],
-            "graded_docs":    [],
-            "retry_count":    0,
-            "sources":        [],
-            "answer":         "",
-            "messages":       [],
-        }
-
+        started_at = start_agent_run("chatbot")
+        result_code = "success"
         usage: dict = {"input_tokens": 0, "output_tokens": 0, "model_name": None}
-
         try:
-            async for sse_event in _stream_events(graph, initial_state, config, usage):
-                yield sse_event
+            graph = get_compiled_graph()
+            config = {"configurable": {"thread_id": session_id}}
 
-        except asyncio.TimeoutError as e:
-            log.error(f"[chatbot_service] 타임아웃: {e}")
-            yield _sse("error", "응답 시간이 초과되었습니다. 다시 시도해 주세요.")
+            initial_state = {
+                "question":       question,
+                "intent":         "",
+                "retrieved_docs": [],
+                "graded_docs":    [],
+                "retry_count":    0,
+                "sources":        [],
+                "answer":         "",
+                "messages":       [],
+            }
 
-        except Exception as e:
-            log.error(f"[chatbot_service] 스트리밍 오류: {e}", exc_info=True)
-            yield _sse("error", "일시적인 오류가 발생했습니다. 다시 시도해 주세요.")
+            try:
+                async for sse_event in _stream_events(graph, initial_state, config, usage):
+                    yield sse_event
 
-        # 토큰이 수집됐고 user_id가 있으면 agent_usage_records에 기록 (fire-and-forget)
-        if user_id is not None and (usage["input_tokens"] > 0 or usage["output_tokens"] > 0):
-            asyncio.create_task(
-                asyncio.to_thread(
-                    insert_agent_usage_record,
-                    project_id=999,
-                    usage_statement_id=None,
-                    agent_type_code="chatbot",
-                    model_name=usage["model_name"],
-                    input_tokens=usage["input_tokens"],
-                    output_tokens=usage["output_tokens"],
-                    requested_by_user_id=user_id,
+            except asyncio.TimeoutError as e:
+                result_code = "fail"
+                log.error(f"[chatbot_service] 타임아웃: {e}")
+                yield _sse("error", "응답 시간이 초과되었습니다. 다시 시도해 주세요.")
+
+            except Exception as e:
+                result_code = "fail"
+                log.error(f"[chatbot_service] 스트리밍 오류: {e}", exc_info=True)
+                yield _sse("error", "일시적인 오류가 발생했습니다. 다시 시도해 주세요.")
+
+            for token_type in ("input_tokens", "output_tokens"):
+                record_agent_tokens(
+                    agent="chatbot",
+                    model=usage["model_name"],
+                    token_type=token_type.removesuffix("_tokens"),
+                    value=usage[token_type],
                 )
+            record_agent_tokens(
+                agent="chatbot",
+                model=usage["model_name"],
+                token_type="total",
+                value=usage["input_tokens"] + usage["output_tokens"],
             )
 
-        yield _DONE_SIGNAL
+            # 토큰이 수집됐고 user_id가 있으면 agent_usage_records에 기록 (fire-and-forget)
+            if user_id is not None and (usage["input_tokens"] > 0 or usage["output_tokens"] > 0):
+                asyncio.create_task(
+                    asyncio.to_thread(
+                        insert_agent_usage_record,
+                        project_id=999,
+                        usage_statement_id=None,
+                        agent_type_code="chatbot",
+                        model_name=usage["model_name"],
+                        input_tokens=usage["input_tokens"],
+                        output_tokens=usage["output_tokens"],
+                        requested_by_user_id=user_id,
+                    )
+                )
+
+            yield _DONE_SIGNAL
+        except (asyncio.CancelledError, GeneratorExit):
+            result_code = "canceled"
+            raise
+        except Exception:
+            result_code = "fail"
+            raise
+        finally:
+            finish_agent_run(
+                agent="chatbot",
+                started_at=started_at,
+                result=result_code,
+            )

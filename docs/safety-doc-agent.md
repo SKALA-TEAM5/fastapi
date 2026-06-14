@@ -144,3 +144,20 @@ uv run python -m tools.safety_doc_reference_vector search \
 
 - 현재 흐름은 `DB view 기반 입력 + OpenAI 판단 + evidence requirement 저장/검증` 기준입니다.
 - 실제 배포 전에는 DB 계정 권한을 환경별로 분리하는 것을 권장합니다.
+- 오케스트레이터가 저장하는 배치 실행 로그에는 원본 파일명과 `storage_key`를 포함하지 않습니다.
+
+## Prometheus 지표
+
+`/metrics`에서 다음 Safety Doc 전용 지표를 확인할 수 있습니다.
+
+- `safety_doc_runs_total{mode,result}`: 단건/배치 실행 결과
+- `safety_doc_inference_duration_seconds{mode,model}`: LLM 추론 시간
+- `safety_doc_llm_failures_total{mode}`: LLM 호출 실패 횟수
+- `safety_doc_reference_failures_total{mode}`: 참고자료 검색 실패 횟수
+- `safety_doc_missing_evidence_total{evidence_type}`: 유형별 누락 증빙 수
+- `safety_doc_batch_size`: 배치당 항목 수
+- `safety_doc_confidence{mode}`: 모델이 반환한 confidence 분포
+- `safety_doc_tokens_total{model,type}`: 입력·출력 등 토큰 사용량
+
+Grafana에서는 실행 성공/HIL/실패율, P95 추론 시간, 참고자료 검색 실패,
+증빙 유형별 누락 추이와 모델별 토큰 사용량을 우선 대시보드로 구성합니다.

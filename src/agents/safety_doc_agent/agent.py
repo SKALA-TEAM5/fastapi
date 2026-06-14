@@ -7,12 +7,18 @@ from langsmith.wrappers import wrap_openai
 from openai import OpenAI
 
 from src.agents.safety_doc_agent.config import Settings, load_settings
+from src.core.metrics import (
+    SAFETY_DOC_BATCH_SIZE,
+    SAFETY_DOC_MISSING_EVIDENCE,
+    SAFETY_DOC_RUNS,
+)
 from src.prompts.safety_doc_agent_evidence_requirement_prompt import (
     ALLOWED_BATCH_EVIDENCE_TYPES,
     build_user_prompt,
 )
 from src.repositories.safety_doc_agent_evidence_repository import EvidenceRepository
 from src.repositories.safety_doc_agent_postgres_evidence_repository import PostgresEvidenceRepository
+from src.schemas.safety_doc_agent_evidence import LinkedEvidenceFileContext
 from src.services.safety_doc_agent_evidence_check_service import EvidenceCheckService
 from src.services.safety_doc_agent_evidence_requirement_service import EvidenceRequirementService
 
@@ -42,9 +48,13 @@ def check_missing_evidence(
     )
     check_service = EvidenceCheckService(repository)
 
-    item_context = repository.get_item_context(item_id)
     ai_input = requirement_service.build_ai_input(item_id)
-    ai_output = requirement_service.infer_required_evidences(item_id)
+    item_context = ai_input.item_context
+    try:
+        ai_output = requirement_service.infer_required_evidences(item_id, ai_input=ai_input)
+    except Exception:
+        SAFETY_DOC_RUNS.labels(mode="single", result="fail").inc()
+        raise
 
     saved_requirements = None
     requirements_after_save = None
@@ -80,6 +90,11 @@ def check_missing_evidence(
                 model_name=settings.chat_model,
                 token=total_tokens(ai_output.usage),
             )
+
+    missing_codes = (evidence_status or {}).get("missing_evidences") or []
+    _record_missing_evidences(missing_codes)
+    result_code = "dry_run" if dry_run else ("hil" if missing_codes else "success")
+    SAFETY_DOC_RUNS.labels(mode="single", result=result_code).inc()
 
     return {
         "db_target": {
@@ -118,7 +133,12 @@ def check_missing_evidence_batch(
         settings=settings,
     )
     check_service = EvidenceCheckService(repository)
-    ai_inputs, outputs = requirement_service.infer_required_evidences_batch(item_ids)
+    SAFETY_DOC_BATCH_SIZE.observe(len(item_ids))
+    try:
+        ai_inputs, outputs = requirement_service.infer_required_evidences_batch(item_ids)
+    except Exception:
+        SAFETY_DOC_RUNS.labels(mode="batch", result="fail").inc()
+        raise
     input_by_item_id = {item.item_context.item_id: item for item in ai_inputs}
     results = []
 
@@ -145,7 +165,10 @@ def check_missing_evidence_batch(
                 "model_name": settings.chat_model,
                 "input_from_db_views": {
                     "item_context": asdict(ai_input.item_context),
-                    "linked_files": [asdict(linked_file) for linked_file in ai_input.linked_files],
+                    "linked_files": [
+                        _linked_file_audit_context(linked_file)
+                        for linked_file in ai_input.linked_files
+                    ],
                     "available_evidence_types": list(ALLOWED_BATCH_EVIDENCE_TYPES),
                 },
                 "ai_response": asdict(ai_output),
@@ -155,6 +178,16 @@ def check_missing_evidence_batch(
             }
         )
 
+    missing_codes = [
+        code
+        for result in results
+        for code in (result["evidence_status"] or {}).get("missing_evidences", [])
+    ]
+    _record_missing_evidences(missing_codes)
+    SAFETY_DOC_RUNS.labels(
+        mode="batch",
+        result="hil" if missing_codes else "success",
+    ).inc()
     return results
 
 
@@ -178,3 +211,21 @@ def missing_evidence_reason(missing_codes: list[str]) -> str:
     if not missing_codes:
         return "필수 증빙 누락 없음"
     return "필수 증빙 누락: " + ", ".join(missing_codes)
+
+
+def _record_missing_evidences(missing_codes: list[str]) -> None:
+    for code in missing_codes:
+        SAFETY_DOC_MISSING_EVIDENCE.labels(evidence_type=code).inc()
+
+
+def _linked_file_audit_context(linked_file: LinkedEvidenceFileContext) -> dict:
+    """운영 로그에는 파일 경로와 원본 파일명을 남기지 않는다."""
+
+    return {
+        "file_id": linked_file.file_id,
+        "mime_type": linked_file.mime_type,
+        "uploaded_evidence_type_code": linked_file.uploaded_evidence_type_code,
+        "linked_evidence_type_code": linked_file.linked_evidence_type_code,
+        "captured_at": linked_file.captured_at,
+        "uploaded_at": linked_file.uploaded_at,
+    }
