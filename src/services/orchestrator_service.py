@@ -32,6 +32,7 @@ from src.core.config import (
     VISION_AGENT_REVIEW_PATH,
     VISION_AGENT_TIMEOUT_SECONDS,
 )
+from src.core.metrics import record_agent_tokens, track_agent_run
 from src.schemas.classifier import CATEGORIES
 from src.services.classi_service import _insert_usage_statement_item
 from src.repositories.orchestrator_repository import (
@@ -80,6 +81,7 @@ _VISION_ALLOWED_CATEGORY_CODES: set[str] | None = {"CAT_02", "CAT_03"}
 # _VISION_ALLOWED_CATEGORY_CODES = None
 
 
+@track_agent_run("classi")
 def parse_and_classify_usage_statement(file_id: int) -> OrchestratorActionResponse:
     if get_openai_callback is not None:
         with get_openai_callback() as _classi_cb:
@@ -137,6 +139,7 @@ def parse_and_classify_usage_statement(file_id: int) -> OrchestratorActionRespon
     )
 
 
+@track_agent_run("classi")
 def classify_existing_usage_statement(
     request: UsageStatementClassifyRequest,
 ) -> OrchestratorActionResponse:
@@ -611,6 +614,7 @@ def run_report_draft(
     )
 
 
+@track_agent_run("safety-doc")
 def _run_safety_doc_agent(
     project_id: int,
     usage_statement_id: int,
@@ -716,6 +720,7 @@ def _run_safety_doc_agent(
         return _mark_agent_failed(project_id, usage_statement_id, "safety-doc", exc)
 
 
+@track_agent_run("link")
 def _run_link_agent(
     project_id: int,
     usage_statement_id: int,
@@ -1014,6 +1019,7 @@ def _is_vision_allowed_file_context(file_context: dict[str, Any] | None) -> bool
     return category_code in _VISION_ALLOWED_CATEGORY_CODES
 
 
+@track_agent_run("vision")
 def _run_vision_agent(
     project_id: int,
     usage_statement_id: int,
@@ -1187,6 +1193,7 @@ def _run_vision_agent(
         return _mark_agent_failed(project_id, usage_statement_id, "vision", exc)
 
 
+@track_agent_run("legal")
 def _run_legal_agent(
     project_id: int,
     usage_statement_id: int,
@@ -1281,6 +1288,7 @@ def _run_legal_agent(
         return _mark_agent_failed(project_id, usage_statement_id, "legal", exc)
 
 
+@track_agent_run("report")
 def _run_report_agent(
     project_id: int,
     usage_statement_id: int,
@@ -1930,6 +1938,30 @@ def _record_agent_usage(
     cached_input_tokens: int | None = None,
     requested_by_user_id: int | None = None,
 ) -> None:
+    record_agent_tokens(
+        agent=agent_type_code,
+        model=model_name,
+        token_type="total",
+        value=token,
+    )
+    record_agent_tokens(
+        agent=agent_type_code,
+        model=model_name,
+        token_type="input",
+        value=input_tokens,
+    )
+    record_agent_tokens(
+        agent=agent_type_code,
+        model=model_name,
+        token_type="output",
+        value=output_tokens,
+    )
+    record_agent_tokens(
+        agent=agent_type_code,
+        model=model_name,
+        token_type="cached_input",
+        value=cached_input_tokens,
+    )
     try:
         insert_agent_usage_record(
             project_id=project_id,

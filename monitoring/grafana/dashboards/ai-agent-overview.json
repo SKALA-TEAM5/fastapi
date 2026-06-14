@@ -1,0 +1,153 @@
+{
+  "annotations": {
+    "list": []
+  },
+  "editable": true,
+  "graphTooltip": 1,
+  "panels": [
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${DS_PROMETHEUS}"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "reqps"
+        }
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 0
+      },
+      "id": 1,
+      "targets": [
+        {
+          "expr": "sum by (agent, result) (rate(ai_agent_runs_total[$__rate_interval]))",
+          "legendFormat": "{{agent}} / {{result}}",
+          "refId": "A"
+        }
+      ],
+      "title": "Agent Run Rate",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${DS_PROMETHEUS}"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s"
+        }
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 0
+      },
+      "id": 2,
+      "targets": [
+        {
+          "expr": "histogram_quantile(0.95, sum by (le, agent) (rate(ai_agent_run_duration_seconds_bucket[$__rate_interval])))",
+          "legendFormat": "{{agent}}",
+          "refId": "A"
+        }
+      ],
+      "title": "Agent Duration P95",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${DS_PROMETHEUS}"
+      },
+      "gridPos": {
+        "h": 7,
+        "w": 8,
+        "x": 0,
+        "y": 8
+      },
+      "id": 3,
+      "targets": [
+        {
+          "expr": "sum by (agent) (ai_agent_runs_in_progress)",
+          "legendFormat": "{{agent}}",
+          "refId": "A"
+        }
+      ],
+      "title": "Runs In Progress",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${DS_PROMETHEUS}"
+      },
+      "gridPos": {
+        "h": 7,
+        "w": 8,
+        "x": 8,
+        "y": 8
+      },
+      "id": 4,
+      "targets": [
+        {
+          "expr": "sum by (agent) (increase(ai_agent_review_items_total[$__range]))",
+          "legendFormat": "{{agent}}",
+          "refId": "A"
+        }
+      ],
+      "title": "Review Items",
+      "type": "barchart"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${DS_PROMETHEUS}"
+      },
+      "gridPos": {
+        "h": 7,
+        "w": 8,
+        "x": 16,
+        "y": 8
+      },
+      "id": 5,
+      "targets": [
+        {
+          "expr": "sum by (agent, type) (increase(ai_agent_tokens_total[$__range]))",
+          "legendFormat": "{{agent}} / {{type}}",
+          "refId": "A"
+        }
+      ],
+      "title": "Token Usage",
+      "type": "barchart"
+    }
+  ],
+  "refresh": "30s",
+  "schemaVersion": 39,
+  "tags": [
+    "ai-agent",
+    "prometheus"
+  ],
+  "templating": {
+    "list": [
+      {
+        "current": {},
+        "label": "Prometheus",
+        "name": "DS_PROMETHEUS",
+        "query": "prometheus",
+        "type": "datasource"
+      }
+    ]
+  },
+  "time": {
+    "from": "now-6h",
+    "to": "now"
+  },
+  "title": "AI Agent Overview",
+  "uid": "ai-agent-overview",
+  "version": 1
+}

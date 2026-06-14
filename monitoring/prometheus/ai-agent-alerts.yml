@@ -1,0 +1,49 @@
+groups:
+  - name: ai-agent-observability
+    rules:
+      - alert: AIAgentHighFailureRate
+        expr: |
+          (
+            sum by (agent) (rate(ai_agent_runs_total{result="fail"}[10m]))
+            /
+            clamp_min(sum by (agent) (rate(ai_agent_runs_total[10m])), 0.001)
+          ) > 0.2
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "AI Agent failure rate is high"
+          description: "{{ $labels.agent }} Agent failure rate exceeded 20% for 10 minutes."
+
+      - alert: AIAgentSlowP95
+        expr: |
+          histogram_quantile(
+            0.95,
+            sum by (le, agent) (
+              rate(ai_agent_run_duration_seconds_bucket[10m])
+            )
+          ) > 120
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "AI Agent P95 latency is high"
+          description: "{{ $labels.agent }} Agent P95 latency exceeded 120 seconds for 10 minutes."
+
+      - alert: AIAgentRunStuck
+        expr: ai_agent_runs_in_progress > 0
+        for: 15m
+        labels:
+          severity: critical
+        annotations:
+          summary: "AI Agent run may be stuck"
+          description: "{{ $labels.agent }} Agent has remained in progress for more than 15 minutes."
+
+      - alert: SafetyDocReferenceSearchFailures
+        expr: increase(safety_doc_reference_failures_total[10m]) >= 3
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Safety Doc reference search is failing"
+          description: "Safety Doc reference search failed at least three times in ten minutes."
