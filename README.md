@@ -398,3 +398,5 @@ uv sync
 
 - `report_agent`: 입력 데이터 기반 리포트 초안 생성
 - `safety_doc_agent`: 산업안전보건관리비 증빙서류 점검
+
+운영 지표와 Grafana 대시보드는 `docs/observability.md`를 참고합니다.
