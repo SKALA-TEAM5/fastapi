@@ -22,7 +22,9 @@ ReportContext와 LLM 없이 먼저 만든 ReportDraft가 제공됩니다.
 - 법령 근거는 입력에 있는 경우에만 언급합니다.
 - `issue_details[].no`는 입력 ReportDraft에 있는 번호만 사용합니다.
 - `legal_basis`, `legal_citations`, 금액, 판정, 카테고리, 담당자, 기한은 변경하지 않습니다.
-- `required_action`은 입력의 `required_action_fact` 또는 기존 `required_action`을 바탕으로 문장만 다듬습니다.
+- `required_action_fact` 또는 기존 `required_action`이 있으면 그 사실을 바탕으로 문장만 다듬습니다.
+- `required_action_fact`와 기존 `required_action`이 모두 비어 있으면 `problem`, `agent_conclusion`, `legal_basis`를 근거로 담당자가 수행할 조치 문장을 생성합니다.
+- 조치 문장을 생성할 때도 입력에 없는 파일명, 번호, 담당자, 기한, 법령 조항은 만들지 않습니다.
 - 담당자 최종 확인이 필요하다는 문장을 유지합니다.
 
 `overall_opinion` 작성 기준:
