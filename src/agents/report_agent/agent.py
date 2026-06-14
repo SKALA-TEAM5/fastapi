@@ -245,7 +245,7 @@ class ReportAgent:
                     site_claim=None,
                     agent_conclusion=review.summary_reason,
                     required_action_fact=str(action) if action else None,
-                    required_action=str(action) if action else "담당자 검토 후 증빙 보완 또는 사용내역 정정 필요",
+                    required_action=str(action) if action else None,
                 )
             )
         return issues
