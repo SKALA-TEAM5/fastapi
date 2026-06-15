@@ -673,16 +673,18 @@ def _run_safety_doc_agent(
             if not missing_evidences:
                 continue
             todo_context = _todo_context_from_safety_doc_result(row)
-            missing_text = ", ".join(_evidence_type_display_name(code, evidence_type_names) for code in missing_evidences)
-            todos.append(
-                {
-                    "usage_statement_item_id": row["item_id"],
-                    **todo_context,
-                    "title": missing_text,
-                    "evidence_type_codes": missing_evidences,
-                    "reason": f"필수 증빙 누락: {missing_text}",
-                }
-            )
+            for evidence_type_code in missing_evidences:
+                evidence_name = _evidence_type_display_name(evidence_type_code, evidence_type_names)
+                todos.append(
+                    {
+                        "usage_statement_item_id": row["item_id"],
+                        **todo_context,
+                        "title": evidence_name,
+                        "evidence_type_code": evidence_type_code,
+                        "evidence_type_codes": [evidence_type_code],
+                        "reason": f"필수 증빙 누락: {evidence_name}",
+                    }
+                )
         upsert_agent_log(
             project_id=project_id,
             usage_statement_id=usage_statement_id,
@@ -2301,6 +2303,15 @@ def _build_status_todos(logs: dict[str, dict[str, Any]]) -> list[SupplementTodoS
             item_id = _int_or_none(todo.get("usage_statement_item_id"))
             context = context_by_item_id.get(item_id or -1, {})
             category_code = _first_string([todo.get("category_code"), context.get("category_code")])
+            evidence_type_code = _first_string([todo.get("evidence_type_code")])
+            raw_evidence_type_codes = todo.get("evidence_type_codes")
+            evidence_type_codes = [
+                str(code)
+                for code in (raw_evidence_type_codes if isinstance(raw_evidence_type_codes, list) else [])
+                if str(code or "").strip()
+            ]
+            if evidence_type_code and evidence_type_code not in evidence_type_codes:
+                evidence_type_codes = [evidence_type_code, *evidence_type_codes]
             todos.append(
                 SupplementTodoSnapshot(
                     agent_type_code=agent_type_code,
@@ -2312,6 +2323,8 @@ def _build_status_todos(logs: dict[str, dict[str, Any]]) -> list[SupplementTodoS
                         [todo.get("usage_statement_item_name"), context.get("usage_statement_item_name")]
                     ),
                     file_id=todo.get("file_id"),
+                    evidence_type_code=evidence_type_code,
+                    evidence_type_codes=evidence_type_codes,
                     reason=reason,
                     status_code=todo.get("status_code") or "open",
                 )

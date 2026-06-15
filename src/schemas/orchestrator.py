@@ -71,6 +71,8 @@ class SupplementTodoSnapshot(BaseModel):
     category_name: str | None = None
     usage_statement_item_name: str | None = None
     file_id: int | None = None
+    evidence_type_code: str | None = None
+    evidence_type_codes: list[str] = Field(default_factory=list)
     reason: str
     status_code: str = "open"
 
