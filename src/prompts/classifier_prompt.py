@@ -44,7 +44,11 @@ CLASSIFIER_CATEGORY_PROMPT = ChatPromptTemplate.from_messages(
             "{context}\n\n"
             "## 후보 카테고리 (RDB 점수 순)\n"
             "{candidates}\n\n"
-            "반드시 JSON 형식으로만 출력하세요. category_code는 CAT_01~CAT_09 중 반드시 하나를 선택하세요.",
+            "반드시 JSON 형식으로만 출력하세요.\n"
+            "항목명이 사람 이름, 고유명사, 산안비와 전혀 무관한 항목(예: '한채윤', '홍길동', '커피')이면 "
+            "is_safety_item을 false로 설정하고, category_code는 current({given_code})를 그대로 입력하세요.\n"
+            "산안비 지출 가능 항목이면 is_safety_item을 true로 설정하고, "
+            "category_code는 CAT_01~CAT_09 중 반드시 하나를 선택하세요.",
         ),
         (
             "human",
