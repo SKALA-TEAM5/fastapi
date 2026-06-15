@@ -888,6 +888,15 @@ def _link_todo_detail(row: dict[str, Any]) -> str | None:
     if reject_reason:
         return reject_reason
 
+    # 하드 게이트(날짜·금액·업체명) 실패로 강제 unmatched된 경우, 유사도가 높아도
+    # "매칭 실패"가 된다. 이때는 유사도가 아니라 실제 실패 사유(게이트)를 보여줘야
+    # 사용자가 "유사도 1.00인데 왜 실패?" 하고 혼란스럽지 않다.
+    gate_failed = row.get("gate_failed")
+    if gate_failed is None:
+        gate_failed = row.get("gateFailed")
+    if isinstance(gate_failed, list) and gate_failed:
+        return "; ".join(str(g) for g in gate_failed[:2])
+
     similarity_score = _float_or_none(
         row.get("similarity_score")
         if row.get("similarity_score") is not None
