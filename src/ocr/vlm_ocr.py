@@ -290,19 +290,29 @@ def call_vision_gemini(
     except EnvironmentError as e:
         return {"error": str(e)}
 
-    try:
-        img = Image.open(image_path)
-    except FileNotFoundError:
-        return {"error": f"이미지 파일을 찾을 수 없습니다: {image_path}"}
-    except Exception as e:
-        return {"error": f"이미지 로드 실패: {e}"}
-
     prompt = _SYSTEM_PROMPT + "\n\n" + _build_user_prompt(type_hint)
+
+    # PDF는 Gemini가 네이티브로 처리한다(래스터화 불필요, 멀티페이지·디지털/스캔 모두 지원).
+    # 이미지는 기존대로 PIL로 로드해 전달한다.
+    ext = Path(image_path).suffix.lower()
+    try:
+        if ext == ".pdf":
+            from google.genai import types
+            content_part = types.Part.from_bytes(
+                data=Path(image_path).read_bytes(),
+                mime_type="application/pdf",
+            )
+        else:
+            content_part = Image.open(image_path)
+    except FileNotFoundError:
+        return {"error": f"파일을 찾을 수 없습니다: {image_path}"}
+    except Exception as e:
+        return {"error": f"파일 로드 실패: {e}"}
 
     try:
         response = client.models.generate_content(
             model=_model,
-            contents=[img, prompt],
+            contents=[content_part, prompt],
         )
         raw_text = response.text
         usage = response.usage_metadata
@@ -373,6 +383,14 @@ def call_vision_openai(
     try:
         path = Path(image_path)
         ext = path.suffix.lower()
+        if ext == ".pdf":
+            # OpenAI chat vision은 PDF 직접 입력을 지원하지 않는다.
+            # PDF는 VLM_PROVIDER=gemini(네이티브 PDF 처리)로 처리하거나 이미지로 변환해야 한다.
+            return {
+                "error": "OpenAI VLM 경로는 PDF 직접 입력을 지원하지 않습니다. "
+                         "PDF는 VLM_PROVIDER=gemini로 처리하세요.",
+                "model_used": _model,
+            }
         mime_map = {".jpg": "image/jpeg", ".jpeg": "image/jpeg",
                     ".png": "image/png", ".gif": "image/gif", ".webp": "image/webp"}
         media_type = mime_map.get(ext, "image/jpeg")
