@@ -16,6 +16,7 @@ import re
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from contextvars import copy_context
 from dataclasses import dataclass, field
+from threading import Lock
 
 # Qdrant 문서에 삽입된 내부 마커 — LLM 입력 및 응답에 유출되지 않도록 제거
 _LEGAL_CITE_RE = re.compile(r"\[LEGAL_CITE:[^\]]*\]\s*")
@@ -27,6 +28,11 @@ from src.agents.validator_agent.context_retriever import CategoryRetrievedContex
 from src.agents.validator_agent.parser import CategoryInputBlock, CategoryItemRow
 from src.prompts.validator_prompt import ITEM_JUDGMENT_PROMPT, ITEM_REASON_ONLY_PROMPT
 from src.repositories import LegalRulesRepository, ValidatorRuleMatch
+
+try:
+    from langchain_community.callbacks import get_openai_callback as _get_openai_callback
+except ImportError:  # pragma: no cover
+    _get_openai_callback = None  # type: ignore
 
 _PROGRESS_RULE_LAW = "별표 3 공사진척에 따른 산업안전보건관리비 사용기준"
 
@@ -57,6 +63,7 @@ class ItemRuleBundle:
     judgment_tier: str = "rdb"  # "rdb" | "llm" — 항목 판정에 사용된 계층
     reason_text: str = ""       # LLM이 생성한 사용자 표시용 사유
     qdrant_citations: list[dict] = field(default_factory=list)
+    token_usage: int = 0        # 이 항목 처리에 사용된 LLM 토큰 합계
 
     @property
     def top_allowed(self) -> ValidatorRuleMatch | None:
@@ -88,6 +95,7 @@ class CategoryRuleBundle:
     progress_required_rate: float | None = None
     progress_rule_text: str = ""
     items: list[ItemRuleBundle] = field(default_factory=list)
+    token_usage: int = 0        # 카테고리 내 전체 항목의 LLM 토큰 합계
 
 
 _AUTHORITATIVE_SOURCES = {"law_rule", "qa_rule"}  # [9] DB 기반 근거
@@ -136,6 +144,69 @@ def _has_strong_allowed_match(matches: list[ValidatorRuleMatch], category_code: 
         and m.allowed is True
         for m in matches
     )
+
+
+def _has_qa_conflict(matches: list[ValidatorRuleMatch], category_code: str) -> bool:
+    """
+    qa_rule 출처의 허용/불허 규칙이 동시에 매칭된 경우(충돌) 감지.
+
+    혼재 QA 답변을 qa_allowed/qa_disallowed로 분리 파싱하면 두 row가 동일 keyword를
+    공유하므로 같은 아이템에 동시 매칭될 수 있다.
+    law_rule 기반 disallowed는 충돌 대상에서 제외 — qa_rule끼리의 충돌만 탐지.
+    """
+    has_qa_disallowed = any(
+        m.match_source == "qa_rule"
+        and m.rule_type == "qa_disallowed"
+        and m.score >= _RDB_MATCH_SCORE_THRESHOLD
+        and m.category_code == category_code
+        for m in matches
+    )
+    has_qa_allowed = any(
+        m.match_source == "qa_rule"
+        and m.rule_type == "qa_allowed"
+        and m.score >= _RDB_MATCH_SCORE_THRESHOLD
+        and m.category_code == category_code
+        for m in matches
+    )
+    return has_qa_disallowed and has_qa_allowed
+
+
+def _build_conflict_context(
+    *,
+    matches: list[ValidatorRuleMatch],
+    category_code: str,
+    retrieved_context: str,
+) -> str:
+    """
+    qa_allowed/qa_disallowed 충돌 케이스에서 LLM에 넘길 컨텍스트를 구성한다.
+    양쪽 evidence를 명시적으로 포함해 LLM이 아이템 조건을 판단할 수 있도록 한다.
+    """
+    disallowed_match = next(
+        (
+            m for m in matches
+            if m.match_source == "qa_rule"
+            and m.rule_type == "qa_disallowed"
+            and m.category_code == category_code
+        ),
+        None,
+    )
+    allowed_match = next(
+        (
+            m for m in matches
+            if m.match_source == "qa_rule"
+            and m.rule_type == "qa_allowed"
+            and m.category_code == category_code
+        ),
+        None,
+    )
+    parts: list[str] = []
+    if disallowed_match and disallowed_match.evidence:
+        parts.append(f"[불허 조건]\n{disallowed_match.evidence}")
+    if allowed_match and allowed_match.evidence:
+        parts.append(f"[허용 조건]\n{allowed_match.evidence}")
+    if retrieved_context:
+        parts.append(f"[법령 원문 맥락]\n{retrieved_context[:1000]}")
+    return "\n\n".join(parts)
 
 
 def _select_exception_context(context_text: str, limit: int = 1500) -> str:
@@ -214,8 +285,12 @@ def _llm_item_fallback(
     except RuntimeError:
         return None, ""
 
-    # 예외/단서 조항 위주로 선별 (lost in the middle 방지)
-    law_context = _select_exception_context(retrieved_context) if retrieved_context else "(관련 법령 맥락 없음)"
+    # 구조화된 충돌 컨텍스트([불허 조건]/[허용 조건])는 이미 정제된 텍스트이므로 필터링 생략.
+    # 일반 Qdrant 원문 청크만 예외/단서 조항 위주로 선별 (lost in the middle 방지).
+    if "[불허 조건]" in retrieved_context or "[허용 조건]" in retrieved_context:
+        law_context = retrieved_context or "(관련 법령 맥락 없음)"
+    else:
+        law_context = _select_exception_context(retrieved_context) if retrieved_context else "(관련 법령 맥락 없음)"
 
     try:
         result: _ItemJudgmentLLMOutput = (
@@ -340,29 +415,54 @@ def _process_single_item(
     )
 
     # 계층 판단:
-    # 1. 강한 불허 RDB → LLM 판단 스킵, 사유만 LLM 생성
+    # 1. 강한 불허 RDB
+    #    1-a. qa_allowed도 동시 매칭(충돌) → LLM이 아이템 문맥으로 조건 판단
+    #    1-b. 충돌 없음 → 판단은 RDB, 사유만 LLM 생성
     # 2. 강한 허용 RDB → LLM 판단 스킵, 사유만 LLM 생성
     # 3. 애매함 → LLM이 판단 + 사유 동시 생성
     reason_text = ""
     qdrant_citations: list[dict] = []
 
     if _has_rdb_disallowed_match(matches, block.category_code):
-        # 강한 불허 → 판단은 RDB, 사유만 LLM
-        judgment_tier = "rdb"
-        best = next((m for m in matches if m.allowed is False and m.match_source in _AUTHORITATIVE_SOURCES), None)
-        qdrant_citations = _qdrant_citations_from_docs(
-            docs=(docs or retrieved.category_docs),
-            referenced_laws=best.referenced_laws if best else [],
-            judgment_source="qdrant_support",
-        )
-        reason_text = _llm_generate_reason_only(
-            item_text=item_text_with_remark,
-            category_name=block.category_name,
-            allowed=False,
-            rdb_evidence=best.evidence if best else "",
-            referenced_laws=best.referenced_laws if best else [],
-            retrieved_context=context_text,
-        )
+        if _has_qa_conflict(matches, block.category_code):
+            # qa_allowed/qa_disallowed 충돌 → LLM이 아이템 문맥으로 조건 판단
+            # 양쪽 evidence를 context로 제공해 LLM이 어느 케이스에 해당하는지 판단
+            conflict_context = _build_conflict_context(
+                matches=matches,
+                category_code=block.category_code,
+                retrieved_context=context_text,
+            )
+            llm_match, reason_text = _llm_item_fallback(
+                item_text=item_text_with_remark,
+                category_name=block.category_name,
+                category_code=block.category_code,
+                retrieved_context=conflict_context,
+            )
+            if llm_match is not None:
+                qdrant_citations = _qdrant_citations_from_docs(
+                    docs=(docs or retrieved.category_docs),
+                    referenced_laws=llm_match.referenced_laws,
+                    judgment_source="llm_fallback",
+                )
+                matches = [llm_match] + matches
+            judgment_tier = "llm"
+        else:
+            # 충돌 없는 불허 → 판단은 RDB, 사유만 LLM
+            judgment_tier = "rdb"
+            best = next((m for m in matches if m.allowed is False and m.match_source in _AUTHORITATIVE_SOURCES), None)
+            qdrant_citations = _qdrant_citations_from_docs(
+                docs=(docs or retrieved.category_docs),
+                referenced_laws=best.referenced_laws if best else [],
+                judgment_source="qdrant_support",
+            )
+            reason_text = _llm_generate_reason_only(
+                item_text=item_text_with_remark,
+                category_name=block.category_name,
+                allowed=False,
+                rdb_evidence=best.evidence if best else "",
+                referenced_laws=best.referenced_laws if best else [],
+                retrieved_context=context_text,
+            )
     elif _has_strong_allowed_match(matches, block.category_code):
         # 강한 허용 → 판단은 RDB, 사유만 LLM
         judgment_tier = "rdb"
@@ -425,24 +525,35 @@ def match_category_rules(
     n_workers = min(max(len(block.items), 1), 2)
     item_bundles: list[ItemRuleBundle] = [None] * len(block.items)  # type: ignore[list-item]
 
-    # copy_context()로 get_openai_callback ContextVar를 스레드에 전파한다.
-    # 미전파 시 _llm_generate_reason_only / _llm_item_fallback 호출 토큰이
-    # 외부 콜백(orchestrator)에 집계되지 않아 token=0으로 잘못 기록된다.
+    # 항목별로 독립적인 get_openai_callback()을 사용해 LLM 토큰을 명시적으로 집계한다.
+    # ContextVar 전파(copy_context)에 의존하면 중첩 스레드 구조에서 outer_cb가
+    # 0을 캡처하는 문제가 발생할 수 있으므로, per-thread 방식으로 전환한다.
+    category_token_total = 0
+    token_lock = Lock()
+
+    def _run_item(idx: int, item: "CategoryItemRow") -> None:
+        nonlocal category_token_total
+        if _get_openai_callback is not None:
+            with _get_openai_callback() as cb:
+                bundle = _process_single_item(
+                    item=item, block=block, retrieved=retrieved, rules_repo=rules_repo
+                )
+            bundle.token_usage = cb.total_tokens
+            with token_lock:
+                category_token_total += cb.total_tokens
+        else:
+            bundle = _process_single_item(
+                item=item, block=block, retrieved=retrieved, rules_repo=rules_repo
+            )
+        item_bundles[idx] = bundle
+
     with ThreadPoolExecutor(max_workers=n_workers) as executor:
         future_to_idx = {
-            executor.submit(
-                copy_context().run,
-                _process_single_item,
-                item=item,
-                block=block,
-                retrieved=retrieved,
-                rules_repo=rules_repo,
-            ): idx
+            executor.submit(_run_item, idx, item): idx
             for idx, item in enumerate(block.items)
         }
         for future in as_completed(future_to_idx):
-            idx = future_to_idx[future]
-            item_bundles[idx] = future.result()
+            future.result()  # 예외 전파
 
     return CategoryRuleBundle(
         category_code=block.category_code,
@@ -454,4 +565,5 @@ def match_category_rules(
         progress_required_rate=progress_required_rate,
         progress_rule_text=progress_rule_text,
         items=item_bundles,
+        token_usage=category_token_total,
     )
