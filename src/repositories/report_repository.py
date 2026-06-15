@@ -253,6 +253,9 @@ def _group_agent_logs_by_item(rows: list[dict]) -> dict[int, list[dict]]:
 
 
 def _agent_log_result_code(row: dict[str, Any], item_details: dict[str, Any]) -> str:
+    if row.get("agent_type_code") == "safety-doc":
+        return _safety_doc_result_code(row, item_details)
+
     if row.get("agent_type_code") != "legal":
         return str(row.get("result_code") or "success")
 
@@ -262,6 +265,43 @@ def _agent_log_result_code(row: dict[str, Any], item_details: dict[str, Any]) ->
     if status == "부적정":
         return "inappropriate"
     return "needs_review"
+
+
+def _safety_doc_result_code(row: dict[str, Any], item_details: dict[str, Any]) -> str:
+    evidence_status = _safety_doc_evidence_status(item_details)
+    if evidence_status in {"OK", "PASS", "SUCCESS", "APPROPRIATE", "SATISFIED"}:
+        return "appropriate"
+    if evidence_status in {"MISSING", "HIL", "REVIEW_REQUIRED", "NEEDS_REVIEW", "UNSATISFIED"}:
+        return "needs_review"
+    if evidence_status in {"FAIL", "FAILED", "ERROR", "INAPPROPRIATE"}:
+        return "inappropriate"
+
+    missing_evidences = item_details.get("missing_evidences")
+    if not isinstance(missing_evidences, list):
+        result = item_details.get("result")
+        if isinstance(result, dict):
+            result_evidence_status = result.get("evidence_status")
+            if isinstance(result_evidence_status, dict):
+                missing_evidences = result_evidence_status.get("missing_evidences")
+    if isinstance(missing_evidences, list):
+        return "needs_review" if missing_evidences else "appropriate"
+
+    return "needs_review" if str(row.get("result_code") or "").strip().lower() in {"hil", "needs_review", "warning"} else "success"
+
+
+def _safety_doc_evidence_status(item_details: dict[str, Any]) -> str:
+    for container in (item_details, item_details.get("result")):
+        if not isinstance(container, dict):
+            continue
+        evidence_status = container.get("evidence_status")
+        if isinstance(evidence_status, dict):
+            status = evidence_status.get("status")
+            if status is not None:
+                return str(status).strip().upper()
+        status = container.get("status") or container.get("result_code")
+        if status is not None:
+            return str(status).strip().upper()
+    return ""
 
 
 def _first_legal_status_value(row: dict[str, Any], item_details: dict[str, Any]) -> str:

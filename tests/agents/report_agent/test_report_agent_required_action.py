@@ -26,6 +26,72 @@ def _long_overall_opinion() -> str:
     )
 
 
+def _report_item(
+    *,
+    item_id: int,
+    validation_logs: list[ValidationLogContext],
+) -> UsageStatementItemContext:
+    return UsageStatementItemContext(
+        id=item_id,
+        category_code="CAT_03",
+        category_name="보호구 등",
+        used_on=date(2026, 6, 9),
+        item_name="안전모 (ABS 산업용)",
+        quantity=Decimal("20"),
+        unit_price=Decimal("30000"),
+        total_amount=Decimal("600000"),
+        page_no=1,
+        validation_logs=validation_logs,
+        legal_validation_result=LegalValidationResultContext(
+            category_code="CAT_03",
+            status="적절",
+            reason="법령상 사용 가능한 항목입니다.",
+        ),
+    )
+
+
+def test_report_agent_does_not_downgrade_item_for_unknown_validation_log_code():
+    agent = ReportAgent(llm_client=lambda task_name, payload: {})
+    item = _report_item(
+        item_id=14,
+        validation_logs=[
+            ValidationLogContext(
+                id=1,
+                validation_type_code="safety-doc",
+                result_code="unexpected_code",
+                details={"reason": "원본 로그 사유"},
+                created_at=datetime(2026, 6, 13, 9, 0, 0),
+            )
+        ],
+    )
+
+    review = agent._build_item_review(1, item)
+
+    assert review.decision == "appropriate"
+    assert review.summary_reason == "법령상 사용 가능한 항목입니다."
+
+
+def test_report_agent_treats_hil_validation_log_as_needs_review():
+    agent = ReportAgent(llm_client=lambda task_name, payload: {})
+    item = _report_item(
+        item_id=14,
+        validation_logs=[
+            ValidationLogContext(
+                id=1,
+                validation_type_code="safety-doc",
+                result_code="hil",
+                details={"reason": "필수 증빙 누락: 보호구 착용 상태 사진"},
+                created_at=datetime(2026, 6, 13, 9, 0, 0),
+            )
+        ],
+    )
+
+    review = agent._build_item_review(1, item)
+
+    assert review.decision == "needs_review"
+    assert review.summary_reason == "필수 증빙 누락: 보호구 착용 상태 사진"
+
+
 def test_report_agent_generates_required_action_when_source_action_is_missing():
     def fake_llm(task_name: str, payload: dict) -> dict:
         issue = payload["draft"]["issue_details"][0]

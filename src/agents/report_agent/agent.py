@@ -44,9 +44,15 @@ RESULT_TO_DECISION: dict[str, DecisionCode] = {
     "success": "appropriate",
     "warning": "needs_review",
     "needs_review": "needs_review",
+    "needsreview": "needs_review",
     "conditional": "needs_review",
+    "hil": "needs_review",
+    "human_in_loop": "needs_review",
+    "review_required": "needs_review",
     "error": "inappropriate",
     "fail": "inappropriate",
+    "failed": "inappropriate",
+    "failure": "inappropriate",
     "inappropriate": "inappropriate",
     "적정": "appropriate",
     "적절": "appropriate",
@@ -176,6 +182,7 @@ class ReportAgent:
     def _build_item_review(self, no: int, item) -> ItemReviewDraft:
         worst_result = "ok"
         reasons: list[str] = []
+        issue_reasons: list[str] = []
 
         # 분류/법령 agent가 이미 판단한 결과이므로 여기서는 그대로 보고서 판정에 반영합니다.
         if item.classification_result:
@@ -192,23 +199,37 @@ class ReportAgent:
                 worst_result = "needs_review"
             if item.legal_validation_result.reason:
                 reasons.append(item.legal_validation_result.reason)
+                if decision != "appropriate":
+                    issue_reasons.append(item.legal_validation_result.reason)
 
         for log in item.validation_logs:
-            decision = RESULT_TO_DECISION.get(log.result_code, "needs_review")
+            decision = self._validation_log_decision(log.result_code)
+            if decision is None:
+                continue
             if decision == "inappropriate":
                 worst_result = "inappropriate"
             elif decision == "needs_review" and worst_result != "inappropriate":
                 worst_result = "needs_review"
             summary = log.details.get("summary") or log.details.get("reason")
-            if summary:
+            if decision != "appropriate" and summary:
+                issue_reasons.append(str(summary))
                 reasons.append(str(summary))
 
         missing = [req.evidence_type_code for req in item.evidence_requirements if not req.is_satisfied]
-        if missing and worst_result == "appropriate":
+        if missing and worst_result != "inappropriate":
             worst_result = "needs_review"
-            reasons.append(f"필수 증빙 미충족: {', '.join(map(str, missing))}")
+            reason = f"필수 증빙 미충족: {', '.join(map(str, missing))}"
+            issue_reasons.append(reason)
+            reasons.append(reason)
 
         decision = RESULT_TO_DECISION.get(worst_result, "appropriate")
+        summary_reason = (
+            issue_reasons[0]
+            if decision != "appropriate" and issue_reasons
+            else reasons[0]
+            if reasons
+            else "제출 증빙과 사용내역서 기준 검토 결과 특이사항 없음"
+        )
         return ItemReviewDraft(
             no=no,
             usage_statement_item_id=item.id,
@@ -217,9 +238,15 @@ class ReportAgent:
             amount=item.total_amount,
             decision=decision,
             decision_label=DECISION_LABEL[decision],
-            summary_reason=reasons[0] if reasons else "제출 증빙과 사용내역서 기준 검토 결과 특이사항 없음",
+            summary_reason=summary_reason,
             risk_level="high" if decision == "inappropriate" else "medium" if decision == "needs_review" else "low",
         )
+
+    def _validation_log_decision(self, result_code: str | None) -> DecisionCode | None:
+        normalized = str(result_code or "").strip().lower()
+        if not normalized:
+            return None
+        return RESULT_TO_DECISION.get(normalized)
 
     def _build_issues(self, item_reviews: list[ItemReviewDraft], context: ReportContext) -> list[IssueDetailDraft]:
         items_by_id = {item.id: item for item in context.items}
