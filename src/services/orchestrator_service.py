@@ -788,19 +788,13 @@ def _run_link_agent(
             todo_context = item_contexts.get(item_id, {})
             item_name = _first_string([todo_context.get("usage_statement_item_name")])
             status_text = str(row.get("match_status") or "review_needed")
-            status_label = {
-                "review_needed": "검토 필요",
-                "unmatched": "매칭 실패",
-                "rejected": "반려",
-            }.get(status_text, status_text)
-            reason_prefix = f"{item_name} 증빙 매칭 검토 필요" if item_name else "증빙 매칭 검토 필요"
             todos.append(
                 {
                     "usage_statement_item_id": item_id,
                     **todo_context,
                     "title": "증빙 매칭 검토",
                     "match_status": status_text,
-                    "reason": f"{reason_prefix}: {status_label}",
+                    "reason": _link_todo_reason(item_name, status_text, row),
                 }
             )
         upsert_agent_log(
@@ -845,8 +839,82 @@ def _int_or_none(value: Any) -> int | None:
         return None
 
 
+def _float_or_none(value: Any) -> float | None:
+    if value is None:
+        return None
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
 def _dict_or_empty(value: Any) -> dict[str, Any]:
     return value if isinstance(value, dict) else {}
+
+
+_LINK_MATCH_STATUS_LABELS = {
+    "review_needed": "검토 필요",
+    "unmatched": "매칭 실패",
+    "rejected": "반려",
+}
+
+
+def _link_todo_reason(
+    item_name: str | None,
+    status_text: str,
+    row: dict[str, Any],
+) -> str:
+    subject = f"{item_name} 증빙 매칭" if item_name else "증빙 매칭"
+    status_label = _LINK_MATCH_STATUS_LABELS.get(status_text, status_text)
+    detail = _link_todo_detail(row)
+    detail_suffix = f" ({detail})" if detail else ""
+    return f"{subject}: {status_label}{detail_suffix}"
+
+
+def _link_todo_detail(row: dict[str, Any]) -> str | None:
+    reject_reason = _first_string(
+        [
+            row.get("reject_reason"),
+            row.get("rejectReason"),
+            row.get("rejection_reason"),
+        ]
+    )
+    if reject_reason:
+        return reject_reason
+
+    similarity_score = _float_or_none(
+        row.get("similarity_score")
+        if row.get("similarity_score") is not None
+        else row.get("similarityScore")
+    )
+    if similarity_score is not None:
+        return f"유사도 {similarity_score:.2f}"
+
+    component_detail = _link_component_score_detail(
+        _as_dict(row.get("component_scores"))
+        or _as_dict(row.get("componentScores"))
+    )
+    return component_detail
+
+
+def _link_component_score_detail(component_scores: dict[str, Any]) -> str | None:
+    score_labels = {
+        "date": "날짜",
+        "amount": "금액",
+        "vendor": "거래처",
+        "item_desc": "품목",
+        "item_description": "품목",
+    }
+    scored_components: list[tuple[str, float]] = []
+    for key, value in component_scores.items():
+        score = _float_or_none(value)
+        if score is not None:
+            scored_components.append((str(key), score))
+    if not scored_components:
+        return None
+    lowest_key, lowest_score = min(scored_components, key=lambda item: item[1])
+    label = score_labels.get(lowest_key, lowest_key)
+    return f"{label} 유사도 {lowest_score:.2f}"
 
 
 _FALLBACK_EVIDENCE_TYPE_NAMES = {
