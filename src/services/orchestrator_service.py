@@ -888,13 +888,29 @@ def _link_todo_detail(row: dict[str, Any]) -> str | None:
     if reject_reason:
         return reject_reason
 
-    # 하드 게이트(날짜·금액·업체명) 실패로 강제 unmatched된 경우, 유사도가 높아도
-    # "매칭 실패"가 된다. 이때는 유사도가 아니라 실제 실패 사유(게이트)를 보여줘야
-    # 사용자가 "유사도 1.00인데 왜 실패?" 하고 혼란스럽지 않다.
+    # 하드 게이트(날짜·금액·업체명) 실패로 강제 unmatched된 경우의 사유 표시.
     gate_failed = row.get("gate_failed")
     if gate_failed is None:
         gate_failed = row.get("gateFailed")
     if isinstance(gate_failed, list) and gate_failed:
+        # 매칭은 프로젝트의 모든 영수증을 후보로 비교하므로, 해당 항목에 맞는 증빙이
+        # 아예 없으면 엉뚱한(품목이 다른) 영수증이 최근접 후보로 잡혀 "금액 X% 차이"가
+        # 표시된다. 이는 사용자에게 오해를 준다.
+        #   - 품목 유사도가 낮거나(다른 품목) 비교할 영수증이 없으면 → "증빙 미업로드" 안내
+        #   - 품목은 맞는데 금액/날짜/업체만 어긋나면 → 실제 게이트 사유 표시
+        component = (
+            _as_dict(row.get("component_scores"))
+            or _as_dict(row.get("componentScores"))
+        )
+        item_sim = _float_or_none(
+            component.get("item_desc")
+            if component.get("item_desc") is not None
+            else component.get("item_description")
+        )
+        no_receipt = any("영수증 없음" in str(g) for g in gate_failed)
+        item_irrelevant = item_sim is not None and item_sim < 0.4
+        if no_receipt or item_irrelevant:
+            return "매칭되는 증빙 없음 — 증빙 업로드 필요"
         return "; ".join(str(g) for g in gate_failed[:2])
 
     similarity_score = _float_or_none(
