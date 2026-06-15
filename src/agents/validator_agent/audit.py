@@ -68,6 +68,24 @@ _CONDITIONAL_EXCLUSION_PATTERNS = (
     re.compile(r"등에서"),               # 특정 공사/상황 예시 한정
     re.compile(r"외의"),                 # 특정 대상 외 범위 한정
 )
+# LLM reason_text 전용 조건부 힌트 패턴.
+# _CONDITIONAL_EXCLUSION_PATTERNS은 RDB evidence용이므로 오탐 방지를 위해 분리.
+# LLM이 "조건을 충족해야 함", "인증 여부 확인" 등을 언급하면 확정 불허가 아닌
+# 조건부 불허로 완화한다 → "다만 인증/조건 확인 필요" 사유 생성.
+_LLM_CONDITIONAL_HINT_PATTERNS = (
+    re.compile(r"조건을\s*충족"),          # "특정 조건을 충족해야 하며"
+    re.compile(r"충족해야"),               # "충족해야 한다/하며"
+    re.compile(r"인증을\s*받"),            # "안전인증을 받은 경우에만"
+    re.compile(r"안전인증"),               # "안전인증 여부 확인 필요"
+    re.compile(r"인증\s*여부"),            # "인증 여부 확인"
+    re.compile(r"여부를\s*확인"),          # "해당 여부를 확인"
+    re.compile(r"해당\s*여부"),            # "조건 해당 여부"
+    re.compile(r"가능성이\s*있"),          # "해당할 가능성이 있어" — LLM 불확실 표현
+    re.compile(r"해당할\s*가능"),          # "이 조항에 해당할 가능성"
+    re.compile(r"확인이\s*필요"),          # "확인이 필요합니다"
+    re.compile(r"판단하기\s*어렵"),        # "판단하기 어렵습니다"
+)
+
 # RDB 기반 출처만 운영상 허용 처리 대상.
 _RDB_SOURCES = frozenset({"law_rule", "qa_rule"})
 
@@ -149,6 +167,7 @@ def decide_category(
         required_used_amount=computation.required_used_amount,
         cumulative_used_amount=computation.cumulative_used_amount,
         usage_shortfall_amount=computation.usage_shortfall_amount,
+        token_usage=rule_bundle.token_usage,
     )
 
 
@@ -282,10 +301,19 @@ def _build_item_judgment(bundle: ItemRuleBundle, *, category_name: str) -> ItemJ
     llm_disallowed_is_conditional = (
         disallowed is not None
         and getattr(disallowed, "match_source", "") == "llm_fallback"
-        and _has_condition_limited_text(bundle.reason_text)
+        and (
+            # ① LLM reason_text에 조건부 언어 포함 (충족해야, 안전인증, 가능성 등)
+            _has_condition_limited_text(bundle.reason_text)
+            # ② RDB 허용 매치가 존재하는데 LLM이 오버라이드하는 경우:
+            #    RDB(법령/QA)는 일반 허용 신호를 줬지만 LLM이 불허 → 확정 불허로 보기 어려움.
+            #    LLM이 RDB보다 권위 있는 출처가 아니므로 조건부 완화.
+            or allowed is not None
+        )
     )
 
-    if disallowed_is_conditional:
+    if disallowed_is_conditional or llm_disallowed_is_conditional:
+        # 조건부 불허(RDB) 또는 LLM이 조건부 언어("충족해야", "안전인증" 등)로 불허 판단 →
+        # 확정 불허가 아닌 "허용 + 다만 확인 필요"로 완화한다.
         item_allowed = True
     else:
         item_allowed = bool(allowed and (not disallowed or allowed.score >= disallowed.score))
@@ -396,6 +424,22 @@ def _conditional_reason_text(
 
     item_label = _subject_marker(item_name) if item_name else "해당 항목은"
 
+    # LLM이 조건부 언어("충족해야", "안전인증" 등)로 불허 판단했지만
+    # 항목 자체는 허용으로 완화된 경우 → "집행 가능. 다만, 인증·조건 확인 필요" 사유
+    if llm_disallowed_is_conditional and item_allowed:
+        if _looks_like_traffic_safety_condition(fallback):
+            return (
+                f"{law_prefix}{item_label} 산안비 집행 가능 항목으로 봅니다. "
+                "다만, 도로 확·포장공사, 관로공사, 도심지 공사 등에서 "
+                "공사차량 외의 차량 유도ㆍ안내ㆍ주의ㆍ경고 목적의 교통안전시설물로 "
+                "사용되는 경우에는 집행 제외 대상이 될 수 있어 용도 확인이 필요합니다."
+            )
+        return (
+            f"{law_prefix}{item_label} 산안비 집행 가능 항목으로 봅니다. "
+            "다만, 법령상 허용 요건(안전인증 등)을 충족하는 제품·용도인지 확인이 필요합니다."
+        )
+
+    # 기존: llm_disallowed_is_conditional이었으나 item_allowed=False인 레거시 경로 (도달 불가)
     if llm_disallowed_is_conditional and not item_allowed:
         if _looks_like_traffic_safety_condition(fallback):
             return (
@@ -653,17 +697,35 @@ def _is_conditional_exclusion(match) -> bool:
 
     LLM이 생성한 불허 판단(llm_fallback 등)은 자연어 단문 형태이므로
     오탐 방지를 위해 RDB 출처(law_rule / qa_rule)만 대상으로 한다.
+
+    qa_rule split에서 나온 qa_disallowed 규칙은 원래 "A는 불가하나, B는 가능" 구조를
+    분리한 것이므로, "이나,"로 끝나는 evidence는 조건부 불허로 취급한다.
     """
     if getattr(match, "match_source", "") not in _RDB_SOURCES:
         return False  # LLM 불허 판단은 항상 확정으로 취급
     evidence = match.evidence or ""
-    return any(pattern.search(evidence) for pattern in _CONDITIONAL_EXCLUSION_PATTERNS)
+    if any(pattern.search(evidence) for pattern in _CONDITIONAL_EXCLUSION_PATTERNS):
+        return True
+    # qa_rule split disallowed: "불가할 것이나," 형태 → 조건부 불허
+    if (
+        getattr(match, "match_source", "") == "qa_rule"
+        and getattr(match, "rule_type", "") == "qa_disallowed"
+        and re.search(r"이나[,\s]?\s*$", evidence.strip())
+    ):
+        return True
+    return False
 
 
 def _has_condition_limited_text(text: str) -> bool:
+    """LLM reason_text에 조건부 불허 힌트가 있는지 확인한다.
+
+    _CONDITIONAL_EXCLUSION_PATTERNS (RDB evidence용) 외에
+    LLM 출력에서 자주 나오는 "조건을 충족해야", "안전인증" 등도 감지한다.
+    """
     if not text:
         return False
-    return any(pattern.search(text) for pattern in _CONDITIONAL_EXCLUSION_PATTERNS)
+    return any(pattern.search(text) for pattern in _CONDITIONAL_EXCLUSION_PATTERNS) or \
+           any(pattern.search(text) for pattern in _LLM_CONDITIONAL_HINT_PATTERNS)
 
 
 def _has_duplicate_cost_risk(bundle: ItemRuleBundle) -> bool:

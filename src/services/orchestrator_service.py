@@ -1285,13 +1285,11 @@ def _run_legal_agent(
 
     try:
         document, category_rows = _build_validator_document(project_id, usage_statement_id)
-        if get_openai_callback is not None:
-            with get_openai_callback() as _legal_cb:
-                audit_response = validate_usage_statement(document=document)
-            _legal_usage = {"input_tokens": _legal_cb.prompt_tokens, "output_tokens": _legal_cb.completion_tokens}
-        else:
-            audit_response = validate_usage_statement(document=document)
-            _legal_usage = {"input_tokens": None, "output_tokens": None}
+        # 토큰 집계는 per-thread get_openai_callback()으로 처리되며
+        # AuditResponse.total_token_usage에 합산된다. 외부 콜백 래퍼 불필요.
+        audit_response = validate_usage_statement(document=document)
+        _legal_token_total = audit_response.total_token_usage
+        _legal_usage = {"input_tokens": _legal_token_total or None, "output_tokens": None}
         summary_response = summarize_audit_response(
             response=audit_response,
             usage_statement_id=usage_statement_id,
@@ -1318,7 +1316,7 @@ def _run_legal_agent(
             for row in item_results
             if row["status"] != "적절"
         ]
-        _legal_token = (_legal_usage["input_tokens"] or 0) + (_legal_usage["output_tokens"] or 0)
+        _legal_token = _legal_token_total
         upsert_agent_log(
             project_id=project_id,
             usage_statement_id=usage_statement_id,
@@ -1345,8 +1343,8 @@ def _run_legal_agent(
             agent_type_code="legal",
             model_name=_openai_model_name(),
             token=_legal_token,
-            input_tokens=_legal_usage["input_tokens"],
-            output_tokens=_legal_usage["output_tokens"],
+            input_tokens=None,
+            output_tokens=None,
             requested_by_user_id=she_user_id,
         )
         return {
