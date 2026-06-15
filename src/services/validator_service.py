@@ -40,6 +40,7 @@ import logging
 import re
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from contextvars import copy_context
+from threading import Lock
 from typing import Any
 
 try:
@@ -112,13 +113,14 @@ def validate_usage_statement_service(
 ) -> AuditResponse:
     parsed = parse_usage_statement(document)
 
-    # get_openai_callback은 호출부(orchestrator)에서 래핑한다.
-    # 여기서 중첩 래핑 시 copy_context()가 inner_cb를 복사해
-    # outer_cb(orchestrator)가 0을 캡처하는 문제가 발생하므로 제거.
+    # 토큰 집계는 _validate_blocks 내부에서 per-thread get_openai_callback()으로 처리한다.
+    # match_category_rules도 동일하게 per-thread 방식으로 집계하므로
+    # 중첩 ThreadPoolExecutor 구조에서 토큰 누락이 발생하지 않는다.
+    token_bucket: dict[str, int] = {"total": 0}
     response = _validate_blocks(
-        parsed.base_amount, parsed.blocks, collection=collection
+        parsed.base_amount, parsed.blocks, collection=collection, token_bucket=token_bucket
     )
-    total_tokens: int | None = None
+    total_tokens: int | None = token_bucket["total"] or None
 
     if project_id is not None and usage_statement_id is not None:
         _write_legal_agent_log(
@@ -494,7 +496,13 @@ def _item_details(item, result: "CategoryAuditResult") -> dict:
 # ── 카테고리 검증 실행 ────────────────────────────────────────────────────────
 
 
-def _validate_blocks(base_amount: float, blocks, *, collection: str) -> AuditResponse:
+def _validate_blocks(
+    base_amount: float,
+    blocks,
+    *,
+    collection: str,
+    token_bucket: dict[str, int] | None = None,
+) -> AuditResponse:
     # 공정률 shortfall은 전체 카테고리 누적합 기준으로 판단한다.
     total_cumulative_used_amount: float | None = None
     for block in blocks:
@@ -507,22 +515,28 @@ def _validate_blocks(base_amount: float, blocks, *, collection: str) -> AuditRes
             v = 0.0
         total_cumulative_used_amount = (total_cumulative_used_amount or 0.0) + v
 
+    # 카테고리별 토큰은 match_category_rules의 CategoryRuleBundle.token_usage에 집계된다.
+    # 카테고리 스레드는 copy_context() 없이 독립 실행하고, 토큰 합계는 token_bucket으로 전달.
     results: dict[str, CategoryAuditResult] = {}
+    token_lock = Lock()
+
+    def _run_category(block) -> CategoryAuditResult:
+        result = _validate_category_block(block, collection, total_cumulative_used_amount)
+        if token_bucket is not None:
+            with token_lock:
+                token_bucket["total"] += result.token_usage
+        return result
+
     with ThreadPoolExecutor(max_workers=min(max(len(blocks), 1), 2)) as executor:
         futures = {
-            executor.submit(
-                copy_context().run,
-                _validate_category_block,
-                block,
-                collection,
-                total_cumulative_used_amount,
-            ): block.category_name
+            executor.submit(_run_category, block): block.category_name
             for block in blocks
         }
         for future in as_completed(futures):
             category_name = futures[future]
             results[category_name] = future.result()
-    return AuditResponse(base_amount=base_amount, categories=results)
+    total_token = token_bucket["total"] if token_bucket is not None else 0
+    return AuditResponse(base_amount=base_amount, categories=results, total_token_usage=total_token)
 
 
 def _validate_category_block(

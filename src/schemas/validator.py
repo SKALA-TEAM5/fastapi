@@ -93,11 +93,13 @@ class CategoryAuditResult(BaseModel):
     usage_shortfall_amount: Optional[float] = Field(
         default=None, description="공정률 기준 부족액 (원)"
     )
+    token_usage: int = Field(default=0, description="이 카테고리 처리에 사용된 LLM 토큰 합계")
 
 
 class AuditResponse(BaseModel):
     base_amount: float
     categories: dict[str, CategoryAuditResult]
+    total_token_usage: int = Field(default=0, description="전체 카테고리 LLM 토큰 합계")
 
 
 class _KoreanAliasModel(BaseModel):
