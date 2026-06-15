@@ -57,12 +57,19 @@ from src.repositories.db import get_connection
 from src.repositories.usage_statement_pipeline_repository import (
     _from_category_code,
     get_files_by_ids,
+    get_project_by_id,
     insert_agent_log,
     insert_usage_statement,
     insert_usage_statement_items,
     insert_usage_statement_summaries,
     update_agent_log_status,
     update_file_status,
+)
+from src.services.usage_statement_validation import (
+    UsageStatementValidationError,  # re-export: 라우터에서 import
+    resolve_report_month,
+    to_report_month,
+    validate_usage_against_project,
 )
 from src.services.matching_service_monthly import (
     THRESHOLD_MATCHED,
@@ -282,13 +289,19 @@ def _complete_classifier_log(
 # ─────────────────────────────────────────────────────────────
 
 
-def parse_usage_statement(usage_file_id: int) -> dict[str, Any]:
+def parse_usage_statement(
+    usage_file_id: int,
+    target_year: int | None = None,
+    target_month: int | None = None,
+) -> dict[str, Any]:
     """
     사용내역서 PDF를 파싱하고 DB에 저장한다.
     Spring이 파일 업로드 직후 즉시 호출한다.
 
     Args:
         usage_file_id : 사용내역서 파일의 files.id (DB PK)
+        target_year   : 화면에서 선택한 연도(슬롯). 주어지면 파싱 연월과 일치 검증.
+        target_month  : 화면에서 선택한 월(슬롯). target_year와 함께 사용.
 
     Returns:
         {
@@ -301,6 +314,7 @@ def parse_usage_statement(usage_file_id: int) -> dict[str, Any]:
     Raises:
         ValueError : 파일을 찾을 수 없는 경우
         RuntimeError: 파싱 실패 또는 S3 접근 오류
+        UsageStatementValidationError : 선택 월 불일치·공사기간 이탈·공사명 불일치
     """
     start = time.time()
     tmp_paths: list[str] = []
@@ -334,6 +348,26 @@ def parse_usage_statement(usage_file_id: int) -> dict[str, Any]:
 
             if parsed_usage.get("parse_status") == "FAILED":
                 raise RuntimeError("사용내역서 파싱 실패 (FAILED)")
+
+            # ── 제약 검증 (선택 월·공사기간·공사명) ────────────────────────
+            # 슬롯 생성 전에 검증한다. 실패 시 UsageStatementValidationError 를
+            # 던지고, 아래 어떤 DB 쓰기도(classifier 로그/usage_statement/items)
+            # 실행되지 않으므로 슬롯이 생성되지 않는다.
+            project = get_project_by_id(conn, project_id)
+            report_month = resolve_report_month(parsed_usage)
+            expected_report_month = None
+            if target_year is not None and target_month is not None:
+                expected_report_month = to_report_month(target_year, target_month)
+                if expected_report_month is None:
+                    raise UsageStatementValidationError(
+                        f"선택한 연월이 올바르지 않습니다 (year={target_year}, month={target_month})."
+                    )
+            validate_usage_against_project(
+                report_month=report_month,
+                project=project,
+                parsed_usage=parsed_usage,
+                expected_report_month=expected_report_month,
+            )
 
             with get_connection() as classifier_log_conn:
                 classifier_log_id = insert_agent_log(

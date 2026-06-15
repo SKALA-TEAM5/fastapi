@@ -82,13 +82,17 @@ _VISION_ALLOWED_CATEGORY_CODES: set[str] | None = {"CAT_02", "CAT_03"}
 
 
 @track_agent_run("classi")
-def parse_and_classify_usage_statement(file_id: int) -> OrchestratorActionResponse:
+def parse_and_classify_usage_statement(
+    file_id: int,
+    target_year: int | None = None,
+    target_month: int | None = None,
+) -> OrchestratorActionResponse:
     if get_openai_callback is not None:
         with get_openai_callback() as _classi_cb:
-            result = parse_usage_statement(file_id)
+            result = parse_usage_statement(file_id, target_year, target_month)
         _classi_usage = {"input_tokens": _classi_cb.prompt_tokens, "output_tokens": _classi_cb.completion_tokens}
     else:
-        result = parse_usage_statement(file_id)
+        result = parse_usage_statement(file_id, target_year, target_month)
         _classi_usage = {"input_tokens": None, "output_tokens": None}
     usage_statement_id = _int_or_none(result.get("usage_statement_id"))
     project_id = _int_or_none(result.get("project_id"))

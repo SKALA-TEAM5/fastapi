@@ -33,6 +33,7 @@ from src.services.orchestrator_service import (
     run_legal_review,
     run_report_draft,
 )
+from src.services.usage_statement_validation import UsageStatementValidationError
 
 
 router = APIRouter(prefix="/orchestrator", tags=["Orchestrator"])
@@ -45,7 +46,18 @@ router = APIRouter(prefix="/orchestrator", tags=["Orchestrator"])
 )
 async def parse_usage_statement(request: UsageStatementParseRequest) -> OrchestratorActionResponse:
     try:
-        return parse_and_classify_usage_statement(request.file_id)
+        return parse_and_classify_usage_statement(
+            request.file_id,
+            request.report_year,
+            request.report_month,
+        )
+    except UsageStatementValidationError as exc:
+        # 입력 연/월 불일치·공사기간 이탈·공사명 불일치 → 슬롯 미생성, 등록 거부.
+        # detail은 백엔드 extractMessage가 읽을 수 있도록 한국어 평문 문자열로 전달.
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=str(exc),
+        ) from exc
     except Exception as exc:
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,

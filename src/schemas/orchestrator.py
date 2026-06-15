@@ -20,6 +20,16 @@ from pydantic import AliasChoices, BaseModel, Field
 
 class UsageStatementParseRequest(BaseModel):
     file_id: int = Field(..., description="files.id. uploaded_evidence_type_code=usage_statement인 파일")
+    report_year: int = Field(
+        ...,
+        description="사용자가 입력한 사용내역서 보고 연도. OCR 인식 연월과 대조해 불일치 시 409 거부.",
+    )
+    report_month: int = Field(
+        ...,
+        ge=1,
+        le=12,
+        description="사용자가 입력한 사용내역서 보고 월(1~12). report_year와 함께 OCR 인식 연월과 대조.",
+    )
 
 
 class UsageStatementClassifyRequest(BaseModel):
