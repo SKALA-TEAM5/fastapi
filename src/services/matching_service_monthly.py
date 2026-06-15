@@ -488,11 +488,28 @@ def _normalize_usage_item(item: dict) -> dict:
 # 3. 반려 조건 검사
 # ══════════════════════════════════════════════════════════════
 
+# 문서 유형별 한국어 라벨 (반려 사유 문구 분기용)
+_DOC_TYPE_LABELS = {
+    "receipt":              "영수증",
+    "delivery_statement":   "거래명세표",
+    "transaction_statement": "거래명세표",
+    "tax_invoice":          "세금계산서",
+    "wage_statement":       "임금명세서",
+}
+
+
+def _doc_label(receipt: dict) -> str:
+    """매칭된 증빙 문서 유형의 한국어 라벨을 반환한다(기본: 증빙)."""
+    return _DOC_TYPE_LABELS.get(receipt.get("doc_type"), "증빙")
+
+
 def _check_rejection(usage_item: dict, receipt: dict) -> Optional[str]:
     """
-    반려(rejected) 조건 검사.
-    1. 영수증 OCR 인식 실패
-    2. 영수증에 품목명이 하나도 없음 (임금명세서는 면제)
+    반려(rejected) 조건 검사. 사유 문구는 매칭된 증빙의 문서 유형에 맞게 분기한다.
+    1. 증빙 OCR 인식 실패
+    2. 증빙에 품목명이 하나도 없음 (임금명세서는 면제)
+       - 세금계산서: 품목 내역이 없어 매칭 불가 → 거래명세표/영수증 증빙 필요
+       - 영수증·거래명세표: 품목 인식 실패 → 재제출 필요
     3. 사용내역서 항목에 설명이 없음
 
     [임금명세서 면제 이유]
@@ -500,10 +517,12 @@ def _check_rejection(usage_item: dict, receipt: dict) -> Optional[str]:
     items가 빈 배열인 것이 구조적으로 정상이다. Gate 3(업체명)과 동일하게
     품목명 검사도 면제한다.
     """
+    label = _doc_label(receipt)
+
     infer = receipt.get("infer_result", "")
     if infer not in ("SUCCESS", ""):
         if infer:
-            return f"영수증 OCR 인식 실패 (상태: {infer})"
+            return f"{label} OCR 인식 실패 (상태: {infer})"
 
     # 임금명세서는 items 비어있는 것이 정상 → 품목명 검사 면제
     if receipt.get("doc_type") != "wage_statement":
@@ -514,7 +533,11 @@ def _check_rejection(usage_item: dict, receipt: dict) -> Optional[str]:
             for item in items
         )
         if not has_named_item:
-            return "영수증 품목명 없음 — 반려 처리"
+            if receipt.get("doc_type") == "tax_invoice":
+                # 세금계산서는 품목 내역이 없는 경우가 많음 → 진짜 필요한 것은
+                # 품목이 기재된 거래명세표/영수증 증빙임을 안내한다.
+                return "세금계산서에 품목 내역이 없어 매칭 불가 — 품목이 기재된 거래명세표/영수증 증빙 필요"
+            return f"{label} 품목 인식 실패 — 증빙 재제출 필요"
 
     if not usage_item.get("name") and not usage_item.get("description") and not usage_item.get("category"):
         return "사용내역서 항목에 내용 설명 누락"
