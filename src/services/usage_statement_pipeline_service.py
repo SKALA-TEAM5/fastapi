@@ -40,7 +40,6 @@ from pathlib import Path
 from typing import Any
 
 from src.agents.classifier_agent.agent import review_usage_statement
-from src.core.config import CLOVA_OCR_SECRET, CLOVA_OCR_URL
 from src.core.json_utils import to_json_compatible
 from src.ocr.clova_ocr_receipt import (
     SUPPORTED_EXTS,
@@ -51,7 +50,6 @@ from src.ocr.clova_ocr_receipt import (
     validate_result as validate_ocr_result,
 )
 from src.ocr.parse_tax_invoice import ALL_EXTS as TAX_INVOICE_EXTS
-from src.ocr.parse_tax_invoice import parse_tax_invoice
 from src.ocr.parse_usage_statement import parse_pdf as parse_usage_pdf
 from src.repositories.db import get_connection
 from src.repositories.usage_statement_pipeline_repository import (
@@ -591,14 +589,25 @@ def run_link_pipeline(
                 tmp_path = _fetch_and_save_temp(file_info["storage_key"], suffix)
                 tmp_paths.append(tmp_path)
 
-                ti_result = parse_tax_invoice(tmp_path, secret=CLOVA_OCR_SECRET, url=CLOVA_OCR_URL)
+                # 세금계산서도 영수증과 동일하게 OCR 엔진(OCR_ENGINE=vlm → Gemini) 경로로
+                # 파싱한다. 레거시 CLOVA 직접 호출(parse_tax_invoice)은 품목(items)을
+                # 추출하지 못해 빈 배열을 반환했고, 매칭에서 "영수증 품목명 없음 — 반려 처리"
+                # 오반려를 유발했다. VLM 경로는 type_hint="tax_invoice"로 품목을 정상 추출한다.
+                from src.ocr import ocr_engine as _ocr_engine
+                ti_result = _ocr_engine.parse_document_image(
+                    tmp_path,
+                    type_hint="tax_invoice",
+                    project_id=project_id,
+                    usage_statement_id=usage_statement_id,
+                )
                 ti_result["doc_type"]    = "tax_invoice"
                 ti_result["source_file"] = file_info["original_filename"]
-                if "vendor" not in ti_result:
-                    sup = ti_result.get("supplier") or {}
-                    ti_result["vendor"] = sup.get("company_name")
-                if "date" not in ti_result:
-                    ti_result["date"] = ti_result.get("issue_date")
+                if not ti_result.get("vendor"):
+                    sup = ti_result.get("supplier") or ti_result.get("store") or {}
+                    ti_result["vendor"] = sup.get("company_name") or sup.get("name")
+                if not ti_result.get("date"):
+                    payment = ti_result.get("payment") or {}
+                    ti_result["date"] = ti_result.get("issue_date") or payment.get("date")
                 receipt_ocr_results.append(ti_result)
 
                 time.sleep(0.2)
