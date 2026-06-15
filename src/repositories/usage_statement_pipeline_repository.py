@@ -27,6 +27,7 @@ from psycopg2.extensions import connection as PgConnection
 import psycopg2.extras
 
 from src.core.json_utils import json_dumps
+from src.services.usage_statement_validation import resolve_report_month
 
 # ─────────────────────────────────────────────────────────────
 # 카테고리 코드 매핑 (OCR JSON 항목코드 → DB category_code)
@@ -108,6 +109,37 @@ def get_file_by_id(conn: PgConnection, file_id: int) -> dict[str, Any]:
     return dict(row)
 
 
+def get_project_by_id(conn: PgConnection, project_id: int) -> dict[str, Any]:
+    """
+    projects 테이블에서 사용내역서 검증에 필요한 정보를 조회한다.
+    (공사기간·공사명 — parse 단계에서 슬롯 생성 전 제약 검증에 사용)
+
+    Returns:
+        {
+          "id": int,
+          "project_name": str,
+          "construction_start_date": date,
+          "construction_end_date": date,
+        }
+
+    Raises:
+        ValueError: 프로젝트를 찾을 수 없는 경우
+    """
+    sql = """
+        SELECT id, project_name,
+               construction_start_date, construction_end_date
+        FROM projects
+        WHERE id = %(project_id)s
+    """
+    with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+        cur.execute(sql, {"project_id": project_id})
+        row = cur.fetchone()
+
+    if row is None:
+        raise ValueError(f"프로젝트를 찾을 수 없습니다 (project_id={project_id})")
+    return dict(row)
+
+
 def get_files_by_ids(
     conn: PgConnection, file_ids: list[int]
 ) -> dict[int, dict[str, Any]]:
@@ -159,16 +191,11 @@ def insert_usage_statement(
     header = parsed.get("header") or {}
     line_items = parsed.get("line_items") or parsed.get("items") or []
 
-    # report_month 추출
-    report_month: date
-    if line_items:
-        first_item = line_items[0]
-        first_date = _safe_date(
-            first_item.get("사용일자") or first_item.get("used_on")
-        )
-        report_month = _first_day_of_month(first_date) if first_date else date.today().replace(day=1)
-    else:
-        report_month = date.today().replace(day=1)
+    # report_month 추출 (검증 단계와 동일 로직 공유: resolve_report_month)
+    # 연월을 확정할 수 없으면 오늘 날짜 기준으로 대체한다. 단, 정상 경로에서는
+    # 파이프라인이 INSERT 전에 validate_usage_against_project 로 None 케이스를
+    # 이미 거부하므로 이 fallback 에 도달하지 않는다.
+    report_month: date = resolve_report_month(parsed) or date.today().replace(day=1)
 
     # 누계공정률
     try:
