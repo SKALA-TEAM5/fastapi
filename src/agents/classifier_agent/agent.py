@@ -114,7 +114,11 @@ class _ClassificationOutcome:
 
 class _ClassifierLLMOutput(BaseModel):
     """LLM 카테고리 분류 결과."""
-    category_code: str = Field(description="CAT_01~CAT_09 중 하나")
+    is_safety_item: bool = Field(
+        default=True,
+        description="산안비(산업안전보건관리비) 지출 가능 항목이면 true, 사람 이름·관련 없는 항목이면 false",
+    )
+    category_code: str = Field(description="CAT_01~CAT_09 중 하나 (is_safety_item=false여도 반드시 입력)")
     reasoning: str = Field(default="", description="분류 근거 한 문장")
 
 
@@ -186,6 +190,8 @@ def _llm_classify_item(
                 "candidates": candidate_lines,
             }
         )
+        if not result.is_safety_item:
+            return UNCLASSIFIED
         code = (result.category_code or "").strip().upper()
         return code if code in CATEGORIES else None
     except Exception:
@@ -694,16 +700,26 @@ def _item_status(
     top_score = candidates[0].score if candidates else 0.0
 
     def _fallback_to_llm(reason_tag: str) -> tuple[str, str, str, str]:
-        """LLM에게 최종 분류를 위임한다. LLM 불가 시 '유지'로 안전하게 처리."""
+        """LLM에게 최종 분류를 위임한다. LLM 불가 시 '유지'로 안전하게 처리.
+
+        LLM이 성공적으로 분류하면 path 태그를 'llm(classified)'로 남겨
+        오케스트레이터의 llm(unclassified) 차단 조건에 걸리지 않도록 한다.
+        LLM도 분류에 실패한 경우에만 'llm(unclassified)' 태그를 사용한다.
+        """
         llm_code = _llm_classify_item(
             item_name=item_name,
             given_code=given_code or UNCLASSIFIED,
             basic_info=basic_info or {},
             candidates=candidates,
         )
-        if llm_code and llm_code != given_code:
-            cat_name = CATEGORIES.get(llm_code, llm_code)
-            return "카테고리변경", llm_code, f"{cat_name} 카테고리로 변경이 필요함.", f"llm({reason_tag})"
+        # LLM이 유효한 카테고리를 찾은 경우 → 성공 태그 사용 (차단 안 됨)
+        if llm_code and llm_code != UNCLASSIFIED:
+            llm_tag = "llm(classified)"
+            if llm_code != given_code:
+                cat_name = CATEGORIES.get(llm_code, llm_code)
+                return "카테고리변경", llm_code, f"{cat_name} 카테고리로 변경이 필요함.", llm_tag
+            return "유지", given_code or llm_code, "", llm_tag
+        # LLM도 분류 실패 → unclassified 태그 유지 (오케스트레이터가 차단)
         return "유지", given_code or (predicted.category_id if predicted.category_id != UNCLASSIFIED else ""), "", f"llm({reason_tag})"
 
     # ── 1. 분류 불가 → LLM 위임
@@ -884,8 +900,21 @@ def review_usage_statement(
         basic_info=basic_info,
     )
 
+    total_tokens: int | None = None
+
     if not request.rows:
         results: list[RowReviewResult] = []
+    elif get_openai_callback is not None:
+        with get_openai_callback() as _cb:
+            results = [
+                _review_single_usage_statement_row(
+                    row=row,
+                    basic_info=request.basic_info,
+                    collection=collection,
+                )
+                for row in request.rows
+            ]
+        total_tokens = _cb.total_tokens or None
     else:
         results = [
             _review_single_usage_statement_row(
@@ -895,8 +924,6 @@ def review_usage_statement(
             )
             for row in request.rows
         ]
-
-    total_tokens: int | None = None
 
     # agent_logs INSERT (project_id + int usage_statement_id 있을 때만)
     _uid = request.usage_statement_id
