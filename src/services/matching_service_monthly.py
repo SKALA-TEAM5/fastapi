@@ -561,15 +561,15 @@ def _resolve_gate2_amount(receipt: dict, usage_amount) -> int | None:
       2순위: raw + tax_amount (VLM이 세액 필드를 별도 반환한 경우)
       3순위: raw × 1.1 (세액 필드 없을 때 10% VAT 추정)
 
-    거래명세표·세금계산서(delivery_statement/tax_invoice)는 공급가액(VAT 미포함)과
-    세액을 분리 제공할 수 있으므로 동일하게 VAT 보정한다. 그 외 doc_type은 raw 그대로 반환.
+    거래명세표·세금계산서·영수증 등 증빙은 공급가액(VAT 미포함)과 세액을 분리 제공할 수
+    있으므로 doc_type에 관계없이 동일하게 VAT 보정한다. 보정이 게이트를 통과시키지 못하면
+    raw를 그대로 반환하므로(1순위 raw 우선), 이미 VAT 포함인 영수증은 영향받지 않는다.
     """
     raw = receipt.get("total_amount")
     if raw is None:
         return None
 
-    doc_type = receipt.get("doc_type")
-    if doc_type not in ("delivery_statement", "tax_invoice") or usage_amount is None:
+    if usage_amount is None:
         return raw
 
     try:
