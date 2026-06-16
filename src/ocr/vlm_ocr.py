@@ -240,7 +240,8 @@ _TAX_INVOICE_PROMPT = """\
       "name": "품목명",
       "count": 수량(정수) 또는 null,
       "unit_price": 단가(정수, 원) 또는 null,
-      "amount": 공급가액(정수, 원) 또는 null
+      "amount": 품목별 공급가액(정수, 원) 또는 null,
+      "tax_amount": 품목별 세액(정수, 원) 또는 null
     }
   ],
   "total_amount": 합계금액(공급가액 + 세액, 정수, 원) 또는 null,
@@ -622,6 +623,7 @@ def parse_vision_response(
                 "count":      item.get("count"),
                 "unit_price": item.get("unit_price"),
                 "amount":     item.get("amount"),
+                "tax_amount": item.get("tax_amount"),
             }
             for item in (vlm_raw.get("items") or [])
         ],
