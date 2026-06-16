@@ -355,6 +355,42 @@ META_PATTERNS = {
 }
 
 
+# 표(key-value) 셀에서 직접 읽을 헤더 텍스트 메타 (라벨 → header 필드).
+# extract_text 정규식은 표 레이아웃에서 라벨/값을 흩어 놓아(예: 공사명이 칸 안에서
+# 줄바꿈되어 "…빌딩"과 "신축공사"로 분리) 값을 일부만 잡는다. 표 셀은 칸 단위로
+# 묶여 있어 더 정확하므로, 변별 텍스트 필드는 표 값으로 보강·교정한다.
+# (금액·공정률 등 숫자 필드는 단위가 섞여 있어 기존 정규식을 그대로 사용)
+_TABLE_LABEL_TO_FIELD = {
+    "공사명": "공사명",
+    "소재지": "소재지",
+    "대표자": "대표자",
+    "발주자": "발주자",
+    "수급인": "건설업체명",
+    "건설업체명": "건설업체명",
+}
+
+
+def _extract_meta_from_tables(tables) -> dict:
+    """page.extract_tables() 결과에서 라벨 옆 셀을 읽어 헤더 텍스트 메타를 추출한다."""
+    out: dict = {}
+    for table in tables or []:
+        for row in table or []:
+            if not row:
+                continue
+            for i in range(len(row) - 1):
+                label = "".join((row[i] or "").split())
+                field = _TABLE_LABEL_TO_FIELD.get(label)
+                if not field or field in out:
+                    continue
+                value = row[i + 1]
+                if value is None:
+                    continue
+                value = " ".join(str(value).split())  # 셀 내 줄바꿈·다중 공백 정리
+                if value:
+                    out[field] = value
+    return out
+
+
 def parse_header_page(page) -> dict:
     """1페이지 텍스트 + 테이블에서 헤더 메타 추출"""
     text = page.extract_text() or ""
@@ -382,6 +418,12 @@ def parse_header_page(page) -> dict:
 
     summaries = []
     tables = page.extract_tables()
+
+    # 표 셀 기반 메타 보강: 표에서 직접 읽은 값이 더 정확하므로 텍스트 필드를 덮어쓴다.
+    # (특히 공사명이 칸 안에서 줄바꿈돼 정규식이 일부만 잡는 문제를 해결)
+    for field, value in _extract_meta_from_tables(tables).items():
+        header[field] = value
+
     for table in tables:
         if not table or not table[0]:
             continue
