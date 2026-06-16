@@ -919,14 +919,39 @@ def _link_todo_detail(row: dict[str, Any]) -> str | None:
         if row.get("similarity_score") is not None
         else row.get("similarityScore")
     )
-    if similarity_score is not None:
-        return f"유사도 {similarity_score:.2f}"
-
-    component_detail = _link_component_score_detail(
+    component_scores = (
         _as_dict(row.get("component_scores"))
         or _as_dict(row.get("componentScores"))
     )
-    return component_detail
+    if similarity_score is not None:
+        # 검토 필요(review_needed)는 점수만으로는 사유를 알기 어려우므로,
+        # 가장 낮게 책정된 컴포넌트에 맞춰 검토 포인트(원인)를 안내한다.
+        hint = _link_review_hint(component_scores)
+        if hint:
+            return f"유사도 {similarity_score:.2f} · {hint}"
+        return f"유사도 {similarity_score:.2f}"
+
+    return _link_component_score_detail(component_scores)
+
+
+def _link_review_hint(component_scores: dict[str, Any]) -> str | None:
+    """
+    review_needed 검토 사유 안내.
+
+    링크 파이프라인(matching_service_monthly)에서 금액·날짜·거래처는 모두 Hard Gate로
+    먼저 걸러진다(게이트 통과 시 금액 1.0 / 거래처는 완전일치 1.0 또는 미기재 면제).
+    따라서 게이트를 통과해 review_needed 로 분류된 항목의 점수를 좌우하는 자유 변수는
+    품목명(item_desc) 하나뿐이다. → 품목명 유사도를 직접 짚어 사용자가 품목 일치 여부를
+    재확인하도록 안내한다.
+    """
+    item_score = _float_or_none(
+        component_scores.get("item_desc")
+        if component_scores.get("item_desc") is not None
+        else component_scores.get("item_description")
+    )
+    if item_score is None:
+        return None
+    return f"품목명 유사도 낮음 ({item_score:.2f}) — 품목 일치 여부 재확인 필요"
 
 
 def _link_component_score_detail(component_scores: dict[str, Any]) -> str | None:
