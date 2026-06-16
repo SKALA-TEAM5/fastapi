@@ -57,6 +57,30 @@ def _normalize_name(value: Any) -> str:
     return "".join(str(value).split())
 
 
+# 공사명에서 변별력 없는 일반 접미사(공사 유형). 길이가 긴 것부터 제거한다.
+_GENERIC_SUFFIXES = (
+    "신축공사", "증축공사", "개축공사", "재축공사", "대수선공사", "리모델링공사",
+    "보수공사", "보강공사", "해체공사", "철거공사", "리모델링",
+    "신축", "증축", "개축", "공사",
+)
+
+
+def _construction_core(name: Any) -> str:
+    """
+    공사명에서 변별력 없는 일반 접미사(신축공사/증축공사/공사 등)를 제거한
+    '핵심부'를 반환한다. 핵심부가 없으면(접미사만으로 구성) 빈 문자열.
+
+    예) "서울 강남구 사무용 빌딩 신축공사" → "서울강남구사무용빌딩"
+        "신축공사" → ""   (변별 정보 없음)
+    """
+    core = _normalize_name(name)
+    for suffix in _GENERIC_SUFFIXES:  # 긴 접미사 우선
+        if core.endswith(suffix):
+            core = core[: -len(suffix)]
+            break
+    return core
+
+
 # ─────────────────────────────────────────────────────────────
 # 공개 함수
 # ─────────────────────────────────────────────────────────────
@@ -113,9 +137,13 @@ def validate_usage_against_project(
 
     검증 순서:
         0) 연월 확정 가능 여부
-        1) 선택 월 == 파싱 월 (expected_report_month 가 주어진 경우)
-        2) 공사기간(construction_start_date ~ construction_end_date) 범위
-        3) 공사명 일치
+        1) 공사기간(construction_start_date ~ construction_end_date) 범위
+        2) 공사명 일치
+
+    참고: 화면에서 선택한 월(expected_report_month)과 사용내역서의 실제 월이 달라도,
+    실제 월이 공사기간 내라면 차단하지 않는다. 슬롯은 사용내역서의 실제 월(report_month)로
+    등록된다(insert_usage_statement가 파싱된 월을 사용). 즉 선택 월은 참고용이며, 문서의
+    실제 월이 우선한다.
 
     Raises:
         UsageStatementValidationError : 위 중 하나라도 위반 시.
@@ -130,14 +158,7 @@ def validate_usage_against_project(
             "사용내역서에서 사용 연월을 확인할 수 없어 업로드를 거부합니다."
         )
 
-    # 1) 화면에서 선택한 월과 사용내역서 월이 일치하는지
-    if expected_report_month is not None and report_month != expected_report_month:
-        raise UsageStatementValidationError(
-            f"사용내역서 연월({report_month:%Y-%m})이 "
-            f"선택한 월({expected_report_month:%Y-%m})과 일치하지 않습니다."
-        )
-
-    # 2) 공사기간 범위 검증 (월 단위, 시작·종료 월 포함)
+    # 1) 공사기간 범위 검증 (월 단위, 시작·종료 월 포함)
     period_text = (
         f"{start:%Y-%m-%d} ~ {end:%Y-%m-%d}"
         if start and end
@@ -152,11 +173,18 @@ def validate_usage_against_project(
             f"사용내역서 연월({report_month:%Y-%m})이 공사기간({period_text})을 벗어났습니다."
         )
 
-    # 3) 공사명 일치 검증 (공백 제거 후 완전 일치)
+    # 2) 공사명 일치 검증 (핵심어 비교)
+    #    일반 접미사(신축공사/증축공사/공사 등)는 변별력이 없어 제거한 '핵심부'로 비교한다.
+    #    PDF 표 레이아웃 탓에 공사명이 일부만 추출될 수 있으므로(예: 전체 "서울 강남구 사무용
+    #    빌딩 신축공사" 중 "신축공사"만), 핵심부끼리 한쪽이 다른 쪽을 포함하면 일치로 본다.
+    #    - 핵심부가 명백히 다르면(예: '대전제조시설' vs '서울강남구사무용빌딩') → 차단
+    #    - 추출값이 접미사뿐이거나 비어 변별 정보가 없으면 → 검증 건너뜀(차단하지 않음)
     header = parsed_usage.get("header") or {}
     parsed_name = header.get("공사명")
     project_name = project.get("project_name")
-    if _normalize_name(parsed_name) != _normalize_name(project_name):
+    parsed_core = _construction_core(parsed_name)
+    project_core = _construction_core(project_name)
+    if parsed_core and project_core and parsed_core not in project_core and project_core not in parsed_core:
         raise UsageStatementValidationError(
             f"사용내역서 공사명('{parsed_name}')이 "
             f"프로젝트 공사명('{project_name}')과 일치하지 않습니다."
