@@ -792,6 +792,11 @@ def _run_link_agent(
                 continue
             if row.get("match_status") not in {"review_needed", "unmatched", "rejected"}:
                 continue
+            # 후보 증빙이 없어 매칭 실패한 경우는 safety-doc 의 '증빙 업로드 필요' TODO 와
+            # 중복되므로 link TODO 에서는 생성하지 않는다. (증빙은 있으나 금액/날짜 불일치,
+            # review_needed, rejected 는 검토 정보로서 의미가 있어 그대로 유지)
+            if row.get("match_status") == "unmatched" and _is_link_no_evidence_row(row):
+                continue
             item_id = int(line_id_text)
             todo_context = item_contexts.get(item_id, {})
             item_name = _first_string([todo_context.get("usage_statement_item_name")])
@@ -879,6 +884,30 @@ def _link_todo_reason(
     return f"{subject}: {status_label}{detail_suffix}"
 
 
+def _is_link_no_evidence_row(row: dict[str, Any]) -> bool:
+    """
+    후보 증빙이 없어(또는 최근접 후보의 품목이 무관해) 매칭 실패한 경우인지 판정한다.
+    이 경우의 안내는 safety-doc 의 '○○ 업로드 필요' TODO 와 중복되므로 link TODO 에서는 제외한다.
+    """
+    gate_failed = row.get("gate_failed")
+    if gate_failed is None:
+        gate_failed = row.get("gateFailed")
+    if not (isinstance(gate_failed, list) and gate_failed):
+        return False
+    component = (
+        _as_dict(row.get("component_scores"))
+        or _as_dict(row.get("componentScores"))
+    )
+    item_sim = _float_or_none(
+        component.get("item_desc")
+        if component.get("item_desc") is not None
+        else component.get("item_description")
+    )
+    no_receipt = any("영수증 없음" in str(g) for g in gate_failed)
+    item_irrelevant = item_sim is not None and item_sim < 0.4
+    return no_receipt or item_irrelevant
+
+
 def _link_todo_detail(row: dict[str, Any]) -> str | None:
     reject_reason = _first_string(
         [
@@ -895,23 +924,10 @@ def _link_todo_detail(row: dict[str, Any]) -> str | None:
     if gate_failed is None:
         gate_failed = row.get("gateFailed")
     if isinstance(gate_failed, list) and gate_failed:
-        # 매칭은 프로젝트의 모든 영수증을 후보로 비교하므로, 해당 항목에 맞는 증빙이
-        # 아예 없으면 엉뚱한(품목이 다른) 영수증이 최근접 후보로 잡혀 "금액 X% 차이"가
-        # 표시된다. 이는 사용자에게 오해를 준다.
-        #   - 품목 유사도가 낮거나(다른 품목) 비교할 영수증이 없으면 → "증빙 미업로드" 안내
+        # 증빙이 아예 없는 경우의 안내. 단, 이 케이스의 TODO 는 _run_link_agent 에서
+        # 생성하지 않으므로(safety-doc 의 '업로드 필요'와 중복 방지) 여기 메시지는 방어용이다.
         #   - 품목은 맞는데 금액/날짜/업체만 어긋나면 → 실제 게이트 사유 표시
-        component = (
-            _as_dict(row.get("component_scores"))
-            or _as_dict(row.get("componentScores"))
-        )
-        item_sim = _float_or_none(
-            component.get("item_desc")
-            if component.get("item_desc") is not None
-            else component.get("item_description")
-        )
-        no_receipt = any("영수증 없음" in str(g) for g in gate_failed)
-        item_irrelevant = item_sim is not None and item_sim < 0.4
-        if no_receipt or item_irrelevant:
+        if _is_link_no_evidence_row(row):
             return "매칭되는 증빙 없음 — 증빙 업로드 필요"
         return "; ".join(str(g) for g in gate_failed[:2])
 

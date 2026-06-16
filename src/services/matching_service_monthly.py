@@ -1284,8 +1284,26 @@ def match_all_usage_to_receipts(
         best = match_best(usage_item, step2_pool, threshold, threshold_matched)
         # 매칭된 영수증의 세금계산서 검증 상태를 결과에 포함
         matched_receipt = best.get("receipt") or {}
-        best["tax_invoice_status"]  = matched_receipt.get("tax_invoice_status", "unverified")
+        ti_status   = matched_receipt.get("tax_invoice_status", "unverified")
+        ti_failed   = matched_receipt.get("ti_failed_gates") or []
+        best["tax_invoice_status"]  = ti_status
         best["matched_tax_invoice"] = matched_receipt.get("matched_tax_invoice")
+
+        # [MVP 세금계산서 검증 정책] 세금계산서 검증을 통과하지 못하면(unverified) 반려한다.
+        #   - 세금계산서 없음            → 반려
+        #   - 금액 불일치 (±1% 초과)      → 반려
+        #   - 업체명(공급자) 불일치        → 반려
+        #   - 날짜는 월 ±2일 유예(_date_gate_monthly)로 판정 → 벗어나면 unverified → 반려
+        #   (verified / exempt(임금명세서) / self(세금계산서 자체 증빙) 는 영향 없음)
+        if best.get("match_status") in {"matched", "review_needed"} and ti_status == "unverified":
+            best["match_status"] = "rejected"
+            if ti_failed and ti_failed[0] == "세금계산서 없음":
+                best["reject_reason"] = "세금계산서 없음 — 반려"
+            elif ti_failed:
+                best["reject_reason"] = "세금계산서 검증 실패 — " + "; ".join(ti_failed[:2])
+            else:
+                best["reject_reason"] = "세금계산서 검증 실패"
+
         match_results.append(best)
 
     total     = len(match_results)
