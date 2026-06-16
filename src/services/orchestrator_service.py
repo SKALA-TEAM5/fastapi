@@ -1660,6 +1660,11 @@ def _legal_generated_item_reason(
     legal_basis_by_source_id: dict[str, dict[str, Any]],
     legal_basis_context: str | None = None,
 ) -> str:
+    # llm_fallback이 조건부 힌트 없이 확정 불허 판단한 항목(예: 사무실 소화기 구입)은
+    # 이미 충분히 구체적인 reason_text를 갖고 있으므로 LLM 재생성으로 일반화/단순화되지
+    # 않도록 원문 그대로 사용한다.
+    if getattr(judgment, "force_reason_text", False) and (judgment.reason_text or "").strip():
+        return _legal_clean_final_reason(str(judgment.reason_text))
     generated_reason = _synthesize_item_reason_with_llm(
         category_name=category_name,
         item=judgment,
@@ -1890,7 +1895,7 @@ def _legal_payload_item_results(item_results: list[dict[str, Any]]) -> list[dict
                 "detected_limit_percent": item_result.get("detected_limit_percent"),
                 "reason": _legal_clean_final_reason(str(item_result.get("reason") or "")),
                 "citations": [
-                    {"legal_basis": str(citation.get("legal_basis") or "")}
+                    {"legal_basis": _strip_law_name_hash_suffix(str(citation.get("legal_basis") or ""))}
                     for citation in _legal_without_progress_citations(item_result.get("citations") or [])
                     if isinstance(citation, dict) and str(citation.get("legal_basis") or "").strip()
                 ],
@@ -2216,7 +2221,14 @@ def _split_legal_basis(value: str) -> tuple[str, str, str]:
     if article_match:
         law_name = text[: article_match.start()].strip()
     law_name = law_name.strip("「」 ,")
+    # Qdrant 문서 소스명(예: "부록4산업안전보건관리비항목별사용불가내역-040b65c1c9")처럼
+    # 파일 식별용 해시가 끝에 붙은 경우 사용자 표시용 법령명에서는 잘라낸다.
+    law_name = _strip_law_name_hash_suffix(law_name)
     return law_name, article, " ".join(clause_parts)
+
+
+def _strip_law_name_hash_suffix(law_name: str) -> str:
+    return re.sub(r"-[0-9a-fA-F]{6,}$", "", law_name or "").strip()
 
 
 def _category_id_number(category_code: str) -> int:
@@ -2258,7 +2270,9 @@ def _frontend_legal_basis(summary, item_results: list[dict[str, Any]]) -> list[d
         for citation in item_result.get("citations") or []:
             if not isinstance(citation, dict):
                 continue
-            law_name = str(citation.get("legal_basis") or "산업안전보건관리비 계상 및 사용기준")
+            law_name = _strip_law_name_hash_suffix(
+                str(citation.get("legal_basis") or "산업안전보건관리비 계상 및 사용기준")
+            )
             basis_by_key.setdefault(
                 law_name,
                 {

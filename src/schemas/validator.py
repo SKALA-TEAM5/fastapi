@@ -76,6 +76,13 @@ class ItemJudgment(BaseModel):
     exception_summary: str = Field(default="")
     judgment_source: str = Field(default="", description="판정 소스 (law_rule | qa_rule | corpus_fallback | llm_fallback | profile_fallback | none)")
     reason_text: str = Field(default="", description="LLM이 생성한 사용자 표시용 사유 텍스트")
+    force_reason_text: bool = Field(
+        default=False,
+        description=(
+            "llm_fallback이 조건부 힌트 없이 확정 불허로 판단한 경우(예: 사무실 소화기 구입) True. "
+            "True이면 orchestrator는 reason_text를 LLM으로 재생성하지 않고 그대로 사용한다."
+        ),
+    )
 
 
 class CategoryAuditResult(BaseModel):
