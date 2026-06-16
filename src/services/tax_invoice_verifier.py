@@ -8,21 +8,21 @@
   세금계산서를 기준으로 영수증·거래명세표의 효력을 확인한다.
 
 [처리 결과]
-  "verified"   — 세금계산서와 월·금액·업체명이 모두 일치
+  "verified"   — 세금계산서와 월·금액·업체명(공급자)이 모두 일치
   "unverified" — 매칭되는 세금계산서 없음 (없거나 불일치)
-               → Step 2(사용내역서 ↔ 영수증 매칭)에 그대로 포함
-               → RAG 단계에서 추가 검토 권장
 
-[unverified 허용 이유]
-  건설현장 소액 거래 등 세금계산서가 발행되지 않는 경우가 있으므로
-  unverified를 즉시 탈락시키지 않고 표시만 하고 통과시킨다.
-  실제 건설현장 데이터에서는 대다수 거래에 세금계산서가 발행되므로
-  unverified 비율 자체가 품질 지표로 활용 가능하다.
+[MVP 검증 정책 — unverified 반려]
+  세금계산서 없음 / 금액 불일치(±1% 초과) / 업체명(공급자) 불일치 → 반려(rejected).
+  날짜는 월 ±2일 유예로 판정하며, 벗어나면 unverified → 반려.
+  ※ 이 모듈은 verified/unverified 판정만 한다. 실제 반려(match_status="rejected") 전환은
+    matching_service_monthly.match_all_usage_to_receipts 에서 수행한다.
 
 [매칭 기준 — Hard Gate 3가지]
   Gate 1 — 날짜  : 같은 연월 (또는 월 경계 ±2일)
   Gate 2 — 금액  : |영수증금액 − 세금계산서금액| / max ≤ 1%
-  Gate 3 — 업체명: 정규화 후 완전일치 (영수증에 업체명 미기재 시 면제)
+  Gate 3 — 업체명: 정규화 후 완전일치 (공급자 기준, 영수증에 업체명 미기재 시 면제)
+                  ※ 세금계산서는 공급자/공급받는자 2개 업체명이 있으므로 OCR(vlm)에서
+                    vendor 를 '공급자'로 매핑한 값으로 비교한다.
 """
 
 from __future__ import annotations

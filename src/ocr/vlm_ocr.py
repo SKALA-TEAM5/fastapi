@@ -216,9 +216,64 @@ _WAGE_STATEMENT_PROMPT = """\
 """
 
 
+_TAX_INVOICE_PROMPT = """\
+이미지를 분석하여 다음 JSON 스키마로 세금계산서 정보를 추출해주세요.
+코드 블록(```json)이나 부가 설명 없이 JSON 객체만 출력하세요.
+
+사용자가 선택한 문서 유형 힌트: tax_invoice
+
+추출 JSON 스키마:
+{
+  "doc_type": "tax_invoice",
+  "infer_result": "SUCCESS | PARTIAL | FAILED",
+  "supplier": {
+    "name": "공급자 상호(법인명)",
+    "biz_num": "공급자 사업자등록번호 (000-00-00000) 또는 null"
+  },
+  "buyer": {
+    "name": "공급받는자 상호(법인명)",
+    "biz_num": "공급받는자 사업자등록번호 (000-00-00000) 또는 null"
+  },
+  "date": "작성일자 (YYYY-MM-DD) 또는 null",
+  "items": [
+    {
+      "name": "품목명",
+      "count": 수량(정수) 또는 null,
+      "unit_price": 단가(정수, 원) 또는 null,
+      "amount": 공급가액(정수, 원) 또는 null
+    }
+  ],
+  "total_amount": 합계금액(공급가액 + 세액, 정수, 원) 또는 null,
+  "tax_amount": 세액 합계(정수, 원) 또는 null,
+  "confidence": 0.0~1.0 사이 신뢰도,
+  "fail_reason": "FAILED 시 실패 사유, 그 외 null"
+}
+
+── 공급자 / 공급받는자 구분 (매우 중요) ─────────────────
+- 세금계산서에는 '공급자'와 '공급받는자' 두 사업자 정보가 있다. 절대 혼동하지 말 것.
+  · supplier = 세금계산서를 발행한 '공급자'(파는 쪽) 영역의 상호·사업자번호
+  · buyer    = '공급받는자'(받는 쪽, 보통 현장/건설사) 영역의 상호·사업자번호
+- 표준 양식에서 공급자는 보통 좌측, 공급받는자는 우측에 위치한다.
+  다만 위치보다 '공급자'/'공급받는자' 라벨을 우선 기준으로 판단한다.
+
+── 금액 · 날짜 규칙 ───────────────────────────────────
+- total_amount = '합계금액'(공급가액 + 세액). 합계금액 표기가 없으면 공급가액 합 + 세액 합으로 계산한다.
+- tax_amount   = 세액 합계
+- date         = '작성일자' (연·월·일 모두 확인된 경우에만 YYYY-MM-DD, 아니면 null)
+- 금액은 숫자만 추출 (원·쉼표·공백 제거)
+- 품목이 없으면 items를 빈 배열 []로 반환
+- infer_result 판정:
+    SUCCESS = 공급자명·작성일자·합계금액 모두 추출 성공
+    PARTIAL = 일부 필드만 추출
+    FAILED  = 판독 불가
+"""
+
+
 def _build_user_prompt(type_hint: str) -> str:
     if type_hint == "wage_statement":
         return _WAGE_STATEMENT_PROMPT
+    if type_hint == "tax_invoice":
+        return _TAX_INVOICE_PROMPT
     return _USER_PROMPT_TEMPLATE.format(type_hint=type_hint)
 
 
@@ -583,6 +638,24 @@ def parse_vision_response(
             vlm_raw.get("doc_type") or "", vlm_raw.get("doc_type")
         ),
     }
+
+    # 세금계산서: 공급자/공급받는자 분리 정보 보존 + vendor 비교 기준을 '공급자'로 통일.
+    # (세금계산서엔 업체명이 둘이라, 검증 시 거래명세표 공급자 ↔ 세금계산서 '공급자'를 맞춰야 한다)
+    _supplier = vlm_raw.get("supplier")
+    if isinstance(_supplier, dict):
+        _buyer = vlm_raw.get("buyer") or {}
+        result["supplier"] = {
+            "name":    _supplier.get("name"),
+            "biz_num": _supplier.get("biz_num"),
+        }
+        result["buyer"] = {
+            "name":    _buyer.get("name"),
+            "biz_num": _buyer.get("biz_num"),
+        }
+        # store.name(업체명)을 공급자명으로 채워 downstream vendor 비교가 공급자 기준이 되게 한다
+        if not result["store"].get("name"):
+            result["store"]["name"]    = _supplier.get("name")
+            result["store"]["biz_num"] = _supplier.get("biz_num")
 
     # FAILED인 경우 실패 사유 추가
     if infer_result == "FAILED":
