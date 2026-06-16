@@ -1068,6 +1068,20 @@ match_threeway = match_twoway
 # 8. 단일 사용내역서 항목 ↔ 후보 영수증 리스트 Best-Match
 # ══════════════════════════════════════════════════════════════
 
+# 품목 최소 유사도 게이트: 금액·날짜·업체명이 맞아도 품목명 유사도가 이 값 미만이면
+# '해당 항목의 증빙이 아님'으로 보고 매칭하지 않는다.
+# (예: 안전모 증빙이 금액만 우연히 맞아 안전표지판에 잡히는 교차 매칭 차단)
+# 교차 매칭은 ~0.11~0.16, 정상(표현 차이) 매칭은 ~0.33+ 로 분포가 갈려 0.25로 분리.
+MIN_ITEM_DESC_SIM: float = 0.25
+
+
+def _match_item_desc(result: dict) -> Optional[float]:
+    """match_twoway 결과에서 품목명 유사도(item_desc)를 꺼낸다."""
+    cs = result.get("component_scores") or {}
+    v = cs.get("item_desc")
+    return v if v is not None else cs.get("item_description")
+
+
 def match_best(
     usage_item: dict,
     receipts: list[dict],
@@ -1105,9 +1119,28 @@ def match_best(
         valid   = [r for r in scored if r["match_status"] != "rejected"]
         invalid = [r for r in scored if r["match_status"] == "rejected"]
 
-        best = max(valid, key=lambda r: r["similarity_score"]) if valid \
-               else max(invalid, key=lambda r: r["similarity_score"])
+        # [품목 최소 유사도 게이트] 금액·날짜·업체명이 맞아도 품목명 유사도가 너무 낮으면
+        # 해당 항목의 증빙이 아닌 교차 매칭으로 보고 제외한다. (item_desc None = 비교 불가 → 유지)
+        item_relevant = [
+            r for r in valid
+            if _match_item_desc(r) is None or _match_item_desc(r) >= MIN_ITEM_DESC_SIM
+        ]
 
+        if item_relevant:
+            best = max(item_relevant, key=lambda r: r["similarity_score"])
+            best["gate_passed"] = True
+            best["gate_failed"] = []
+            return best
+
+        # 품목 유사도 미달뿐이면 → 이 항목의 증빙 아님 → 매칭 없음(증빙 미업로드로 처리되어 link TODO 생략)
+        if valid:
+            best = max(valid, key=lambda r: r["similarity_score"])
+            best["match_status"] = "unmatched"
+            best["gate_passed"]  = False
+            best["gate_failed"]  = ["품목 불일치 — 해당 항목 증빙 아님"]
+            return best
+
+        best = max(invalid, key=lambda r: r["similarity_score"])
         best["gate_passed"] = True
         best["gate_failed"] = []
         return best

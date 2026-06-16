@@ -35,23 +35,35 @@ from src.tools.safety_doc_reference_vector import search_reference_vector_db
 log = logging.getLogger(__name__)
 
 
-# 사진 증빙(현장/착용)은 안전모·안전벨트 품목에만 요구한다.
-# (LLM이 '설치·시공 완료→site_photo'로 안전시설비 등에도 사진을 붙이는 것을 후처리로 제한)
-_PHOTO_EVIDENCE_CODES: frozenset[str] = frozenset({"site_photo", "wearing_photo"})
+# 사진 증빙 규칙(결정적):
+#   - 안전모·안전벨트(보호구) → '착용사진(wearing_photo)'만 요구. '현장사진(site_photo)'은 부적합.
+#   - 그 외 품목 → 사진 증빙 요구 없음.
+# LLM이 보호구에 site_photo를 붙이거나(현장사진 오류) 사진을 아예 빠뜨리는(누락) 비결정성을
+# 후처리로 보정해, 보호구는 항상 착용사진만 요구하도록 고정한다.
+_SITE_PHOTO_CODE: str = "site_photo"
+_WEARING_PHOTO_CODE: str = "wearing_photo"
+_PHOTO_EVIDENCE_CODES: frozenset[str] = frozenset({_SITE_PHOTO_CODE, _WEARING_PHOTO_CODE})
 _PHOTO_ITEM_KEYWORDS: tuple[str, ...] = ("안전모", "헬멧", "안전벨트", "안전대", "안전띠")
 
 
 def _photo_evidence_allowed(item_name: str | None) -> bool:
-    """해당 품목이 사진 증빙(현장/착용) 요구 대상(안전모·안전벨트)인지 판단."""
+    """해당 품목이 사진 증빙(착용사진) 요구 대상(안전모·안전벨트)인지 판단."""
     name = item_name or ""
     return any(kw in name for kw in _PHOTO_ITEM_KEYWORDS)
 
 
 def _filter_photo_codes(codes: set[str], item_name: str | None) -> set[str]:
-    """안전모·안전벨트가 아니면 사진 증빙 코드를 제거한다."""
+    """
+    사진 증빙 코드를 규칙에 맞게 보정한다.
+      - 보호구(안전모·안전벨트): 현장사진 제거 + 착용사진 보장(항상 요구).
+      - 그 외 품목: 사진 증빙(현장/착용) 모두 제거.
+    """
+    result = set(codes)
     if _photo_evidence_allowed(item_name):
-        return codes
-    return codes - _PHOTO_EVIDENCE_CODES
+        result.discard(_SITE_PHOTO_CODE)   # 보호구엔 현장사진 부적합 → 제거
+        result.add(_WEARING_PHOTO_CODE)    # 착용사진은 항상 요구
+        return result
+    return result - _PHOTO_EVIDENCE_CODES
 
 
 class EvidenceRequirementService:
