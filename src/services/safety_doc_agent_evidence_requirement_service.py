@@ -35,6 +35,25 @@ from src.tools.safety_doc_reference_vector import search_reference_vector_db
 log = logging.getLogger(__name__)
 
 
+# 사진 증빙(현장/착용)은 안전모·안전벨트 품목에만 요구한다.
+# (LLM이 '설치·시공 완료→site_photo'로 안전시설비 등에도 사진을 붙이는 것을 후처리로 제한)
+_PHOTO_EVIDENCE_CODES: frozenset[str] = frozenset({"site_photo", "wearing_photo"})
+_PHOTO_ITEM_KEYWORDS: tuple[str, ...] = ("안전모", "헬멧", "안전벨트", "안전대", "안전띠")
+
+
+def _photo_evidence_allowed(item_name: str | None) -> bool:
+    """해당 품목이 사진 증빙(현장/착용) 요구 대상(안전모·안전벨트)인지 판단."""
+    name = item_name or ""
+    return any(kw in name for kw in _PHOTO_ITEM_KEYWORDS)
+
+
+def _filter_photo_codes(codes: set[str], item_name: str | None) -> set[str]:
+    """안전모·안전벨트가 아니면 사진 증빙 코드를 제거한다."""
+    if _photo_evidence_allowed(item_name):
+        return codes
+    return codes - _PHOTO_EVIDENCE_CODES
+
+
 class EvidenceRequirementService:
     """상세 항목 1건의 필수 증빙을 생성하고 저장한다."""
 
@@ -217,11 +236,16 @@ class EvidenceRequirementService:
             ).observe(time.perf_counter() - started_at)
 
         available_codes = set(ai_input.available_evidence_types)
-        required_evidences = [
-            code
-            for code in payload.get("required_evidences", [])
-            if code in available_codes
-        ]
+        required_evidences = sorted(
+            _filter_photo_codes(
+                {
+                    code
+                    for code in payload.get("required_evidences", [])
+                    if code in available_codes
+                },
+                ai_input.item_context.item_name,
+            )
+        )
 
         result = AIEvidenceRequirementOutput(
             required_evidences=required_evidences,
@@ -271,6 +295,10 @@ class EvidenceRequirementService:
             ).observe(time.perf_counter() - started_at)
         expected_item_ids = {item.item_context.item_id for item in ai_inputs}
         allowed_codes = set(ALLOWED_BATCH_EVIDENCE_TYPES)
+        item_name_by_id = {
+            item.item_context.item_id: item.item_context.item_name
+            for item in ai_inputs
+        }
         outputs: dict[int, AIEvidenceRequirementOutput] = {}
 
         for row in payload.get("results") or []:
@@ -293,11 +321,14 @@ class EvidenceRequirementService:
             )
             outputs[item_id] = AIEvidenceRequirementOutput(
                 required_evidences=sorted(
-                    {
-                        code
-                        for code in required_evidences
-                        if code in allowed_codes
-                    }
+                    _filter_photo_codes(
+                        {
+                            code
+                            for code in required_evidences
+                            if code in allowed_codes
+                        },
+                        item_name_by_id.get(item_id),
+                    )
                 ),
                 confidence=row.get("confidence"),
                 reason=row.get("reason"),
