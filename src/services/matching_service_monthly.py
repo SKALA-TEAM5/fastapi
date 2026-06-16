@@ -880,7 +880,9 @@ def compute_component_scores(
     )
 
     score_vs_item  = amount_score(usage_amount, best_item_amount) if best_item_amount is not None else None
-    score_vs_total = amount_score(usage_amount, receipt.get("total_amount"))
+    # 총액 비교도 게이트와 동일하게 VAT 보정된 금액을 사용한다(영수증 총액이 공급가액인
+    # 경우 raw로 비교하면 점수가 낮아 matched가 아니라 review로 빠지는 문제 방지).
+    score_vs_total = amount_score(usage_amount, _resolve_gate2_amount(receipt, usage_amount))
     if score_vs_item is not None and score_vs_total is not None:
         score_amount = max(score_vs_item, score_vs_total)
     elif score_vs_item is not None:
