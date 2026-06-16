@@ -54,7 +54,24 @@ class ItemJudgment(BaseModel):
     qdrant_citations: List[dict] = Field(default=[], description="항목 판단 또는 사유 생성에 사용한 Qdrant 원문 근거")
     category_limit_pct: Optional[float] = Field(default=None)
     category_limit_rule: str = Field(default="")
+    item_limit_pct: Optional[float] = Field(
+        default=None,
+        description=(
+            "이 항목 자체의 비용 인정 비율 (0~1 소수, 예: 70% 인정 → 0.7). "
+            "카테고리 총액 한도(category_limit_pct)와 달리 항목 단위 인정 한도이며, "
+            "근거 조항이 명시적으로 매칭된 경우에만 채워진다."
+        ),
+    )
     needs_human_review: bool = Field(default=False)
+    conditional_review: bool = Field(
+        default=False,
+        description=(
+            "인건비성 항목(CAT_01/CAT_08)에 전담·선임·신고·자격 등 조건부 불허 규칙이 매칭되어 "
+            "allowed=True로 완화되었지만, 실제 조건 충족 여부 확인이 필요한 경우 True. "
+            "다른 카테고리/일반 허용 항목에는 절대 설정되지 않는다(좁게 게이팅됨). "
+            "orchestrator는 이 값이 True이면 allowed=True라도 최종 status를 '검토필요'로 표시한다."
+        ),
+    )
     review_reason: str = Field(default="")
     exception_summary: str = Field(default="")
     judgment_source: str = Field(default="", description="판정 소스 (law_rule | qa_rule | corpus_fallback | llm_fallback | profile_fallback | none)")
