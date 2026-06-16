@@ -14,6 +14,7 @@ import os
 from pathlib import Path
 from threading import Lock
 from typing import NamedTuple
+from hashlib import sha256
 
 from kiwipiepy import Kiwi
 from langchain_classic.retrievers.ensemble import EnsembleRetriever
@@ -26,7 +27,7 @@ from langchain_core.retrievers import BaseRetriever
 import src.core.llm_config as llm_config
 from src.prompts import REWRITE_PROMPT
 from src.schemas.shared import AgenticRAGState
-from src.core.storage import load_collection_documents
+from src.core.storage import _env_int, _redis_get_json, _redis_set_json, load_collection_documents
 
 log = logging.getLogger(__name__)
 
@@ -37,6 +38,7 @@ _RERANK_MODEL = "BAAI/bge-reranker-v2-m3"
 _RERANK_LOCAL_PATH = "/app/models/bge-reranker-v2-m3-onnx"
 _TOP_N = 5
 _BATCH_SIZE = 8
+_RERANK_SCORE_CACHE_TTL = 7 * 24 * 3600
 _PDF_SOURCE_TYPES = {"law_notice", "commentary", "appendix_disallowed"}
 
 
@@ -156,6 +158,44 @@ def _score_in_batches(model: CrossEncoder, pairs: list) -> list[float]:
     return scores
 
 
+def _hash_text(value: str) -> str:
+    return sha256(value.encode("utf-8")).hexdigest()
+
+
+def _rerank_doc_cache_key(query: str, doc: Document) -> str:
+    model_key = _hash_text(_resolve_rerank_model_path())
+    query_key = _hash_text(query)
+    source = str(doc.metadata.get("source") or doc.metadata.get("title") or "")
+    doc_key = _hash_text(f"{source}\n{doc.page_content}")
+    return f"rerank_score:{model_key}:{query_key}:{doc_key}"
+
+
+def _score_with_cache(model: CrossEncoder, query: str, docs: list[Document]) -> list[float]:
+    scores: list[float | None] = []
+    missing_pairs: list[tuple[str, str]] = []
+    missing_indexes: list[int] = []
+
+    for doc in docs:
+        cache_key = _rerank_doc_cache_key(query, doc)
+        cached = _redis_get_json(cache_key)
+        if isinstance(cached, (int, float)):
+            scores.append(float(cached))
+            continue
+        scores.append(None)
+        missing_indexes.append(len(scores) - 1)
+        missing_pairs.append((query, doc.page_content))
+
+    if missing_pairs:
+        computed_scores = _score_in_batches(model, missing_pairs)
+        ttl = _env_int("RERANK_SCORE_CACHE_TTL_SECONDS", _RERANK_SCORE_CACHE_TTL)
+        for index, score in zip(missing_indexes, computed_scores):
+            score_value = float(score)
+            scores[index] = score_value
+            _redis_set_json(_rerank_doc_cache_key(query, docs[index]), score_value, ttl)
+
+    return [float(score or 0.0) for score in scores]
+
+
 def rerank(state: AgenticRAGState) -> AgenticRAGState:
     docs = state["retrieved_docs"]
     if not docs:
@@ -163,8 +203,7 @@ def rerank(state: AgenticRAGState) -> AgenticRAGState:
 
     model = _get_rerank_model()
     query = state["question"]
-    pairs = [(query, doc.page_content) for doc in docs]
-    scores = _score_in_batches(model, pairs)
+    scores = _score_with_cache(model, query, docs)
 
     ranked: list[tuple[float, Document]] = sorted(
         zip(scores, docs), key=lambda x: x[0], reverse=True
