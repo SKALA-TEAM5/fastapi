@@ -287,7 +287,13 @@ def _synthesize_reason_with_llm(
     return text
 
 
-def _synthesize_item_reason_with_llm(*, category_name: str, item, result=None) -> str:
+def _synthesize_item_reason_with_llm(
+    *,
+    category_name: str,
+    item,
+    result=None,
+    legal_basis_context: str = "",
+) -> str:
     """
     확정된 항목 판정값을 바탕으로 item-level reason 한 문장만 LLM으로 재작성한다.
     LLM은 판정을 바꾸지 않고, 원본 reasoning/법령을 자연스럽게 설명하는 역할만 맡는다.
@@ -298,8 +304,19 @@ def _synthesize_item_reason_with_llm(*, category_name: str, item, result=None) -
         logger.info("[validator_reason] LLM unavailable for item reason: %s", exc)
         return ""
 
-    verdict = "허용" if item.allowed else "불허"
-    laws = ", ".join(getattr(item, "referenced_laws", []) or []) or "(법령 미확인)"
+    is_conditional_review = bool(item.allowed and getattr(item, "conditional_review", False))
+    verdict = "조건부 허용(확인 필요)" if is_conditional_review else ("허용" if item.allowed else "불허")
+    conditional_note = (
+        "법령상 조건(전담·선임·신고·자격 등)을 실제로 충족했는지 아직 확인되지 않아 검토가 필요합니다."
+        if is_conditional_review
+        else "(없음)"
+    )
+    item_laws = [
+        str(law)
+        for law in (getattr(item, "referenced_laws", []) or [])
+        if law and not _is_progress_law_reference(str(law))
+    ]
+    laws = ", ".join(item_laws) or "(법령 미확인)"
     reasoning = _item_reasoning_context_for_llm(item)
     category_issue = _item_category_issue_context(result)
     try:
@@ -314,6 +331,8 @@ def _synthesize_item_reason_with_llm(*, category_name: str, item, result=None) -
                 "verdict": verdict,
                 "laws": laws,
                 "category_issue": category_issue,
+                "conditional_note": conditional_note,
+                "legal_basis_context": legal_basis_context or "(각주/법령 원문 없음)",
                 "reasoning": reasoning or "(원본 근거 없음)",
             }
         )
@@ -324,11 +343,87 @@ def _synthesize_item_reason_with_llm(*, category_name: str, item, result=None) -
     text = _normalize_reason_output(output.reason or "")
     if len(text) < 15:
         return ""
+    text = _ensure_reason_has_footnoted_law_reference(
+        text=text,
+        laws=laws,
+        legal_basis_context=legal_basis_context,
+    )
     has_category_issue = category_issue != "(없음)"
     if item.allowed and not has_category_issue and any(keyword in text for keyword in ("불가", "부적절", "제외", "인정하기 어렵")):
         logger.info("[validator_reason] rejected conflicting item reason for allowed item: %s", item.item)
         return ""
     return text
+
+
+def _ensure_reason_has_footnoted_law_reference(*, text: str, laws: str, legal_basis_context: str) -> str:
+    reason = " ".join((text or "").split()).strip()
+    if not reason:
+        return ""
+    reason = _wrap_first_law_reference(reason)
+    if _reason_has_footnoted_law_reference(reason):
+        return reason
+    if _reason_has_law_reference(reason):
+        return reason
+    law_reference = _primary_law_reference(laws=laws, legal_basis_context=legal_basis_context)
+    if not law_reference:
+        return reason
+    return f"[{law_reference}]에 따르면, {reason}"
+
+
+def _reason_has_footnoted_law_reference(text: str) -> bool:
+    return bool(
+        re.search(r"\[[^\]]*(?:산업안전보건관리비|산업안전보건법|근로기준법|제\d+조)[^\]]*\]", text or "")
+    )
+
+
+def _wrap_first_law_reference(text: str) -> str:
+    if _reason_has_footnoted_law_reference(text):
+        return text
+
+    patterns = (
+        r"(「[^」]+」\s*제\d+조(?:제\d+항)?(?:제\d+호)?)",
+        r"((?:건설업\s*)?산업안전보건관리비\s*계상\s*및\s*사용기준\s*제\d+조(?:제\d+항)?(?:제\d+호)?)",
+        r"((?:산업안전보건법|근로기준법)\s*제\d+조(?:제\d+항)?(?:제\d+호)?)",
+        r"(제\d+조(?:제\d+항)?(?:제\d+호)?)",
+    )
+    for pattern in patterns:
+        match = re.search(pattern, text)
+        if not match:
+            continue
+        start, end = match.span(1)
+        return f"{text[:start]}[{match.group(1)}]{text[end:]}"
+    return text
+
+
+def _reason_has_law_reference(text: str) -> bool:
+    return bool(
+        re.search(r"(건설업\s*)?산업안전보건관리비|산업안전보건법|근로기준법|제\d+조", text or "")
+    )
+
+
+def _primary_law_reference(*, laws: str, legal_basis_context: str) -> str:
+    context = " ".join((legal_basis_context or "").split())
+    law_match = re.search(
+        r"((?:「[^」]+」|건설업\s*산업안전보건관리비\s*계상\s*및\s*사용기준|산업안전보건법|근로기준법)[^\\n]{0,80}?제\d+조(?:제\d+항)?(?:제\d+호)?)",
+        context,
+    )
+    if law_match:
+        return law_match.group(1).strip(" ,.")
+
+    law_text = " ".join((laws or "").split()).strip()
+    if not law_text or law_text == "(법령 미확인)":
+        return ""
+    first_law = law_text.split(",")[0].split("|")[0].strip()
+    if _is_progress_law_reference(first_law):
+        return ""
+    if re.fullmatch(r"제\d+조(?:제\d+항)?(?:제\d+호)?", first_law):
+        return f"「건설업 산업안전보건관리비 계상 및 사용기준」 {first_law}"
+    return first_law
+
+
+def _is_progress_law_reference(law: str) -> bool:
+    normalized = " ".join((law or "").split())
+    return "별표 3" in normalized or "공사진척" in normalized or "공정률" in normalized
 
 
 def _item_category_issue_context(result) -> str:
@@ -346,22 +441,10 @@ def _item_category_issue_context(result) -> str:
         else:
             issue_parts.append("카테고리 법정 한도를 초과합니다.")
 
-    shortfall = getattr(result, "usage_shortfall_amount", None)
-    if shortfall is not None and shortfall > 0:
-        progress = getattr(result, "progress_rate", None)
-        required = getattr(result, "required_used_amount", None)
-        used = getattr(result, "cumulative_used_amount", None)
-        if progress is not None and required is not None and used is not None:
-            issue_parts.append(
-                f"공정률 {progress:.1f}% 기준 요구 최소 사용액 {required:,.0f}원 대비 "
-                f"누적 사용액 {used:,.0f}원으로 {shortfall:,.0f}원이 부족합니다."
-            )
-        else:
-            issue_parts.append(f"공정률 기준 사용액이 {shortfall:,.0f}원 부족합니다.")
-
     if getattr(result, "needs_human_review", False) and not issue_parts:
         rejection = " ".join((getattr(result, "rejection_reason", "") or "").split()).strip()
-        issue_parts.append(rejection or "카테고리 차원의 추가 검토가 필요합니다.")
+        if "공정률" not in rejection and "공사진척" not in rejection:
+            issue_parts.append(rejection or "카테고리 차원의 추가 검토가 필요합니다.")
 
     return " ".join(issue_parts) if issue_parts else "(없음)"
 

@@ -38,13 +38,27 @@ def _load_static_rule_config(rule_config_path: Path = DEFAULT_RULE_CONFIG_PATH) 
 
 
 _STATIC_RULE_CONFIG = _load_static_rule_config()
+_SUPPLEMENTAL_VALIDATOR_PROFILES = {
+    "CAT_02": {
+        "allow_terms": ["법정 안전검사", "안전검사", "크레인", "화재예방"],
+        "disallow_terms": ["복합기", "유지보수", "분전반"],
+    },
+    "CAT_05": {
+        "disallow_terms": ["음료", "간식"],
+    },
+    "CAT_06": {
+        "disallow_terms": ["사무소", "사무실"],
+    },
+}
 _ACTIVE_VALIDATOR_SYNONYMS = {
     key: {str(value).lower() for value in values}
     for key, values in _STATIC_RULE_CONFIG.get("validator_synonyms", {}).items()
 }
 
 
-def _parse_progress_rules_from_corpus_text(text: str) -> list[tuple[float, float | None, float, str]]:
+def _parse_progress_rules_from_corpus_text(
+    text: str,
+) -> list[tuple[float, float | None, float, str]]:
     cleaned = " ".join((text or "").split())
     if not cleaned:
         return []
@@ -52,11 +66,15 @@ def _parse_progress_rules_from_corpus_text(text: str) -> list[tuple[float, float
     range_pattern = re.compile(r"(\d+)퍼센트\s*이상\s*(\d+)퍼센트\s*미만")
     usage_pattern = re.compile(r"(\d+)퍼센트\s*이상")
 
-    ranges = [(float(m.group(1)), float(m.group(2))) for m in range_pattern.finditer(cleaned)]
+    ranges = [
+        (float(m.group(1)), float(m.group(2))) for m in range_pattern.finditer(cleaned)
+    ]
     usage_rates: list[float] = []
     if "사용기준" in cleaned:
         usage_section = cleaned.split("사용기준", 1)[1]
-        usage_rates = [float(m.group(1)) / 100 for m in usage_pattern.finditer(usage_section)]
+        usage_rates = [
+            float(m.group(1)) / 100 for m in usage_pattern.finditer(usage_section)
+        ]
 
     rules: list[tuple[float, float | None, float, str]] = []
     for idx, (min_rate, max_rate) in enumerate(ranges):
@@ -64,7 +82,7 @@ def _parse_progress_rules_from_corpus_text(text: str) -> list[tuple[float, float
             break
         rules.append((min_rate, max_rate, usage_rates[idx], cleaned))
     if len(usage_rates) > len(ranges):
-        for usage in usage_rates[len(ranges):]:
+        for usage in usage_rates[len(ranges) :]:
             if ranges:
                 last_max = ranges[-1][1]
                 rules.append((last_max, None, usage, cleaned))
@@ -141,7 +159,7 @@ class LegalRulesRepository:
             # id 필드를 source_id 키로도 노출 (기존 스코어링 코드 호환)
             r["source_id"] = r.get("id", "")
             r["cited_laws"] = list(r.get("cited_laws") or [])
-            r["keywords"]   = list(r.get("keywords") or [])
+            r["keywords"] = list(r.get("keywords") or [])
             metadata = dict(r.get("metadata") or {})
             r["metadata"] = metadata
             # original_rule_type이 있으면 우선 사용 (qa/heuristic 계열 복원)
@@ -150,10 +168,18 @@ class LegalRulesRepository:
                 r["rule_type"] = original_rule_type
             else:
                 source_kind = metadata.get("source_kind", "")
-                current_rt  = r.get("rule_type", "")
-                if source_kind == "qa" and current_rt in {"allowed", "disallowed", "limit"}:
+                current_rt = r.get("rule_type", "")
+                if source_kind == "qa" and current_rt in {
+                    "allowed",
+                    "disallowed",
+                    "limit",
+                }:
                     r["rule_type"] = f"qa_{current_rt}"
-                elif source_kind == "heuristic" and current_rt in {"allowed", "disallowed", "limit"}:
+                elif source_kind == "heuristic" and current_rt in {
+                    "allowed",
+                    "disallowed",
+                    "limit",
+                }:
                     r["rule_type"] = f"rule_like_{current_rt}"
             if r.get("limit_pct") is not None:
                 r["limit_pct"] = float(r["limit_pct"])
@@ -227,7 +253,9 @@ class LegalRulesRepository:
                     "category_code": category_code,
                     "rule_type": rule.get("rule_type", ""),
                     "tokens": tokens,
-                    "evidence": _clean_evidence(rule.get("rule_text") or rule.get("keyword") or ""),
+                    "evidence": _clean_evidence(
+                        rule.get("rule_text") or rule.get("keyword") or ""
+                    ),
                 }
             )
 
@@ -242,13 +270,25 @@ class LegalRulesRepository:
     def validator_synonyms(self) -> dict[str, set[str]]:
         raw = self._load_rule_config().get("validator_synonyms", {})
         return {
-            key: {str(value).lower() for value in values}
-            for key, values in raw.items()
+            key: {str(value).lower() for value in values} for key, values in raw.items()
         }
 
     @property
     def validator_profiles(self) -> dict[str, dict[str, list[str]]]:
-        return self._load_rule_config().get("validator_profiles", {})
+        profiles = {
+            code: {key: list(values) for key, values in profile.items()}
+            for code, profile in self._load_rule_config()
+            .get("validator_profiles", {})
+            .items()
+        }
+        for code, additions in _SUPPLEMENTAL_VALIDATOR_PROFILES.items():
+            profile = profiles.setdefault(code, {})
+            for key, values in additions.items():
+                existing = profile.setdefault(key, [])
+                for value in values:
+                    if value not in existing:
+                        existing.append(value)
+        return profiles
 
     @property
     def classifier_profiles(self) -> dict[str, dict]:
@@ -361,7 +401,10 @@ class LegalRulesRepository:
                         seen_keywords.add(token_norm)
                         keywords.append(token_norm)
 
-                if len(cited_laws) >= limit_per_category and len(keywords) >= limit_per_category:
+                if (
+                    len(cited_laws) >= limit_per_category
+                    and len(keywords) >= limit_per_category
+                ):
                     break
 
             hints[category_code] = {
@@ -385,12 +428,16 @@ class LegalRulesRepository:
         for rule in self.rules:
             if category_code and rule.get("category_code") != category_code:
                 continue
-            if not _is_rule_in_category(rule, category_code=category_code, category_name=category_name):
+            if not _is_rule_in_category(
+                rule, category_code=category_code, category_name=category_name
+            ):
                 continue
             limit_pct = rule.get("limit_pct")
             metadata = rule.get("metadata") or {}
             limit_text = metadata.get("limit_rule_text") or rule.get("rule_text") or ""
-            if limit_pct is None and not any(keyword in limit_text for keyword in _LIMIT_HINTS):
+            if limit_pct is None and not any(
+                keyword in limit_text for keyword in _LIMIT_HINTS
+            ):
                 continue
             score = _validator_rule_type_weight(rule.get("rule_type", ""))
             candidates.append(
@@ -409,7 +456,9 @@ class LegalRulesRepository:
         _, limit_pct, text, laws = candidates[0]
         return limit_pct, text, laws
 
-    def find_progress_requirement(self, progress_rate: float | None) -> tuple[float | None, str, list[str]]:
+    def find_progress_requirement(
+        self, progress_rate: float | None
+    ) -> tuple[float | None, str, list[str]]:
         if progress_rate is None:
             return None, "", []
         rules = self._load_progress_rules()
@@ -445,7 +494,9 @@ class LegalRulesRepository:
             )
 
         if structured_rules:
-            structured_rules.sort(key=lambda item: (item[0], item[1] is None, item[1] or math.inf))
+            structured_rules.sort(
+                key=lambda item: (item[0], item[1] is None, item[1] or math.inf)
+            )
             self._progress_rules = structured_rules
             return self._progress_rules
 
@@ -525,7 +576,9 @@ class LegalRulesRepository:
                             rule_type=rule_type,
                             allowed=normalized_allowed,
                             score=score * 0.5,
-                            evidence=_clean_evidence(rule.get("rule_text") or rule.get("keyword") or ""),
+                            evidence=_clean_evidence(
+                                rule.get("rule_text") or rule.get("keyword") or ""
+                            ),
                             referenced_laws=_rule_laws(rule, category_code),
                             limit_pct=rule.get("limit_pct"),
                             source_id=rule.get("source_id", ""),
@@ -534,7 +587,9 @@ class LegalRulesRepository:
                     )
                 continue
 
-            if not _is_rule_in_category(rule, category_code=category_code, category_name=category_name):
+            if not _is_rule_in_category(
+                rule, category_code=category_code, category_name=category_name
+            ):
                 continue
 
             normalized_allowed = _normalized_validator_allowed(
@@ -568,7 +623,9 @@ class LegalRulesRepository:
                 rule_type=rule_type,
                 allowed=normalized_allowed,
                 score=score,
-                evidence=_clean_evidence(rule.get("rule_text") or rule.get("keyword") or ""),
+                evidence=_clean_evidence(
+                    rule.get("rule_text") or rule.get("keyword") or ""
+                ),
                 referenced_laws=_rule_laws(rule, category_code),
                 limit_pct=rule.get("limit_pct"),
                 source_id=rule.get("source_id", ""),
@@ -605,29 +662,113 @@ class LegalRulesRepository:
         # 전역 정책은 항목과 실제로 겹치는 경우에만 최대 2개 추가
         result.extend(global_matches[:2])
 
-        # validator_profiles fallback — 1차 RDB 매칭이 약할 때 profile allow/disallow_terms로 보완
+        # validator_profiles fallback
+        profiles = self.validator_profiles
+        profile = profiles.get(category_code or "", {})
+        disallow_hits = {
+            term
+            for term in profile.get("disallow_terms", [])
+            if term.lower() in item_text_norm
+        }
+        # disallow 신호는 top_score와 무관하게 항상 추가 — LLM 충돌 판단 경로를 열어야 하므로
+        if disallow_hits:
+            disallow_fb = _build_fallback_validator_match(
+                category_code=category_code,
+                category_name=category_name,
+                item_text=item_text_norm,
+                allow_hits=set(),
+                disallow_hits=disallow_hits,
+                validator_profiles=profiles,
+                retrieved_context=retrieved_context,
+            )
+            if disallow_fb:
+                result.append(disallow_fb)
+
+        # allow fallback은 1차 RDB 매칭이 약할 때만 보완 (disallow 없을 때)
         top_score = result[0].score if result else 0.0
-        if top_score < 3.0:
-            profiles = self.validator_profiles
-            profile = profiles.get(category_code or "", {})
+        if top_score < 3.0 and not disallow_hits:
             allow_hits = {
-                term for term in profile.get("allow_terms", [])
+                term
+                for term in profile.get("allow_terms", [])
                 if term.lower() in item_text_norm
             }
-            disallow_hits = {
-                term for term in profile.get("disallow_terms", [])
-                if term.lower() in item_text_norm
-            }
-            fallback = _build_fallback_validator_match(
+            allow_fb = _build_fallback_validator_match(
                 category_code=category_code,
                 category_name=category_name,
                 item_text=item_text_norm,
                 allow_hits=allow_hits,
-                disallow_hits=disallow_hits,
+                disallow_hits=set(),
                 validator_profiles=profiles,
+                retrieved_context=retrieved_context,
             )
-            if fallback:
-                result.append(fallback)
+            if allow_fb:
+                result.append(allow_fb)
+
+        # 인건비/수당 계열은 QA 불허 예시(출장비, 제세공과금 등)가 넓게 매칭될 수 있어
+        # 항목명에 직접적인 허용 프로필 신호가 있으면 함께 보존한다.
+        if category_code == "CAT_01" and not disallow_hits:
+            allow_hits = {
+                term
+                for term in profile.get("allow_terms", [])
+                if term.lower() in item_text_norm
+            }
+            has_compensation_term = any(
+                term in item_text_norm for term in ("급여", "수당", "인건비", "임금")
+            )
+            if allow_hits and has_compensation_term:
+                already_has_profile_allowed = any(
+                    match.rule_type == "profile_allowed" and match.allowed is True
+                    for match in result
+                )
+                if already_has_profile_allowed:
+                    allow_hits = set()
+            else:
+                allow_hits = set()
+            allow_fb = _build_fallback_validator_match(
+                category_code=category_code,
+                category_name=category_name,
+                item_text=item_text_norm,
+                allow_hits=allow_hits,
+                disallow_hits=set(),
+                validator_profiles=profiles,
+                retrieved_context=retrieved_context,
+            )
+            if allow_fb:
+                result.append(allow_fb)
+
+        # CAT_02 소화기 QA는 "불가하나, 화재 위험작업용은 가능" 구조라 불허 파트가
+        # 넓게 매칭된다. 항목명 자체에 화재위험/화재예방/용접 조건이 있으면 허용 신호를 보존한다.
+        if (
+            category_code == "CAT_02"
+            and "소화기" in item_text_norm
+            and not disallow_hits
+        ):
+            allow_hits = {
+                term
+                for term in profile.get("allow_terms", [])
+                if term.lower() in item_text_norm
+            }
+            has_fire_work_term = any(
+                term in item_text_norm for term in ("용접", "화재위험", "화재예방")
+            )
+            if not has_fire_work_term:
+                allow_hits = set()
+            already_has_profile_allowed = any(
+                match.rule_type == "profile_allowed" and match.allowed is True
+                for match in result
+            )
+            if allow_hits and not already_has_profile_allowed:
+                allow_fb = _build_fallback_validator_match(
+                    category_code=category_code,
+                    category_name=category_name,
+                    item_text=item_text_norm,
+                    allow_hits=allow_hits,
+                    disallow_hits=set(),
+                    validator_profiles=profiles,
+                    retrieved_context=retrieved_context,
+                )
+                if allow_fb:
+                    result.append(allow_fb)
 
         result.sort(key=lambda m: m.score, reverse=True)
         return result[:limit]
@@ -644,14 +785,16 @@ _CLASSIFIER_RULE_TYPES = {"category", "allowed", "qa_allowed", "limit", "qa_limi
 _AUTHORITATIVE_RULE_TYPES = {"allowed", "disallowed", "limit", "category"}
 _SECONDARY_RULE_TYPES = {"qa_allowed", "qa_disallowed", "qa_limit"}
 _FALLBACK_RULE_TYPES = {"rule_like_allowed", "rule_like_disallowed", "rule_like_limit"}
-_VALIDATOR_RULE_TYPES = _AUTHORITATIVE_RULE_TYPES | _SECONDARY_RULE_TYPES | _FALLBACK_RULE_TYPES
+_VALIDATOR_RULE_TYPES = (
+    _AUTHORITATIVE_RULE_TYPES | _SECONDARY_RULE_TYPES | _FALLBACK_RULE_TYPES
+)
 _LIMIT_HINTS = ("초과", "%", "분의", "이내")
 _LAW_NAME_고시 = "건설업 산업안전보건관리비 계상 및 사용기준"
 
 # 조항 번호만 있는 경우 → 전체 법령명으로 보완하기 위한 매핑
 _ARTICLE_TO_LAW: dict[str, str] = {
     # ── 산업안전보건법 ──────────────────────────────────────────────
-    "제5조":  "산업안전보건법 제5조",
+    "제5조": "산업안전보건법 제5조",
     "제10조": "산업안전보건법 제10조",
     "제11조": "산업안전보건법 제11조",
     "제14조": "산업안전보건법 제14조",
@@ -682,7 +825,7 @@ _ARTICLE_TO_LAW: dict[str, str] = {
     # ── 산업안전보건법 시행규칙 ───────────────────────────────────
     "제98조": "산업안전보건법 시행규칙 제98조",
     # ── 중대재해 처벌 등에 관한 법률 시행령 ──────────────────────
-    "제4조":  "중대재해처벌법 시행령 제4조",
+    "제4조": "중대재해처벌법 시행령 제4조",
     "제4조제2호": "중대재해처벌법 시행령 제4조제2호",
     "제4조제2호나목": "중대재해처벌법 시행령 제4조제2호나목",
     # ── 건설기술 진흥법 ───────────────────────────────────────────
@@ -702,12 +845,65 @@ _PRIMARY_LAW_BY_CATEGORY = {
     "CAT_09": f"{_LAW_NAME_고시} 제7조제1항제9호",
 }
 _STOPWORDS = {
-    "건설", "건설공사", "건설현장", "현장", "작업장", "근로자", "산업", "안전", "보건", "산업안전", "산업안전보건",
-    "관리비", "비용", "구입", "임대", "설치", "사용", "가능", "가능한지", "항목", "소요", "해당", "따른",
-    "법", "규정", "기준", "제", "호", "목", "등", "위한", "위하여", "대한", "경우", "업무", "관련", "실시",
-    "관리", "예방", "필요", "장비", "시설", "현수", "세트", "인건비",
-    "등에", "따라", "위해", "대해", "로서", "로써", "에서", "에게", "에도", "으로", "부터", "까지",
+    "건설",
+    "건설공사",
+    "건설현장",
+    "현장",
+    "작업장",
+    "근로자",
+    "산업",
+    "안전",
+    "보건",
+    "산업안전",
+    "산업안전보건",
+    "관리비",
+    "비용",
+    "구입",
+    "임대",
+    "설치",
+    "사용",
+    "가능",
+    "가능한지",
+    "항목",
+    "소요",
+    "해당",
+    "따른",
+    "법",
+    "규정",
+    "기준",
+    "제",
+    "호",
+    "목",
+    "등",
+    "위한",
+    "위하여",
+    "대한",
+    "경우",
+    "업무",
+    "관련",
+    "실시",
+    "관리",
+    "예방",
+    "필요",
+    "장비",
+    "시설",
+    "현수",
+    "세트",
+    "인건비",
+    "등에",
+    "따라",
+    "위해",
+    "대해",
+    "로서",
+    "로써",
+    "에서",
+    "에게",
+    "에도",
+    "으로",
+    "부터",
+    "까지",
 }
+
 
 def _tokenize(text: str) -> set[str]:
     tokens = {
@@ -754,17 +950,34 @@ def _score_profile(
             score += 2.5
             evidence.append(f"질의에 보조 분류 신호 '{term}' 포함")
 
-    negative_hits = {term for term in profile.get("negative_terms", set()) if term.lower() in query_text}
+    negative_hits = {
+        term
+        for term in profile.get("negative_terms", set())
+        if term.lower() in query_text
+    }
     if negative_hits:
         score -= 2.5 * len(negative_hits)
         evidence.append(f"비선호 신호 {', '.join(sorted(negative_hits))} 포함")
 
-    if category_code == "CAT_03" and "안전인증" in query_text and "스티커" not in query_text:
+    if (
+        category_code == "CAT_03"
+        and "안전인증" in query_text
+        and "스티커" not in query_text
+    ):
         score += 2.0
     # 보호구 핵심 품목이 직접 언급되면 강하게 보강 (CAT_06 QA룰 토큰 충돌 방지)
     _CAT03_EQUIPMENT = {
-        "안전화", "방진마스크", "방독마스크", "귀마개", "귀덮개",
-        "안전모", "안전대", "보안경", "안전장갑", "방열복", "보호복",
+        "안전화",
+        "방진마스크",
+        "방독마스크",
+        "귀마개",
+        "귀덮개",
+        "안전모",
+        "안전대",
+        "보안경",
+        "안전장갑",
+        "방열복",
+        "보호복",
     }
     if category_code == "CAT_03" and (_CAT03_EQUIPMENT & query_tokens):
         hit = sorted(_CAT03_EQUIPMENT & query_tokens)
@@ -773,7 +986,9 @@ def _score_profile(
     if category_code == "CAT_06" and "kf94" in query_text:
         score += 6.0
         evidence.append("질의에 'KF94'가 포함되어 건강장해예방비 신호가 강함")
-    if category_code == "CAT_04" and any(token.endswith("측정기") for token in query_tokens):
+    if category_code == "CAT_04" and any(
+        token.endswith("측정기") for token in query_tokens
+    ):
         score += 6.0
         evidence.append("품목명이 '측정기' 계열이라 진단/측정비 신호가 강함")
     if category_code == "CAT_02" and "설치" in query_text and "인건비" in query_text:
@@ -831,7 +1046,9 @@ def _score_rule(
     return score, rule["evidence"]
 
 
-def _validator_tokens(text: str, synonyms: dict[str, set[str]] | None = None) -> set[str]:
+def _validator_tokens(
+    text: str, synonyms: dict[str, set[str]] | None = None
+) -> set[str]:
     # synonyms: DB에서 로드한 validator_synonyms (없으면 파일 기반 _ACTIVE_VALIDATOR_SYNONYMS 사용)
     active_synonyms = synonyms if synonyms is not None else _ACTIVE_VALIDATOR_SYNONYMS
     base = _tokenize(text)
@@ -881,9 +1098,8 @@ def _rule_tier(rule_type: str) -> int:
 
 def _is_global_policy(rule: dict) -> bool:
     """category_code가 없는 법령 기반 disallowed 규칙 — 전역 정책으로 취급."""
-    return (
-        rule.get("rule_type") in {"disallowed", "qa_disallowed"}
-        and not rule.get("category_code")
+    return rule.get("rule_type") in {"disallowed", "qa_disallowed"} and not rule.get(
+        "category_code"
     )
 
 
@@ -963,8 +1179,9 @@ def _rule_laws(rule: dict, category_code: str | None) -> list[str]:
             # 세부 조항(제4조제2호)을 기본 조항(제4조)으로 fallback 매핑
             base = re.match(r"(제\d+조)", p)
             if base and base.group(1) in _ARTICLE_TO_LAW:
-                return _ARTICLE_TO_LAW[base.group(1)].rstrip() + p[len(base.group(1)):]
+                return _ARTICLE_TO_LAW[base.group(1)].rstrip() + p[len(base.group(1)) :]
             return p
+
         enriched = " | ".join(_enrich(part) for part in legal_basis.split("|"))
         if enriched not in laws:
             laws.append(enriched)
@@ -1001,10 +1218,9 @@ def _score_validator_rule(
         for key in ("keyword", "item_pattern", "category_name")
     )
     # ★ item·rule 양쪽 모두 synonym 확장 없이 base 토큰만 사용한다.
-    #   synonym 그룹(보호구 전체 등)을 확장하면 "보호구" 한 단어만 있는 규칙이
+    #   synonym 그룹을 확장하면 "보호구" 한 단어만 있는 규칙이
     #   "안전모/안전화/안전대" 등과 전부 겹쳐 오매칭·오버스코어링이 발생한다.
     #   실제 법령 텍스트에 명시된 단어끼리만 겹쳐야 신뢰도 있는 매칭으로 인정한다.
-    #   Synonym 확장은 classifier 쪽(_score_rule)에서만 사용한다.
     rule_tokens = _tokenize(rule_text)
     if not rule_tokens:
         return 0.0
@@ -1052,7 +1268,9 @@ def _normalized_validator_allowed(
     )
 
     if "불가" in text:
-        if "근로자 재해" in text and any(term in item_text for term in ("감리원", "감리자", "방문자")):
+        if "근로자 재해" in text and any(
+            term in item_text for term in ("감리원", "감리자", "방문자")
+        ):
             return False
 
     if rule.get("rule_type") in {"disallowed", "qa_disallowed", "rule_like_disallowed"}:
@@ -1069,35 +1287,42 @@ def _build_fallback_validator_match(
     allow_hits: set[str],
     disallow_hits: set[str],
     validator_profiles: dict[str, dict[str, list[str]]],
+    retrieved_context: str = "",
 ) -> ValidatorRuleMatch | None:
     if not category_code:
         return None
     profile = validator_profiles.get(category_code, {})
     if disallow_hits:
+        evidence = _profile_evidence_text(
+            category_name=category_name,
+            item_text=item_text,
+            hits=disallow_hits,
+            allowed=False,
+        )
         return ValidatorRuleMatch(
             category_code=category_code,
             category_name=category_name,
             rule_type="profile_disallowed",
             allowed=False,
             score=4.5 + len(disallow_hits),
-            evidence=(
-                f"{category_name} 카테고리에서는 '{', '.join(sorted(disallow_hits))}' 관련 항목이 "
-                "예외 또는 제한 조건으로 다뤄질 수 있습니다."
-            ),
+            evidence=evidence,
             referenced_laws=_primary_laws(category_code),
             match_source="corpus_fallback",
         )
     if allow_hits:
+        evidence = _profile_evidence_text(
+            category_name=category_name,
+            item_text=item_text,
+            hits=allow_hits,
+            allowed=True,
+        )
         return ValidatorRuleMatch(
             category_code=category_code,
             category_name=category_name,
             rule_type="profile_allowed",
             allowed=True,
             score=4.0 + len(allow_hits),
-            evidence=(
-                f"{category_name} 카테고리의 일반 허용 범위와 "
-                f"'{', '.join(sorted(allow_hits))}' 신호가 일치합니다."
-            ),
+            evidence=evidence,
             referenced_laws=_primary_laws(category_code),
             match_source="corpus_fallback",
         )
@@ -1110,8 +1335,57 @@ def _build_fallback_validator_match(
                 rule_type="profile_allowed",
                 allowed=True,
                 score=4.0,
-                evidence=f"{category_name} 카테고리의 일반 허용 범위와 '{term}' 신호가 일치합니다.",
+                evidence=_profile_evidence_text(
+                    category_name=category_name,
+                    item_text=item_text,
+                    hits={term},
+                    allowed=True,
+                ),
                 referenced_laws=_primary_laws(category_code),
                 match_source="corpus_fallback",
             )
     return None
+
+
+def _profile_evidence_text(
+    *,
+    category_name: str,
+    item_text: str,
+    hits: set[str],
+    allowed: bool,
+) -> str:
+    hit_text = "', '".join(sorted(hits))
+    if allowed:
+        return (
+            f"{item_text}는 '{hit_text}' 키워드가 감지되어 {category_name}의 허용 검토 대상으로 분류되었습니다. "
+            "세부 사용 목적이 산업재해 예방 목적 및 법령상 허용 범위와 일치하면 산업안전보건관리비 집행 대상으로 볼 수 있습니다."
+        )
+
+    condition_text = _profile_disallow_condition_text(
+        category_name=category_name,
+        item_text=item_text,
+        hits=hits,
+    )
+    return (
+        f"{item_text}는 '{hit_text}' 키워드가 감지되어 {category_name}의 제한 검토 대상으로 분류되었습니다. "
+        f"{condition_text}"
+    )
+
+
+def _profile_disallow_condition_text(*, category_name: str, item_text: str, hits: set[str]) -> str:
+    hit_values = {hit.lower() for hit in hits}
+    item = item_text.lower()
+
+    if "음료" in hit_values or "간식" in hit_values:
+        return "교육 실시 자체에 필요한 비용이 아니라 일반 제공성·복리후생성 비용이면 산업안전보건관리비 집행 대상으로 보기 어렵습니다."
+
+    if "소화기" in item and hit_values & {"사무실", "사무용", "분전반"}:
+        return "화재위험작업 중 근로자 보호 목적이 아니라 사무실·분전반 비치 목적이면 산업안전보건관리비 집행 대상으로 보기 어렵습니다."
+
+    if hit_values & {"복합기", "유지보수"}:
+        return "안전시설 자체의 법정 안전검사비가 아니라 사무기기 유지관리 목적이면 산업안전보건관리비 집행 대상으로 보기 어렵습니다."
+
+    if hit_values & {"사무소", "사무실"} and "방역" in item:
+        return "현장 작업 근로자 감염병 예방 목적이 아니라 사무공간 일반 관리 목적이면 산업안전보건관리비 집행 대상으로 보기 어렵습니다."
+
+    return "해당 비용이 산업재해 예방 목적의 직접 비용이 아니라 복리후생·사무관리·일반 운영 목적이면 산업안전보건관리비 집행 대상으로 보기 어렵습니다."

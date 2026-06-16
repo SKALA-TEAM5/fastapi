@@ -15,6 +15,7 @@ import os
 import re
 import time
 import uuid
+from hashlib import sha256
 from pathlib import Path
 from threading import Lock
 from typing import Any
@@ -30,13 +31,17 @@ DEFAULT_EMBED_MODEL = "jhgan/ko-sroberta-multitask"
 DEFAULT_EMBED_LOCAL_PATH = "/app/models/ko-sroberta-multitask"
 DEFAULT_QDRANT_URL = "http://localhost:6333"
 DEFAULT_COLLECTION = "legal_documents"
+DEFAULT_EMBEDDING_CACHE_TTL = 7 * 24 * 3600
+DEFAULT_COLLECTION_DOCS_CACHE_TTL = 24 * 3600
 
-_embeddings_cache: dict[str, HuggingFaceEmbeddings] = {}
+_embeddings_cache: dict[str, Any] = {}
 _vectorstore_cache: dict[tuple, Any] = {}
 _collection_docs_cache: dict[tuple[str, str], list[Document]] = {}
+_redis_client: Any | None = None
 _embeddings_lock = Lock()
 _vectorstore_lock = Lock()
 _collection_docs_lock = Lock()
+_redis_lock = Lock()
 
 
 class LocalJSONCache:
@@ -96,13 +101,124 @@ def _resolve_embed_model(model_name: str) -> str:
     return local_path if local_path and Path(local_path).exists() else model_name
 
 
-def _get_embeddings(model_name: str = DEFAULT_EMBED_MODEL) -> HuggingFaceEmbeddings:
+def _env_int(name: str, default: int) -> int:
+    raw = os.getenv(name)
+    if not raw:
+        return default
+    try:
+        return int(raw)
+    except ValueError:
+        log.warning("정수 환경변수 파싱 실패: %s=%s", name, raw)
+        return default
+
+
+def _hash_text(value: str) -> str:
+    return sha256(value.encode("utf-8")).hexdigest()
+
+
+def _get_redis_client() -> Any | None:
+    global _redis_client
+
+    redis_url = os.getenv("REDIS_URL", "").strip()
+    if not redis_url:
+        return None
+    if _redis_client is None:
+        with _redis_lock:
+            if _redis_client is None:
+                try:
+                    from redis import Redis
+
+                    client = Redis.from_url(redis_url, decode_responses=True)
+                    client.ping()
+                    _redis_client = client
+                    log.info("Redis 캐시 연결 완료: %s", redis_url)
+                except Exception as e:
+                    log.warning("Redis 캐시 연결 실패: %s", e)
+                    return None
+    return _redis_client
+
+
+def _redis_get_json(key: str) -> Any | None:
+    client = _get_redis_client()
+    if client is None:
+        return None
+    try:
+        raw = client.get(key)
+        return json.loads(raw) if raw else None
+    except Exception as e:
+        log.warning("Redis 캐시 읽기 오류 (%s): %s", key, e)
+        return None
+
+
+def _redis_set_json(key: str, value: Any, ttl: int) -> None:
+    client = _get_redis_client()
+    if client is None:
+        return
+    try:
+        client.setex(key, ttl, json.dumps(value, ensure_ascii=False))
+    except Exception as e:
+        log.warning("Redis 캐시 쓰기 오류 (%s): %s", key, e)
+
+
+def _documents_to_cache_payload(docs: list[Document]) -> list[dict[str, Any]]:
+    return [
+        {
+            "page_content": doc.page_content,
+            "metadata": doc.metadata,
+        }
+        for doc in docs
+    ]
+
+
+def _documents_from_cache_payload(payload: Any) -> list[Document] | None:
+    if not isinstance(payload, list):
+        return None
+    try:
+        return [
+            Document(
+                page_content=str(item.get("page_content") or ""),
+                metadata=dict(item.get("metadata") or {}),
+            )
+            for item in payload
+            if isinstance(item, dict)
+        ]
+    except Exception as e:
+        log.warning("문서 캐시 역직렬화 실패: %s", e)
+        return None
+
+
+class CachedEmbeddings:
+    def __init__(self, embeddings: HuggingFaceEmbeddings, model_name: str) -> None:
+        self._embeddings = embeddings
+        self._model_name = model_name
+
+    def embed_query(self, text: str) -> list[float]:
+        cache_key = f"embedding_query:{_hash_text(self._model_name)}:{_hash_text(text)}"
+        cached = _redis_get_json(cache_key)
+        if isinstance(cached, list):
+            log.info("Redis 임베딩 캐시 히트: %s", cache_key)
+            return [float(value) for value in cached]
+
+        vector = self._embeddings.embed_query(text)
+        ttl = _env_int("EMBEDDING_CACHE_TTL_SECONDS", DEFAULT_EMBEDDING_CACHE_TTL)
+        _redis_set_json(cache_key, vector, ttl)
+        return vector
+
+    def embed_documents(self, texts: list[str]) -> list[list[float]]:
+        return self._embeddings.embed_documents(texts)
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._embeddings, name)
+
+
+def _get_embeddings(model_name: str = DEFAULT_EMBED_MODEL) -> Any:
     resolved_model = _resolve_embed_model(model_name)
     if resolved_model not in _embeddings_cache:
         with _embeddings_lock:
             if resolved_model not in _embeddings_cache:
                 log.info("Embedding 모델 로드 중: %s", resolved_model)
-                _embeddings_cache[resolved_model] = HuggingFaceEmbeddings(model_name=resolved_model)
+                embeddings = HuggingFaceEmbeddings(model_name=resolved_model)
+                _embeddings_cache[resolved_model] = CachedEmbeddings(embeddings, resolved_model)
     return _embeddings_cache[resolved_model]
 
 
@@ -152,6 +268,10 @@ def load_collection_documents(
         with _collection_docs_lock:
             docs = _collection_docs_cache.get(cache_key)
             if docs is None:
+                redis_key = f"collection_docs:{collection}:{_hash_text(url)}"
+                cached_payload = _redis_get_json(redis_key)
+                docs = _documents_from_cache_payload(cached_payload)
+            if docs is None:
                 client = _get_qdrant_client(url)
                 offset = None
                 docs = []
@@ -171,7 +291,10 @@ def load_collection_documents(
                     if next_offset is None:
                         break
                     offset = next_offset
-                _collection_docs_cache[cache_key] = docs
+                redis_key = f"collection_docs:{collection}:{_hash_text(url)}"
+                ttl = _env_int("COLLECTION_DOCS_CACHE_TTL_SECONDS", DEFAULT_COLLECTION_DOCS_CACHE_TTL)
+                _redis_set_json(redis_key, _documents_to_cache_payload(docs), ttl)
+            _collection_docs_cache[cache_key] = docs
     return docs
 
 
@@ -179,3 +302,11 @@ def _invalidate_collection_cache(collection: str) -> None:
     target_keys = [key for key in _collection_docs_cache if key[0] == collection]
     for key in target_keys:
         _collection_docs_cache.pop(key, None)
+    client = _get_redis_client()
+    if client is None:
+        return
+    try:
+        for key in client.scan_iter(f"collection_docs:{collection}:*"):
+            client.delete(key)
+    except Exception as e:
+        log.warning("Redis 컬렉션 캐시 무효화 실패 (%s): %s", collection, e)
