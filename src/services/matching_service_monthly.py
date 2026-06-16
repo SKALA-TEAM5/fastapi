@@ -631,21 +631,39 @@ def _check_hard_gates(
             )
 
     # ── Gate 2: 금액 ─────────────────────────────────────────
-    # delivery_statement는 VLM이 공급가액만 반환할 수 있으므로
-    # _resolve_gate2_amount()로 VAT 보정 후 비교
-    usage_amount   = usage_item.get("amount")
-    receipt_amount = _resolve_gate2_amount(receipt, usage_amount)
-    if usage_amount is not None and receipt_amount is not None:
+    # 사용내역서 금액(VAT 포함)과 비교할 영수증 금액 후보:
+    #   ① 영수증 총액(_resolve_gate2_amount: VAT 보정)
+    #   ② 사용내역과 가장 유사한 "품목 1건"의 VAT 포함 금액(_find_best_receipt_item_amount)
+    # ②가 핵심 — 다품목 세금계산서/거래명세표는 총액(=여러 품목 합)이 단일 사용내역과
+    # 맞지 않으므로, 해당 품목의 VAT 포함 소계로 비교해야 올바른 증빙이 Gate를 통과한다.
+    usage_amount = usage_item.get("amount")
+    candidates: list[int] = []
+    total_cand = _resolve_gate2_amount(receipt, usage_amount)
+    if total_cand is not None:
+        candidates.append(total_cand)
+    _, best_item_amount = _find_best_receipt_item_amount(
+        usage_item.get("name") or usage_item.get("description", ""),
+        receipt.get("items", []),
+        doc_type=receipt.get("doc_type"),
+    )
+    if best_item_amount is not None:
+        candidates.append(best_item_amount)
+
+    if usage_amount is not None and candidates:
         try:
-            a1, a2 = int(usage_amount), int(receipt_amount)
-            if max(a1, a2) > 0:
-                diff_pct = abs(a1 - a2) / max(a1, a2)
-                if diff_pct > GATE_AMOUNT_PCT:
-                    failed.append(
-                        f"금액 {diff_pct * 100:.1f}% 차이 "
-                        f"(내역서: {a1:,}원 / 영수증: {a2:,}원, "
-                        f"허용: ±{GATE_AMOUNT_PCT * 100:.0f}%)"
-                    )
+            a1 = int(usage_amount)
+            passed_amount = any(
+                max(a1, int(c)) > 0 and abs(a1 - int(c)) / max(a1, int(c)) <= GATE_AMOUNT_PCT
+                for c in candidates
+            )
+            if not passed_amount:
+                nearest = min(candidates, key=lambda c: abs(a1 - int(c)))
+                diff_pct = abs(a1 - int(nearest)) / max(a1, int(nearest), 1)
+                failed.append(
+                    f"금액 {diff_pct * 100:.1f}% 차이 "
+                    f"(내역서: {a1:,}원 / 영수증: {int(nearest):,}원, "
+                    f"허용: ±{GATE_AMOUNT_PCT * 100:.0f}%)"
+                )
         except (TypeError, ValueError):
             failed.append("금액 파싱 오류")
 
