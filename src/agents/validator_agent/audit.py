@@ -315,6 +315,17 @@ def _verbalize_from_match(
     return f"{law} 기준 허용 범위를 벗어난 것으로 확인됩니다."
 
 
+def _item_is_signage(item_name: str) -> bool:
+    """항목명에 '표지판'이 포함되면 안전표지판류로 보고 항상 허용 처리한다.
+
+    일반 규칙("안전시설물 설치비용은 사용 불가")과 특정 예외("교통안전표지판은
+    조건부 사용 가능")가 동시에 매칭되어 애매하게 갈리는 항목이라, 운영상 항목명
+    기준으로 확정 허용한다.
+    """
+    name = re.sub(r"\s+", "", item_name or "")
+    return "표지판" in name
+
+
 def _build_item_judgment(bundle: ItemRuleBundle, *, category_name: str) -> ItemJudgment:
     allowed = bundle.top_allowed
     disallowed = bundle.top_disallowed
@@ -324,6 +335,7 @@ def _build_item_judgment(bundle: ItemRuleBundle, *, category_name: str) -> ItemJ
         item_name=bundle.item.item_name,
         exception_text=exception_summary or exception_source,
     )
+    item_is_signage = _item_is_signage(bundle.item.item_name)
 
     # 조건부 불허 규칙은 항목 자체를 확정 불허하지 않는다.
     # 운영상 allowed=True 항목은 "적절"로 넘기고, 확인 조건은 reason_text에 남긴다.
@@ -340,7 +352,9 @@ def _build_item_judgment(bundle: ItemRuleBundle, *, category_name: str) -> ItemJ
         )
     )
 
-    if exception_directly_disallows_item:
+    if item_is_signage:
+        item_allowed = True
+    elif exception_directly_disallows_item:
         item_allowed = False
     elif disallowed_is_conditional or llm_disallowed_is_conditional:
         # 조건부 불허(RDB) 또는 LLM이 조건부 언어("충족해야", "안전인증" 등)로 불허 판단 →
@@ -382,12 +396,30 @@ def _build_item_judgment(bundle: ItemRuleBundle, *, category_name: str) -> ItemJ
     else:
         best = disallowed or allowed or (bundle.matches[0] if bundle.matches else None)
     has_conflict = bool(allowed and disallowed and abs(allowed.score - disallowed.score) < 1.0)
+    # llm_fallback이 조건부 언어 힌트 없이("충족해야"/"안전인증" 등 無) 확정적으로 불허
+    # 판단했고 그 결과 실제로 item_allowed=False가 된 경우("사무실 소화기 구입" 등) →
+    # exception_summary/has_conflict는 이 disallowed 매칭과 무관한 다른 매칭(예: 같은
+    # 카테고리의 일반 허용 규정 본문에 우연히 들어있는 "...사용 불가" 단서 문구)에서
+    # 추출된 노이즈일 뿐이다. LLM이 이미 전체 컨텍스트를 보고 확정 판단했으므로 그 노이즈
+    # 때문에 "부적절"이 "검토필요"로 완화되지 않도록 한다.
+    llm_confirmed_disallow = bool(
+        disallowed is not None
+        and getattr(disallowed, "match_source", "") == "llm_fallback"
+        and not item_allowed
+        and not disallowed_is_conditional
+        and not llm_disallowed_is_conditional
+    )
     # 조건부 불허이면 조건 확인이 필요하므로 needs_human_review 강제 설정
+    # exception_directly_disallows_item=True(항목명에 직접 매칭된 확정 불허)이거나
+    # llm_confirmed_disallow=True(LLM이 조건 없이 확정 불허로 판단)인 경우는
+    # 네 가지 사유(exception_summary/has_conflict/disallowed_is_conditional/
+    # llm_disallowed_is_conditional) 전부 검토 대상에서 제외한다.
+    # item_is_signage(표지판류)는 항목명 기준으로 확정 허용했으므로 검토 대상에서 제외한다.
     needs_review = bool(
-        exception_summary
-        or has_conflict
-        or disallowed_is_conditional
-        or llm_disallowed_is_conditional
+        not item_is_signage
+        and not exception_directly_disallows_item
+        and not llm_confirmed_disallow
+        and (exception_summary or has_conflict or disallowed_is_conditional or llm_disallowed_is_conditional)
     )
     reasoning = "직접 매칭된 규칙이 없습니다."
     referenced_laws: list[str] = []
@@ -438,6 +470,11 @@ def _build_item_judgment(bundle: ItemRuleBundle, *, category_name: str) -> ItemJ
             fallback=bundle.reason_text,
             item_name=bundle.item.item_name,
         ),
+        # llm_confirmed_disallow 경로 외에도, 항목이 확정 불허(item_allowed=False)로
+        # 떨어진 경우는 전부 내부 reason_text(법령 원문 기반, 항목별 구체 사유)를 그대로
+        # 쓴다. orchestrator의 LLM 재생성 단계가 "사무실 소화기 구입"처럼 구체적인 사유를
+        # 뭉뚱그려 일반화해버리는 문제를 막기 위함.
+        force_reason_text=not item_allowed,
     )
 
 

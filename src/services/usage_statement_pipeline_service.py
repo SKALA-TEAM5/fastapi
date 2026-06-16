@@ -449,6 +449,7 @@ def parse_usage_statement(
         "parse_status": (parsed_usage or {}).get("parse_status", "SUCCESS"),
         "item_count": len(line_items),
         "items": items_with_id,
+        "classifier_details": classifier_details or {},
         "classifier_changed_count": classifier_changed_count,
         "elapsed_sec": elapsed,
     }

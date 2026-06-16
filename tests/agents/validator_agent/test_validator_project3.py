@@ -9,7 +9,11 @@ project_id=3, usage_statement_id=2 validator 테스트 스크립트.
   python tests/agents/validator_agent/test_validator_project3.py
   python tests/agents/validator_agent/test_validator_project3.py --model gpt-4o
   python tests/agents/validator_agent/test_validator_project3.py --verbose
-  python tests/agents/validator_agent/test_validator_project3.py --full-payload
+
+기본 출력에 [legal swagger 응답과 동일한 details.payload 전체]가 항상 포함됩니다.
+이건 실제 /orchestrator/usage-statements/legal 호출 시 agent_logs.details.payload에
+저장되는 것과 동일한 구조({usage_statement_id, results, todos, categories})이며,
+categories[].items[].legalBasis / reviewReason이 곧 프론트/보고서로 내려가는 실제 값입니다.
 """
 
 import argparse
@@ -40,13 +44,14 @@ from src.services.orchestrator_service import (
     _legal_frontend_categories,
     _legal_item_results_from_audit,
     _legal_payload_item_results,
+    _legal_todo_payload,
     _linked_files_by_item_id,
 )
 
 load_dotenv()
 
-TARGET_PROJECT_ID = 3
-TARGET_USAGE_STATEMENT_ID = 2
+TARGET_PROJECT_ID = 2
+TARGET_USAGE_STATEMENT_ID = 11
 
 
 # ── DB 연결 ──────────────────────────────────────────────────────────────────
@@ -210,7 +215,6 @@ def main() -> None:
     )
     parser.add_argument("--model", default="gpt-4o-mini")
     parser.add_argument("--verbose", "-v", action="store_true")
-    parser.add_argument("--full-payload", action="store_true")
     parser.add_argument(
         "--debug-items",
         action="store_true",
@@ -364,16 +368,11 @@ def main() -> None:
         f"  소요 시간         : {elapsed_validate:.1f}s (validate) / {elapsed_total:.1f}s (total)"
     )
 
-    print("\n[item_results]")
+    print("\n[item_results] (raw, 프론트 변환 전 — 참고용)")
     print(json.dumps(payload_item_results, ensure_ascii=False, indent=2, default=str))
 
     todos = [
-        {
-            "usage_statement_item_id": row.get("item_id"),
-            "category_code": row.get("category_code"),
-            "category_name": CATEGORIES.get(str(row.get("category_code") or "")),
-            "reason": f"법령 검토 필요: {row.get('reason') or row.get('status')}",
-        }
+        _legal_todo_payload(row, linked_files_by_item_id)
         for row in item_results
         if row["status"] != "적절"
     ]
@@ -381,9 +380,17 @@ def main() -> None:
         print("\n[todos]")
         print(json.dumps(todos, ensure_ascii=False, indent=2, default=str))
 
-    if args.full_payload:
-        print("\n[categories payload 전체]")
-        print(json.dumps(categories, ensure_ascii=False, indent=2, default=str))
+    # 실제 legal swagger(/orchestrator/usage-statements/legal)가 agent_logs.details.payload에
+    # 저장하는 것과 동일한 구조. categories[].items[].legalBasis / reviewReason이
+    # 여기 들어있는 값이 실제 프론트/리포트로 내려가는 값이다 (_run_legal_agent, orchestrator_service.py:1359-1368 참고).
+    legal_details_payload = {
+        "usage_statement_id": TARGET_USAGE_STATEMENT_ID,
+        "results": payload_item_results,
+        "todos": todos,
+        "categories": categories,
+    }
+    print("\n[legal swagger 응답과 동일한 details.payload 전체]")
+    print(json.dumps(legal_details_payload, ensure_ascii=False, indent=2, default=str))
 
     if args.verbose:
         print("\n[AuditResponse 전체]")
