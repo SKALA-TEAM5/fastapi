@@ -19,6 +19,7 @@ from src.agents.validator_agent.rule_matcher import CategoryRuleBundle
 @dataclass
 class CategoryComputation:
     total: float
+    limit_checked_total: float
     limit_pct: float | None
     limit_amount: float | None
     exceeded: bool
@@ -40,11 +41,13 @@ def calculate_category_metrics(
     total_cumulative_used_amount: float | None = None,
 ) -> CategoryComputation:
     total = sum(item.amount for item in block.items)
+    limit_pct = rule_bundle.limit_pct
+    limit_checked_total = total
     limit_amount = (
-        block.base_amount * rule_bundle.limit_pct
-        if rule_bundle.limit_pct is not None else None
+        block.base_amount * limit_pct
+        if limit_pct is not None else None
     )
-    exceeded = bool(limit_amount is not None and total > limit_amount)
+    exceeded = bool(limit_amount is not None and limit_checked_total > limit_amount)
 
     cumulative_used_amount = _to_float(
         block.summary.get("누적사용금액") or block.summary.get("cumulative_amount")
@@ -63,7 +66,8 @@ def calculate_category_metrics(
 
     return CategoryComputation(
         total=total,
-        limit_pct=rule_bundle.limit_pct,
+        limit_checked_total=limit_checked_total,
+        limit_pct=limit_pct,
         limit_amount=limit_amount,
         exceeded=exceeded,
         progress_rate=block.progress_rate,

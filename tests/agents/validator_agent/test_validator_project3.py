@@ -26,11 +26,15 @@ import psycopg2.extras
 from dotenv import load_dotenv
 from langchain_openai import ChatOpenAI
 
-from src.agents.validator_agent.agent import summarize_audit_response, validate_usage_statement
+from src.agents.validator_agent.agent import (
+    summarize_audit_response,
+    validate_usage_statement,
+)
 from src.core import llm_config
 from src.schemas.classifier import CATEGORIES
 from src.schemas.validator import AuditResponse
 from src.services.orchestrator_service import (
+    _legal_apply_generated_item_reasons,
     _legal_basis_by_citation,
     _legal_citations_from_results,
     _legal_frontend_categories,
@@ -47,6 +51,7 @@ TARGET_USAGE_STATEMENT_ID = 2
 
 # ── DB 연결 ──────────────────────────────────────────────────────────────────
 
+
 def _get_conn():
     return psycopg2.connect(
         host=os.getenv("POSTGRES_HOST", "localhost"),
@@ -59,6 +64,7 @@ def _get_conn():
 
 
 # ── DB → v1_input 조립 ───────────────────────────────────────────────────────
+
 
 def fetch_v1_input(usage_statement_id: int) -> dict:
     with _get_conn() as conn:
@@ -125,14 +131,22 @@ def fetch_v1_input(usage_statement_id: int) -> dict:
             "source_file_id": row["source_file_id"],
             "report_month": str(row["report_month"]) if row["report_month"] else None,
             "revision_no": row["revision_no"],
-            "document_written_date": str(row["document_written_date"]) if row["document_written_date"] else None,
-            "cumulative_progress_rate": float(row["cumulative_progress_rate"]) if row["cumulative_progress_rate"] is not None else None,
+            "document_written_date": str(row["document_written_date"])
+            if row["document_written_date"]
+            else None,
+            "cumulative_progress_rate": float(row["cumulative_progress_rate"])
+            if row["cumulative_progress_rate"] is not None
+            else None,
         },
         "usage_statement_summaries": summaries,
         "usage_statement_items": items,
         "validator_context": {
-            "safety_budget_total": int(row["appropriated_amount"]) if row["appropriated_amount"] else None,
-            "cumulative_progress_rate": float(row["cumulative_progress_rate"]) if row["cumulative_progress_rate"] is not None else None,
+            "safety_budget_total": int(row["appropriated_amount"])
+            if row["appropriated_amount"]
+            else None,
+            "cumulative_progress_rate": float(row["cumulative_progress_rate"])
+            if row["cumulative_progress_rate"] is not None
+            else None,
         },
     }
 
@@ -189,6 +203,7 @@ def _validator_input_from_v1(v1_input: dict) -> dict:
 
 # ── 실행 ─────────────────────────────────────────────────────────────────────
 
+
 def main() -> None:
     parser = argparse.ArgumentParser(
         description=f"project_id={TARGET_PROJECT_ID}, usage_statement_id={TARGET_USAGE_STATEMENT_ID} validator 테스트 (토큰 추적 포함)"
@@ -219,7 +234,9 @@ def main() -> None:
 
     W = 70
     print(f"\n{'=' * W}")
-    print(f"  project_id={TARGET_PROJECT_ID} / usage_statement_id={TARGET_USAGE_STATEMENT_ID}  |  model: {args.model}")
+    print(
+        f"  project_id={TARGET_PROJECT_ID} / usage_statement_id={TARGET_USAGE_STATEMENT_ID}  |  model: {args.model}"
+    )
     print(f"{'=' * W}\n")
 
     # 1. DB 조회
@@ -228,10 +245,14 @@ def main() -> None:
     validator_input = _validator_input_from_v1(v1_input)
     print("[DB 조회 완료]")
     print(f"  project_id       : {v1_input['project']['id']}")
-    budget = v1_input['validator_context']['safety_budget_total']
+    budget = v1_input["validator_context"]["safety_budget_total"]
     print(f"  산안비총액        : {budget:,}" if budget else "  산안비총액        : -")
-    rate = v1_input['validator_context']['cumulative_progress_rate']
-    print(f"  누계공정률        : {rate}%" if rate is not None else "  누계공정률        : -")
+    rate = v1_input["validator_context"]["cumulative_progress_rate"]
+    print(
+        f"  누계공정률        : {rate}%"
+        if rate is not None
+        else "  누계공정률        : -"
+    )
     print(f"  summaries 수      : {len(v1_input['usage_statement_summaries'])}")
     print(f"  items 수          : {len(v1_input['usage_statement_items'])}")
 
@@ -244,17 +265,27 @@ def main() -> None:
     t1 = perf_counter()
     response: AuditResponse = validate_usage_statement(document=validator_input)
     elapsed_validate = perf_counter() - t1
-    summary_response = summarize_audit_response(response=response, usage_statement_id=TARGET_USAGE_STATEMENT_ID)
+    summary_response = summarize_audit_response(
+        response=response, usage_statement_id=TARGET_USAGE_STATEMENT_ID
+    )
     elapsed_total = perf_counter() - t0
 
     # 3. 토큰 집계 출력 (핵심 검증 포인트)
-    print(f"[토큰 집계]")
+    print("[토큰 집계]")
     total_tokens = response.total_token_usage
-    print(f"  전체 토큰 합계    : {total_tokens:,}" if total_tokens else "  전체 토큰 합계    : 0 (LLM 미사용 또는 집계 오류)")
-    print(f"  카테고리별:")
+    print(
+        f"  전체 토큰 합계    : {total_tokens:,}"
+        if total_tokens
+        else "  전체 토큰 합계    : 0 (LLM 미사용 또는 집계 오류)"
+    )
+    print("  카테고리별:")
     for cat_code, cat_result in sorted(response.categories.items()):
         cat_name = CATEGORIES.get(cat_code, "")
-        label = f"{cat_code} ({cat_name})" if cat_name and cat_name != cat_code else cat_code
+        label = (
+            f"{cat_code} ({cat_name})"
+            if cat_name and cat_name != cat_code
+            else cat_code
+        )
         item_count = len(cat_result.items)
         print(f"    {label}: {cat_result.token_usage:,} tokens  ({item_count}항목)")
 
@@ -265,7 +296,9 @@ def main() -> None:
             cat_name = CATEGORIES.get(cat_code, cat_code)
             for item in cat_result.items:
                 verdict = "✓ 허용" if item.allowed else "✗ 불허"
-                print(f"  [{cat_code}] {item.item:30s}  {verdict}  source={item.judgment_source}  conf={item.confidence:.2f}")
+                print(
+                    f"  [{cat_code}] {item.item:30s}  {verdict}  source={item.judgment_source}  conf={item.confidence:.2f}"
+                )
                 if item.reasoning:
                     print(f"    evidence : {item.reasoning[:150]}")
                 if item.reason_text:
@@ -299,7 +332,13 @@ def main() -> None:
         category_rows=category_rows,
     )
     linked_files_by_item_id = _linked_files_by_item_id(TARGET_USAGE_STATEMENT_ID)
-    legal_basis_by_source_id = _legal_basis_by_citation(_legal_citations_from_results(item_results))
+    legal_basis_by_source_id = _legal_basis_by_citation(
+        _legal_citations_from_results(item_results)
+    )
+    _legal_apply_generated_item_reasons(
+        item_results=item_results,
+        legal_basis_by_source_id=legal_basis_by_source_id,
+    )
     categories = _legal_frontend_categories(
         item_results=item_results,
         category_rows=category_rows,
@@ -310,14 +349,20 @@ def main() -> None:
 
     review_count = sum(1 for row in item_results if row["status"] != "적절")
     result_code = "hil" if review_count else "success"
-    reason = "법령 검토 결과 특이사항 없음" if review_count == 0 else f"법령 검토 결과 보고서 반영 대상 {review_count}건"
+    reason = (
+        "법령 검토 결과 특이사항 없음"
+        if review_count == 0
+        else f"법령 검토 결과 보고서 반영 대상 {review_count}건"
+    )
 
     # 5. 최종 결과 출력
-    print(f"\n[검증 결과]")
+    print("\n[검증 결과]")
     print(f"  result_code      : {result_code}")
     print(f"  reason           : {reason}")
     print(f"  이슈 항목         : {review_count}건")
-    print(f"  소요 시간         : {elapsed_validate:.1f}s (validate) / {elapsed_total:.1f}s (total)")
+    print(
+        f"  소요 시간         : {elapsed_validate:.1f}s (validate) / {elapsed_total:.1f}s (total)"
+    )
 
     print("\n[item_results]")
     print(json.dumps(payload_item_results, ensure_ascii=False, indent=2, default=str))

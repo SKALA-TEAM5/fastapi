@@ -26,6 +26,7 @@ from src.agents.report_agent.context_builder import build_report_context
 from src.agents.safety_doc_agent.agent import check_missing_evidence_batch
 from src.agents.classifier_agent.agent import review_usage_statement
 from src.agents.validator_agent.agent import summarize_audit_response, validate_usage_statement
+from src.agents.validator_agent.presenter import _synthesize_item_reason_with_llm
 from src.core.config import (
     LEGAL_DATABASE_URL,
     VISION_AGENT_BASE_URL,
@@ -1328,6 +1329,10 @@ def _run_legal_agent(
         )
         linked_files_by_item_id = _linked_files_by_item_id(usage_statement_id)
         legal_basis_by_source_id = _legal_basis_by_citation(_legal_citations_from_results(item_results))
+        _legal_apply_generated_item_reasons(
+            item_results=item_results,
+            legal_basis_by_source_id=legal_basis_by_source_id,
+        )
         frontend_categories = _legal_frontend_categories(
             item_results=item_results,
             category_rows=category_rows,
@@ -1571,20 +1576,221 @@ def _legal_item_results_from_audit(
         ]
         item_rows = category_rows.get(category_code) or []
         for raw_item, judgment in zip(item_rows, category_result.items):
-            status = _legal_status_from_judgment(judgment, summary.status if summary else category_result.status)
+            status = _legal_status_from_judgment(
+                judgment,
+                summary.status if summary else category_result.status,
+                category_result=category_result,
+            )
             citations = _legal_item_citations(judgment, source_citations)
             results.append(
                 {
                     "item_id": raw_item["행ID"],
                     "item_name": raw_item.get("항목명") or "",
+                    "amount": _number_or_none(raw_item.get("금액")) or 0,
                     "category_code": category_code,
                     "category_name": CATEGORIES.get(category_code, category_code),
                     "status": status,
                     "reason": judgment.reason_text or judgment.review_reason or judgment.reasoning or "",
                     "citations": citations,
+                    "_base_amount": getattr(audit_response, "base_amount", None),
+                    "_judgment": judgment,
+                    "_category_result": category_result,
                 }
             )
     return results
+
+
+def _legal_apply_generated_item_reasons(
+    *,
+    item_results: list[dict[str, Any]],
+    legal_basis_by_source_id: dict[str, dict[str, Any]],
+) -> None:
+    for item_result in item_results:
+        judgment = item_result.get("_judgment")
+        category_result = item_result.get("_category_result")
+        if judgment is None or category_result is None:
+            continue
+        legal_basis_context = _legal_basis_reason_context(
+            item_result.get("citations") or [],
+            legal_basis_by_source_id,
+        )
+        item_result["reason"] = _legal_generated_item_reason(
+            category_name=str(item_result.get("category_name") or ""),
+            judgment=judgment,
+            category_result=category_result,
+            citations=item_result.get("citations") or [],
+            legal_basis_by_source_id=legal_basis_by_source_id,
+            legal_basis_context=legal_basis_context,
+        )
+        _legal_apply_detected_limit_status(
+            item_result=item_result,
+            judgment=judgment,
+            legal_basis_context=legal_basis_context,
+        )
+
+
+def _legal_generated_item_reason(
+    *,
+    category_name: str,
+    judgment,
+    category_result,
+    citations: list[dict[str, Any]],
+    legal_basis_by_source_id: dict[str, dict[str, Any]],
+    legal_basis_context: str | None = None,
+) -> str:
+    generated_reason = _synthesize_item_reason_with_llm(
+        category_name=category_name,
+        item=judgment,
+        result=category_result,
+        legal_basis_context=(
+            legal_basis_context
+            if legal_basis_context is not None
+            else _legal_basis_reason_context(citations, legal_basis_by_source_id)
+        ),
+    )
+    reason = generated_reason or judgment.reason_text or judgment.review_reason or judgment.reasoning or ""
+    return _legal_clean_final_reason(str(reason or ""))
+
+
+def _legal_basis_reason_context(
+    citations: list[dict[str, Any]],
+    legal_basis_by_source_id: dict[str, dict[str, Any]],
+) -> str:
+    basis_payload = _legal_basis_payload(
+        _legal_without_progress_citations(citations),
+        legal_basis_by_source_id,
+    )
+    parts: list[str] = []
+    for basis in basis_payload[:3]:
+        law_name = str(basis.get("lawName") or "")
+        article = str(basis.get("article") or "")
+        clause = str(basis.get("clause") or "")
+        original_text = str(basis.get("originalText") or "")
+        summary = str(basis.get("summary") or "")
+        line = " ".join(part for part in (law_name, article, clause, original_text, summary) if part)
+        if line:
+            parts.append(line[:600])
+    return "\n".join(parts)[:1600]
+
+
+def _legal_apply_detected_limit_status(*, item_result: dict[str, Any], judgment, legal_basis_context: str) -> bool:
+    amount = _number_or_none(item_result.get("amount"))
+    if amount is None:
+        amount = _number_or_none(getattr(judgment, "amount", None))
+    if amount is None:
+        return False
+
+    # 1) 구조화된 항목 단위 인정 비율(item_limit_pct)이 있으면 이를 우선 사용한다.
+    #    이 값은 judge/rule_matcher 단계에서 RDB 룰 또는 LLM이 법령 맥락에서 명시적으로
+    #    추출한 비율이며, 자유 텍스트에서 "%"를 정규식으로 긁어내는 것보다 신뢰도가 높다.
+    structured_pct = _number_or_none(getattr(judgment, "item_limit_pct", None))
+    if structured_pct is not None and 0 < structured_pct <= 1:
+        limit_type, limit_pct = "cost_ratio", structured_pct
+    else:
+        # 2) 구조화된 값이 없으면 기존처럼 reason/reasoning 텍스트에서 "NN%" 패턴을 탐지한다 (fallback).
+        context = "\n".join(
+            str(part or "")
+            for part in (
+                legal_basis_context,
+                item_result.get("reason"),
+                getattr(judgment, "reasoning", ""),
+                getattr(judgment, "reason_text", ""),
+            )
+        )
+        limit = _legal_detect_limit_rule(context)
+        if limit is None:
+            return False
+        limit_type, limit_pct = limit
+
+    recognized_amount = amount * limit_pct
+    if amount <= recognized_amount:
+        return False
+    exceeded_amount = amount - recognized_amount
+    limit_reason = (
+        f"해당 항목 비용 {amount:,.0f}원 기준 인정 비율 {limit_pct * 100:g}%가 적용되어 "
+        f"인정 가능 금액은 {recognized_amount:,.0f}원입니다. 초과 금액은 {exceeded_amount:,.0f}원으로, "
+        f"해당 초과분은 산업안전보건관리비 인정 범위를 벗어납니다."
+    )
+
+    item_result["status"] = "부적절"
+    item_result["recognized_amount"] = max(0, min(amount, recognized_amount))
+    item_result["disputed_amount"] = max(0, amount - item_result["recognized_amount"])
+    item_result["detected_limit_percent"] = limit_pct * 100
+    item_result["detected_limit_type"] = limit_type
+    item_result["reason"] = _legal_append_limit_reason(
+        base_reason=str(item_result.get("reason") or ""),
+        limit_reason=limit_reason,
+    )
+    return True
+
+
+def _legal_append_limit_reason(*, base_reason: str, limit_reason: str) -> str:
+    base = _legal_remove_generic_limit_sentences(
+        _legal_clean_final_reason(str(base_reason or ""))
+    )
+    limit = _legal_clean_final_reason(str(limit_reason or ""))
+    if not base:
+        return limit
+    if not limit or limit in base:
+        return base
+    return f"{base} 다만, {limit}"
+
+
+def _legal_remove_generic_limit_sentences(reason: str) -> str:
+    text = " ".join((reason or "").split()).strip()
+    if not text:
+        return ""
+    sentences = re.split(r"(?<=[.!?。])\s+|(?<=다\.)\s*", text)
+    kept = [
+        sentence.strip()
+        for sentence in sentences
+        if sentence.strip()
+        and not (
+            any(keyword in sentence for keyword in ("카테고리", "집행액", "법정 한도", "한도"))
+            and any(keyword in sentence for keyword in ("초과", "검토", "부적절", "불허"))
+        )
+    ]
+    return " ".join(kept).strip()
+
+
+def _legal_detect_limit_rule(text: str) -> tuple[str, float] | None:
+    normalized = " ".join((text or "").split())
+    if not normalized or "%" not in normalized:
+        return None
+
+    cost_ratio_candidates: list[float] = []
+    for match in re.finditer(r"(\d+(?:\.\d+)?)\s*%", normalized):
+        start = max(0, match.start() - 80)
+        end = min(len(normalized), match.end() + 80)
+        window = normalized[start:end]
+        try:
+            pct = float(match.group(1)) / 100
+        except ValueError:
+            continue
+        if not 0 < pct <= 1:
+            continue
+        if _legal_is_cost_ratio_limit_window(window):
+            cost_ratio_candidates.append(pct)
+    if cost_ratio_candidates:
+        return "cost_ratio", min(cost_ratio_candidates)
+    return None
+
+
+def _legal_is_cost_ratio_limit_window(text: str) -> bool:
+    normalized = re.sub(r"\s+", "", text or "")
+    has_cost_ratio = any(
+        pattern in normalized
+        for pattern in (
+            "구입·임대비용의",
+            "구입임대비용의",
+            "구입ㆍ임대비용의",
+            "구입·임대",
+            "구입임대",
+            "해당비용의",
+            "비용의",
+        )
+    ) or bool(re.search(r"비용.{0,15}\d+(?:\.\d+)?\s*%", text or ""))
+    return has_cost_ratio and any(keyword in text for keyword in ("해당", "인정", "사용", "지원", "가능", "까지", "범위"))
 
 
 def _legal_frontend_categories(
@@ -1612,9 +1818,13 @@ def _legal_frontend_categories(
             decision = _frontend_legal_decision(status)
             category_decisions.append(decision)
             amount = _number_or_none(row.get("금액")) or 0
-            recognized_amount = amount if decision == "appropriate" else 0
-            disputed_amount = 0 if decision == "appropriate" else amount
-            review_reason = str((item_result or {}).get("reason") or "")
+            recognized_amount = _number_or_none((item_result or {}).get("recognized_amount"))
+            disputed_amount = _number_or_none((item_result or {}).get("disputed_amount"))
+            if recognized_amount is None:
+                recognized_amount = amount if decision == "appropriate" else 0
+            if disputed_amount is None:
+                disputed_amount = 0 if decision == "appropriate" else amount
+            review_reason = _legal_clean_final_reason(str((item_result or {}).get("reason") or ""))
             category_items.append(
                 {
                     "usageStatementItemId": item_id,
@@ -1627,7 +1837,7 @@ def _legal_frontend_categories(
                     "reviewReason": review_reason,
                     "problemFiles": linked_files_by_item_id.get(item_id, []) if item_id is not None else [],
                     "legalBasis": _legal_basis_payload(
-                        (item_result or {}).get("citations") or [],
+                        _legal_without_progress_citations((item_result or {}).get("citations") or []),
                         legal_basis_by_source_id,
                     ),
                 }
@@ -1652,15 +1862,85 @@ def _legal_payload_item_results(item_results: list[dict[str, Any]]) -> list[dict
                 "item_id": item_result.get("item_id"),
                 "category_code": item_result.get("category_code"),
                 "status": item_result.get("status"),
-                "reason": item_result.get("reason") or "",
+                "amount": item_result.get("amount"),
+                "recognized_amount": item_result.get("recognized_amount"),
+                "disputed_amount": item_result.get("disputed_amount"),
+                "detected_limit_percent": item_result.get("detected_limit_percent"),
+                "reason": _legal_clean_final_reason(str(item_result.get("reason") or "")),
                 "citations": [
                     {"legal_basis": str(citation.get("legal_basis") or "")}
-                    for citation in (item_result.get("citations") or [])
+                    for citation in _legal_without_progress_citations(item_result.get("citations") or [])
                     if isinstance(citation, dict) and str(citation.get("legal_basis") or "").strip()
                 ],
             }
         )
     return payload_results
+
+
+def _legal_without_progress_citations(citations: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    return [
+        citation
+        for citation in citations
+        if isinstance(citation, dict)
+        and not _legal_is_progress_law(str(citation.get("legal_basis") or ""))
+    ]
+
+
+def _legal_is_progress_law(legal_basis: str) -> bool:
+    normalized = " ".join((legal_basis or "").split())
+    return "별표 3" in normalized or "공사진척" in normalized or "공정률" in normalized
+
+
+def _legal_clean_final_reason(reason: str) -> str:
+    return _legal_remove_generic_limit_sentences(
+        _legal_without_internal_match_reason(_legal_without_progress_reason(reason))
+    )
+
+
+def _legal_without_progress_reason(reason: str) -> str:
+    text = " ".join((reason or "").split()).strip()
+    if not text or not any(keyword in text for keyword in ("공정률", "공사진척", "별표 3")):
+        return text
+    sentences = re.split(r"(?<=[.!?。])\s+|(?<=다\.)\s*", text)
+    kept = [
+        sentence.strip()
+        for sentence in sentences
+        if sentence.strip()
+        and not any(keyword in sentence for keyword in ("공정률", "공사진척", "별표 3"))
+    ]
+    return " ".join(kept).strip()
+
+
+def _legal_without_internal_match_reason(reason: str) -> str:
+    text = " ".join((reason or "").split()).strip()
+    if not text or not any(
+        keyword in text
+        for keyword in (
+            "키워드가 감지",
+            "키워드가 포함",
+            "키워드가 확인",
+            "제한 검토 대상으로 분류",
+            "허용 검토 대상으로 분류",
+        )
+    ):
+        return text
+    sentences = re.split(r"(?<=[.!?。])\s+|(?<=다\.)\s*", text)
+    kept = [
+        sentence.strip()
+        for sentence in sentences
+        if sentence.strip()
+        and not any(
+            keyword in sentence
+            for keyword in (
+                "키워드가 감지",
+                "키워드가 포함",
+                "키워드가 확인",
+                "제한 검토 대상으로 분류",
+                "허용 검토 대상으로 분류",
+            )
+        )
+    ]
+    return " ".join(kept).strip()
 
 
 def _legal_todo_payload(
@@ -2004,13 +2284,17 @@ def _frontend_legal_issues(
     return issues
 
 
-def _legal_status_from_judgment(judgment, category_status: str) -> str:
+def _legal_status_from_judgment(judgment, category_status: str, *, category_result=None) -> str:
     if not judgment.allowed:
         if judgment.needs_human_review:
             return "검토필요"
         return "부적절"
-    # allowed=True이면 needs_human_review 포함 모두 적절.
-    # 전담 여부 등 조건/주의사항은 reason_text에 남긴다.
+    # allowed=True이지만 인건비성 조건부 불허(전담/선임/신고/자격 등, CAT_01/CAT_08에만
+    # 좁게 게이팅된 conditional_review)가 매칭된 경우 → 조건 충족 여부를 사람이 확인해야
+    # 하므로 "검토필요"로 표시한다. 그 외 일반 허용 항목은 영향 없음.
+    if getattr(judgment, "conditional_review", False):
+        return "검토필요"
+    # 그 외 allowed=True는 모두 적절. 단순 주의사항은 reason_text에 남긴다.
     return "적절"
 
 

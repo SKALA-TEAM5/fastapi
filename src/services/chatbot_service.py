@@ -29,13 +29,17 @@ import logging
 import uuid
 from typing import AsyncGenerator
 
+from langchain_core.messages import messages_from_dict, messages_to_dict
+
 from src.agents.chatbot_agent.agent import get_compiled_graph
+from src.agents.chatbot_agent.nodes import MAX_MESSAGES
 from src.core.metrics import (
     finish_agent_run,
     record_agent_run,
     record_agent_tokens,
     start_agent_run,
 )
+from src.core.storage import _env_int, _redis_get_json, _redis_set_json
 from src.repositories.orchestrator_repository import insert_agent_usage_record
 
 log = logging.getLogger(__name__)
@@ -45,6 +49,7 @@ _DONE_SIGNAL = "data: [DONE]\n\n"
 # 타임아웃 설정
 _STREAM_TOTAL_TIMEOUT  = 120  # 전체 스트리밍 최대 시간 (초)
 _STREAM_TOKEN_TIMEOUT  = 30   # 토큰 간 최대 대기 시간 (초)
+_CHATBOT_MEMORY_TTL = 7 * 24 * 3600
 
 # 세션별 Lock (동시 요청 중복 방지)
 _session_locks: dict[str, asyncio.Lock] = {}
@@ -82,6 +87,37 @@ def _has_session_state(session_id: str) -> bool:
         return bool(state and state.values)
     except Exception:
         return False
+
+
+def _chatbot_memory_key(session_id: str) -> str:
+    return f"chatbot:session:{session_id}:messages"
+
+
+def _load_chatbot_messages(session_id: str) -> list:
+    payload = _redis_get_json(_chatbot_memory_key(session_id))
+    if not isinstance(payload, list):
+        return []
+    try:
+        messages = messages_from_dict(payload)
+        if len(messages) > MAX_MESSAGES:
+            messages = messages[-MAX_MESSAGES:]
+        log.info("[chatbot_service] Redis 대화 메모리 복원: session=%s messages=%s", session_id, len(messages))
+        return messages
+    except Exception as e:
+        log.warning("[chatbot_service] Redis 대화 메모리 복원 실패 (%s): %s", session_id, e)
+        return []
+
+
+def _save_chatbot_messages(session_id: str, messages: list) -> None:
+    if not messages:
+        return
+    try:
+        trimmed = messages[-MAX_MESSAGES:]
+        ttl = _env_int("CHATBOT_MEMORY_TTL_SECONDS", _CHATBOT_MEMORY_TTL)
+        _redis_set_json(_chatbot_memory_key(session_id), messages_to_dict(trimmed), ttl)
+        log.info("[chatbot_service] Redis 대화 메모리 저장: session=%s messages=%s", session_id, len(trimmed))
+    except Exception as e:
+        log.warning("[chatbot_service] Redis 대화 메모리 저장 실패 (%s): %s", session_id, e)
 
 
 async def _stream_events(
@@ -204,7 +240,10 @@ async def stream_chat(
         yield _sse("session_id", session_id)
 
         # ── 4. 세션 만료 감지 ─────────────────────────────────────────────────
-        if not is_new_session and not _has_session_state(session_id):
+        redis_messages = _load_chatbot_messages(session_id)
+        has_memory_state = _has_session_state(session_id)
+
+        if not is_new_session and not has_memory_state and not redis_messages:
             log.info(f"[chatbot_service] 세션 만료 감지: {session_id}")
             yield _sse("session_reset", "이전 대화 기록이 만료되었습니다. 새 대화를 시작합니다.")
 
@@ -224,7 +263,7 @@ async def stream_chat(
                 "retry_count":    0,
                 "sources":        [],
                 "answer":         "",
-                "messages":       [],
+                "messages":       redis_messages if not has_memory_state else [],
             }
 
             try:
@@ -240,6 +279,13 @@ async def stream_chat(
                 result_code = "fail"
                 log.error(f"[chatbot_service] 스트리밍 오류: {e}", exc_info=True)
                 yield _sse("error", "일시적인 오류가 발생했습니다. 다시 시도해 주세요.")
+
+            try:
+                state = graph.get_state(config)
+                messages = list((state.values or {}).get("messages") or [])
+                _save_chatbot_messages(session_id, messages)
+            except Exception as e:
+                log.warning("[chatbot_service] 그래프 상태 저장 실패: %s", e)
 
             for token_type in ("input_tokens", "output_tokens"):
                 record_agent_tokens(

@@ -21,7 +21,31 @@ from src.agents.validator_agent.parser import CategoryInputBlock
 from src.agents.validator_agent.rule_matcher import CategoryRuleBundle, ItemRuleBundle
 import src.core.llm_config as llm_config
 from src.prompts import CATEGORY_DECISION_PROMPT
+from src.schemas.classifier import CATEGORIES
 from src.schemas.validator import CategoryAuditResult, ItemJudgment
+
+_CATEGORY_NAME_TO_CODE = {name: code for code, name in CATEGORIES.items()}
+
+# conditional_review(상태를 "검토필요"로 끌어올리는 용도) 전용 — 인건비성 카테고리에만 좁게 게이팅.
+# _CONDITIONAL_EXCLUSION_PATTERNS/_LLM_CONDITIONAL_HINT_PATTERNS는 일반 법령 문구에도 흔히
+# 나오는 단어("목적", "용도", "외의" 등)라서 status 판정에 그대로 쓰면 무관한 항목까지
+# 검토필요로 오탐된다. 따라서 카테고리/항목명/키워드 동시 조건으로 범위를 강하게 좁힌다.
+_PERSONNEL_CONDITIONAL_CATEGORY_CODES = frozenset({"CAT_01", "CAT_08"})
+_PERSONNEL_ITEM_KEYWORDS = ("인건비", "임금", "수당", "급여")
+_PERSONNEL_CONDITIONAL_KEYWORDS = ("전담", "선임", "신고", "자격", "겸직", "겸임")
+
+
+def _is_personnel_conditional_exclusion(*, category_code: str, item_name: str, text: str) -> bool:
+    """안전관리자 인건비 등 '전담/선임/신고/자격' 조건부 불허 케이스만 좁게 감지한다."""
+    if category_code not in _PERSONNEL_CONDITIONAL_CATEGORY_CODES:
+        return False
+    item = item_name or ""
+    if not any(keyword in item for keyword in _PERSONNEL_ITEM_KEYWORDS):
+        return False
+    haystack = text or ""
+    hits = sum(1 for keyword in _PERSONNEL_CONDITIONAL_KEYWORDS if keyword in haystack)
+    return hits >= 2
+
 
 _EXCEPTION_PATTERNS = (
     re.compile(r"다만"),
@@ -222,7 +246,7 @@ def _hard_status(
     if computation.exceeded and computation.limit_amount is not None:
         return (
             "부적절",
-            f"카테고리 한도 초과: {computation.total:,.0f}원 > {computation.limit_amount:,.0f}원",
+            f"카테고리 한도 초과: {computation.limit_checked_total:,.0f}원 > {computation.limit_amount:,.0f}원",
         )
 
     # 2. 명확한 불허 항목
@@ -294,6 +318,12 @@ def _verbalize_from_match(
 def _build_item_judgment(bundle: ItemRuleBundle, *, category_name: str) -> ItemJudgment:
     allowed = bundle.top_allowed
     disallowed = bundle.top_disallowed
+    exception_source = _best_exception_source(bundle)
+    exception_summary = _extract_exception_summary(exception_source)
+    exception_directly_disallows_item = _exception_directly_disallows_item(
+        item_name=bundle.item.item_name,
+        exception_text=exception_summary or exception_source,
+    )
 
     # 조건부 불허 규칙은 항목 자체를 확정 불허하지 않는다.
     # 운영상 allowed=True 항목은 "적절"로 넘기고, 확인 조건은 reason_text에 남긴다.
@@ -301,22 +331,49 @@ def _build_item_judgment(bundle: ItemRuleBundle, *, category_name: str) -> ItemJ
     llm_disallowed_is_conditional = (
         disallowed is not None
         and getattr(disallowed, "match_source", "") == "llm_fallback"
-        and (
-            # ① LLM reason_text에 조건부 언어 포함 (충족해야, 안전인증, 가능성 등)
-            _has_condition_limited_text(bundle.reason_text)
-            # ② RDB 허용 매치가 존재하는데 LLM이 오버라이드하는 경우:
-            #    RDB(법령/QA)는 일반 허용 신호를 줬지만 LLM이 불허 → 확정 불허로 보기 어려움.
-            #    LLM이 RDB보다 권위 있는 출처가 아니므로 조건부 완화.
-            or allowed is not None
+        and _has_condition_limited_text(
+            "\n".join(
+                text
+                for text in (bundle.reason_text, bundle.item_exception_text)
+                if text
+            )
         )
     )
 
-    if disallowed_is_conditional or llm_disallowed_is_conditional:
+    if exception_directly_disallows_item:
+        item_allowed = False
+    elif disallowed_is_conditional or llm_disallowed_is_conditional:
         # 조건부 불허(RDB) 또는 LLM이 조건부 언어("충족해야", "안전인증" 등)로 불허 판단 →
         # 확정 불허가 아닌 "허용 + 다만 확인 필요"로 완화한다.
         item_allowed = True
     else:
         item_allowed = bool(allowed and (not disallowed or allowed.score >= disallowed.score))
+
+    # conditional_review: status를 "검토필요"로 끌어올릴지 결정하는 좁은 게이트.
+    # disallowed_is_conditional/llm_disallowed_is_conditional은 일반 법령 문구에도 자주 등장하는
+    # 단어("목적", "용도" 등)라서 그대로 status에 쓰면 무관한 항목까지 오탐된다 → 인건비성
+    # 카테고리(CAT_01/CAT_08) + 항목명 키워드 + 전담/선임/신고/자격 키워드 2개 이상 동시 등장
+    # 조건으로 추가 게이팅한다.
+    category_code = _CATEGORY_NAME_TO_CODE.get(category_name, category_name)
+    conditional_review_text = "\n".join(
+        text
+        for text in (
+            exception_summary,
+            exception_source,
+            bundle.reason_text,
+            bundle.item_exception_text,
+            getattr(disallowed, "evidence", "") if disallowed is not None else "",
+        )
+        if text
+    )
+    conditional_review = bool(
+        (disallowed_is_conditional or llm_disallowed_is_conditional)
+        and _is_personnel_conditional_exclusion(
+            category_code=category_code,
+            item_name=bundle.item.item_name,
+            text=conditional_review_text,
+        )
+    )
 
     # ★ best는 item_allowed 판단 방향과 일치하는 규칙을 우선 선택한다.
     #   이전: 항상 allowed 규칙 우선 → allowed=false인 항목에 허용 근거가 붙는 문제
@@ -324,8 +381,6 @@ def _build_item_judgment(bundle: ItemRuleBundle, *, category_name: str) -> ItemJ
         best = allowed or disallowed or (bundle.matches[0] if bundle.matches else None)
     else:
         best = disallowed or allowed or (bundle.matches[0] if bundle.matches else None)
-    exception_source = _best_exception_source(bundle)
-    exception_summary = _extract_exception_summary(exception_source)
     has_conflict = bool(allowed and disallowed and abs(allowed.score - disallowed.score) < 1.0)
     # 조건부 불허이면 조건 확인이 필요하므로 needs_human_review 강제 설정
     needs_review = bool(
@@ -364,7 +419,9 @@ def _build_item_judgment(bundle: ItemRuleBundle, *, category_name: str) -> ItemJ
         qdrant_citations=bundle.qdrant_citations,
         category_limit_pct=None,
         category_limit_rule="",
+        item_limit_pct=getattr(best, "limit_pct", None) if best is not None else None,
         needs_human_review=needs_review,
+        conditional_review=conditional_review,
         review_reason=_build_item_review_reason(
             needs_review=needs_review,
             exception_summary=exception_summary,
@@ -398,6 +455,9 @@ def _conditional_reason_text(
     조건부 불허 케이스는 판정은 허용으로 두고, 제외 가능 조건만 사유에 남긴다.
     운영 흐름을 막는 "확인 필요" 문구 대신 보고서 설명에 남길 주의사항으로 작성한다.
     """
+    if fallback and not _looks_like_fallback_evidence_reason(fallback):
+        return fallback
+
     if not (disallowed_is_conditional or llm_disallowed_is_conditional):
         return fallback
 
@@ -502,6 +562,22 @@ def _extract_condition_text(disallowed, *, fallback: str) -> str:
     condition_only = _re.sub(r"^(관련\s*법령에서는|법령에서는)\s*", "", condition_only).strip()
     condition_only = _re.sub(r"[은는]$", "", condition_only.strip(" ."))
     return condition_only
+
+
+def _looks_like_fallback_evidence_reason(text: str) -> bool:
+    normalized = re.sub(r"\s+", " ", text or "").strip()
+    if not normalized:
+        return True
+    fallback_patterns = (
+        "카테고리의 일반 허용 범위와",
+        "카테고리에서는",
+        "예외 문구 적용 여부 확인 필요",
+        "직접 매칭된 규칙이 없습니다",
+        "기준 집행 제외 대상으로 확인됩니다",
+        "기준 허용 범위를 벗어난 것으로 확인됩니다",
+        "에 따른 허용 항목으로 확인됩니다",
+    )
+    return any(pattern in normalized for pattern in fallback_patterns)
 
 
 def _condition_suffix(cond_text: str, *, classified: bool) -> str:
@@ -706,13 +782,8 @@ def _is_conditional_exclusion(match) -> bool:
     evidence = match.evidence or ""
     if any(pattern.search(evidence) for pattern in _CONDITIONAL_EXCLUSION_PATTERNS):
         return True
-    # qa_rule split disallowed: "불가할 것이나," 형태 → 조건부 불허
-    if (
-        getattr(match, "match_source", "") == "qa_rule"
-        and getattr(match, "rule_type", "") == "qa_disallowed"
-        and re.search(r"이나[,\s]?\s*$", evidence.strip())
-    ):
-        return True
+    # qa_rule "이나,$" 결미는 mixed QA에서 분리된 불허 파트 →
+    # _has_qa_conflict에서 충돌로 처리해 LLM이 판단하므로 여기서는 조건부 완화하지 않음
     return False
 
 
@@ -747,3 +818,16 @@ def _exception_snippet_score(text: str) -> tuple[int, int]:
 def _contains_exception_phrase(text: str) -> bool:
     normalized = re.sub(r"\s+", " ", text or "").strip()
     return any(pattern.search(normalized) for pattern in _EXCEPTION_PATTERNS)
+
+
+def _exception_directly_disallows_item(*, item_name: str, exception_text: str) -> bool:
+    item = re.sub(r"\s+", " ", item_name or "").strip()
+    text = re.sub(r"\s+", " ", exception_text or "").strip()
+    if not item or not text:
+        return False
+
+    if "소화기" in item and "소화기" in text and any(term in item for term in ("사무실", "사무용", "분전반")):
+        return any(term in text for term in ("사무실", "사무용", "분전반")) and any(
+            term in text for term in ("불가", "사용할 수 없", "제외")
+        )
+    return False
