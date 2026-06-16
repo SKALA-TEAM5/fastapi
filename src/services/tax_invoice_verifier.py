@@ -36,6 +36,8 @@ from src.services.matching_service_monthly import (
     _extract_receipt_date,
     _extract_receipt_vendor,
     _normalize_vendor,
+    _find_best_receipt_item_amount,
+    _get_item_name,
     GATE_AMOUNT_PCT,
 )
 
@@ -102,13 +104,32 @@ def verify_one_receipt(
 
     r_vendor_clean = _clean_vendor_for_gate(receipt_vendor)
 
+    # 다품목 대응: 영수증/거래명세표는 품목별 가상 영수증으로 분리되어 total_amount가
+    # '해당 품목 공급가액+세액'이다. 세금계산서도 합계(total)가 아니라 같은 품목의
+    # 공급가액+세액으로 비교해야 다품목에서 어긋나지 않는다. (매칭용 품목명)
+    receipt_item_name = (
+        receipt.get("_item_name")
+        or _get_item_name((receipt.get("items") or [{}])[0])
+        or ""
+    )
+
     best_failed: list[str] = []
 
     for ti in tax_invoices:
         ti_date   = _extract_receipt_date(ti)
         ti_vendor = _extract_receipt_vendor(ti)
-        ti_amount = ti.get("total_amount")
         ti_vendor_clean = _clean_vendor_for_gate(ti_vendor)
+
+        # 세금계산서 금액: 합계(total)가 아니라 영수증 품목과 매칭되는 세금계산서 품목의
+        # 공급가액+세액으로 비교한다. 매칭 품목을 못 찾으면 합계금액으로 폴백.
+        ti_amount = ti.get("total_amount")
+        _ti_items = ti.get("items") or []
+        if receipt_item_name and _ti_items:
+            _sim, _item_amt = _find_best_receipt_item_amount(
+                receipt_item_name, _ti_items, doc_type="tax_invoice"
+            )
+            if _item_amt is not None:
+                ti_amount = _item_amt
 
         failed: list[str] = []
 
