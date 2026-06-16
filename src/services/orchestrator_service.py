@@ -734,7 +734,8 @@ def _run_link_agent(
     *,
     requested_by_user_id: int | None = None,
 ) -> dict[str, Any]:
-    grouped_files = list_evidence_file_ids_by_type(project_id)
+    # 후보 증빙을 "이 사용내역서에 업로드된 파일"로만 한정 (타 사용내역서/타 월 증빙 혼입 방지)
+    grouped_files = list_evidence_file_ids_by_type(project_id, usage_statement_id)
     receipt_file_ids = [
         file_id
         for evidence_type in ("receipt", "transaction_statement")
@@ -924,12 +925,8 @@ def _link_todo_detail(row: dict[str, Any]) -> str | None:
         or _as_dict(row.get("componentScores"))
     )
     if similarity_score is not None:
-        # 검토 필요(review_needed)는 점수만으로는 사유를 알기 어려우므로,
-        # 가장 낮게 책정된 컴포넌트에 맞춰 검토 포인트(원인)를 안내한다.
-        hint = _link_review_hint(component_scores)
-        if hint:
-            return f"유사도 {similarity_score:.2f} · {hint}"
-        return f"유사도 {similarity_score:.2f}"
+        # 검토 필요(review_needed): 유사도 수치는 표기하지 않고 검토 포인트(원인)만 안내한다.
+        return _link_review_hint(component_scores)
 
     return _link_component_score_detail(component_scores)
 
@@ -951,7 +948,7 @@ def _link_review_hint(component_scores: dict[str, Any]) -> str | None:
     )
     if item_score is None:
         return None
-    return f"품목명 유사도 낮음 ({item_score:.2f}) — 품목 일치 여부 재확인 필요"
+    return "품목명 유사도 낮음 — 품목 일치 여부 재확인 필요"
 
 
 def _link_component_score_detail(component_scores: dict[str, Any]) -> str | None:

@@ -177,21 +177,34 @@ def list_usage_statement_item_ids(usage_statement_id: int) -> list[int]:
             return [int(row[0]) for row in cur.fetchall()]
 
 
-def list_evidence_file_ids_by_type(project_id: int) -> dict[str, list[int]]:
+def list_evidence_file_ids_by_type(
+    project_id: int,
+    usage_statement_id: int | None = None,
+) -> dict[str, list[int]]:
+    # 매칭 후보 증빙은 "해당 사용내역서에 업로드된 파일"로 한정한다.
+    # usage_statement_id 가 주어지면 files.usage_statement_id 로 필터해, 같은 프로젝트의
+    # 다른 사용내역서/다른 월 증빙이 후보로 섞이는 것을 막는다.
+    # ※ files.usage_statement_id 는 backend 업로드 시 기록되는 컬럼이므로,
+    #   배포 순서(backend → fastapi)를 반드시 지켜야 한다. (컬럼 부재 시 런타임 오류)
+    where = [
+        "project_id = %(project_id)s",
+        "deleted_at IS NULL",
+        "status_code IN ('draft', 'fail')",
+        "uploaded_evidence_type_code IS NOT NULL",
+    ]
+    params: dict[str, Any] = {"project_id": project_id}
+    if usage_statement_id is not None:
+        where.append("usage_statement_id = %(usage_statement_id)s")
+        params["usage_statement_id"] = usage_statement_id
+
+    sql = (
+        "SELECT id, uploaded_evidence_type_code FROM files WHERE "
+        + " AND ".join(where)
+        + " ORDER BY id"
+    )
     with get_connection() as conn:
         with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
-            cur.execute(
-                """
-                SELECT id, uploaded_evidence_type_code
-                FROM files
-                WHERE project_id = %(project_id)s
-                  AND deleted_at IS NULL
-                  AND status_code IN ('draft', 'fail')
-                  AND uploaded_evidence_type_code IS NOT NULL
-                ORDER BY id
-                """,
-                {"project_id": project_id},
-            )
+            cur.execute(sql, params)
             grouped: dict[str, list[int]] = {}
             for row in cur.fetchall():
                 grouped.setdefault(row["uploaded_evidence_type_code"], []).append(int(row["id"]))
