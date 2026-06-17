@@ -149,8 +149,7 @@ def verify_one_receipt(
                     diff_pct = abs(a1 - a2) / max(a1, a2)
                     if diff_pct > GATE_AMOUNT_PCT:
                         failed.append(
-                            f"금액 {diff_pct * 100:.1f}% 차이 "
-                            f"(영수증: {a1:,}원 / 세금계산서: {a2:,}원)"
+                            f"금액 불일치 (영수증: {a1:,}원 / 세금계산서: {a2:,}원)"
                         )
             except (TypeError, ValueError):
                 failed.append("금액 파싱 오류")
