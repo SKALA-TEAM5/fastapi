@@ -565,10 +565,15 @@ def _resolve_gate2_amount(receipt: dict, usage_amount) -> int | None:
     if doc_type in ("delivery_statement", "tax_invoice"):
         supply = receipt.get("supply_amount")
         tax    = receipt.get("tax_amount")
-        if supply is None or tax is None:
-            return None
+        if supply is not None and tax is not None:
+            try:
+                return int(supply) + int(tax)   # 공급가액 + 세액 (정상 경로)
+            except (TypeError, ValueError):
+                pass
+        # supply 또는 tax 미추출 시 total_amount로 폴백
+        raw = receipt.get("total_amount")
         try:
-            return int(supply) + int(tax)
+            return int(raw) if raw is not None else None
         except (TypeError, ValueError):
             return None
 
@@ -629,21 +634,23 @@ def _check_hard_gates(
     if best_item_amount is not None:
         candidates.append(best_item_amount)
 
-    if usage_amount is not None and candidates:
-        try:
-            a1 = int(usage_amount)
-            passed_amount = any(
-                max(a1, int(c)) > 0 and abs(a1 - int(c)) / max(a1, int(c)) <= GATE_AMOUNT_PCT
-                for c in candidates
-            )
-            if not passed_amount:
-                nearest = min(candidates, key=lambda c: abs(a1 - int(c)))
-                diff_pct = abs(a1 - int(nearest)) / max(a1, int(nearest), 1)
-                failed.append(
-                    f"금액 불일치 (내역서: {a1:,}원 / 영수증: {int(nearest):,}원)"
+    if usage_amount is not None:
+        if not candidates:
+            failed.append("금액 비교 불가 — 공급가액·세액 미인식")
+        else:
+            try:
+                a1 = int(usage_amount)
+                passed_amount = any(
+                    max(a1, int(c)) > 0 and abs(a1 - int(c)) / max(a1, int(c)) <= GATE_AMOUNT_PCT
+                    for c in candidates
                 )
-        except (TypeError, ValueError):
-            failed.append("금액 파싱 오류")
+                if not passed_amount:
+                    nearest = min(candidates, key=lambda c: abs(a1 - int(c)))
+                    failed.append(
+                        f"금액 불일치 (내역서: {a1:,}원 / 영수증: {int(nearest):,}원)"
+                    )
+            except (TypeError, ValueError):
+                failed.append("금액 파싱 오류")
 
     # ── Gate 3: 업체명 ────────────────────────────────────────
     # wage_statement(임금명세서)는 업체명 개념이 없으므로 Gate 3 자동 면제
@@ -1115,8 +1122,21 @@ def match_best(
             # 해당 문서가 위변조됐을 가능성이 있으므로 경고로 붙여서 올린다.
             # 예) 세금계산서(400,000) matched ← 정상
             #     거래명세표(200,000) Gate 실패 + ti_failed_gates 존재 ← 위변조 의심
+            #
+            # 단, 같은 파일에서 _expand_to_item_receipts로 분리된 형제 가상 영수증은
+            # 제외한다. 다품목 거래명세표의 다른 품목이 금액 불일치로 Gate 탈락하는 것은
+            # 정상이며, 위변조 의심 대상이 아니다.
+            best_receipt = best.get("receipt") or {}
+            best_src = (
+                best_receipt.get("source_file")
+                or best_receipt.get("_parent_source", "")
+            )
             discrepant: list[dict] = []
             for r, gates in gate_failed_pairs:
+                # 같은 파일의 형제 가상 영수증은 건너뜀
+                r_src = r.get("source_file") or r.get("_parent_source", "")
+                if r.get("_expanded") and r_src == best_src:
+                    continue
                 if r.get("tax_invoice_status") == "unverified" and r.get("ti_failed_gates"):
                     discrepant.append({
                         "source_file":    r.get("source_file") or r.get("_parent_source", ""),
@@ -1270,14 +1290,15 @@ def match_all_usage_to_receipts(
         ti_verified, ti_unverified,
     )
 
-    # ── 세금계산서 → Step 2 풀에 포함 (직접 증빙 케이스) ──────
-    # 일부 항목(예: 본사 전담조직 임금)은 세금계산서가 유일한 증빙이므로
-    # 세금계산서도 Step 2 매칭 풀에 포함한다.
-    # tax_invoice_status = "self" : 세금계산서 자체가 증빙인 경우
-    ti_as_evidence = [
-        {**ti, "tax_invoice_status": "self", "matched_tax_invoice": None, "ti_failed_gates": []}
-        for ti in tax_invoices
-    ]
+    # ── 세금계산서는 Step 2 풀에 포함하지 않음 ────────────────────
+    # 세금계산서는 거래명세표·영수증이 올바르게 작성됐는지 검증하는 자료이며,
+    # 사용내역서와 직접 매칭하는 증빙 문서가 아니다.
+    # 올바른 증빙 흐름:
+    #   1) 거래명세표 + 세금계산서 업로드 확인
+    #   2) 세금계산서 ↔ 거래명세표 비교 검증 (verify_receipts_against_tax_invoices)
+    #   3) 거래명세표 ↔ 사용내역서 항목 매칭 (Step 2)
+    # 거래명세표(또는 영수증) 없이 세금계산서만 업로드된 경우 → unmatched 처리
+    ti_as_evidence: list[dict] = []
 
     # ── 임금명세서 → Step 2 풀에 포함 (세금계산서 검증 제외) ──
     # 임금명세서는 세금계산서가 발행되지 않으므로 사전검증 대상에서 제외.
@@ -1316,8 +1337,9 @@ def match_all_usage_to_receipts(
         )
 
     match_results = []
+    available_pool = list(step2_pool)   # 독점 매칭용 — 사용된 영수증은 풀에서 제거
     for usage_item in items:
-        best = match_best(usage_item, step2_pool, threshold, threshold_matched)
+        best = match_best(usage_item, available_pool, threshold, threshold_matched)
         # 매칭된 영수증의 세금계산서 검증 상태를 결과에 포함
         matched_receipt = best.get("receipt") or {}
         ti_status   = matched_receipt.get("tax_invoice_status", "unverified")
@@ -1339,6 +1361,37 @@ def match_all_usage_to_receipts(
                 best["reject_reason"] = "세금계산서 검증 실패 — " + "; ".join(ti_failed[:2])
             else:
                 best["reject_reason"] = "세금계산서 검증 실패"
+
+        # ── 독점 매칭: Gate를 통과한 영수증은 풀에서 제거하여 중복 매칭 방지 ──
+        # matched뿐 아니라 rejected(Gate 통과 후 세금계산서 검증 실패)도 제거.
+        # 그렇지 않으면 rejected된 가상 영수증이 다른 항목의 gate_failed_pairs에
+        # 남아 잘못된 discrepant_evidence 경고를 유발한다.
+        # _expanded=True인 가상 영수증(다품목 거래명세표 분리본)은 품목 단위로 제거.
+        # 같은 파일의 다른 품목은 유지하여 별도 사용내역 항목과 매칭될 수 있도록 한다.
+        if best.get("gate_passed"):
+            used_receipt = best.get("receipt") or {}
+            used_src = (
+                used_receipt.get("source_file")
+                or used_receipt.get("_parent_source")
+            )
+            used_item_name = used_receipt.get("_item_name")
+
+            if used_src:
+                if used_receipt.get("_expanded") and used_item_name:
+                    # 다품목 분리본: 해당 품목만 제거, 같은 파일의 다른 품목은 유지
+                    available_pool = [
+                        r for r in available_pool
+                        if not (
+                            (r.get("source_file") or r.get("_parent_source")) == used_src
+                            and r.get("_item_name") == used_item_name
+                        )
+                    ]
+                else:
+                    # 단일 문서: 파일 전체 제거
+                    available_pool = [
+                        r for r in available_pool
+                        if (r.get("source_file") or r.get("_parent_source")) != used_src
+                    ]
 
         match_results.append(best)
 
