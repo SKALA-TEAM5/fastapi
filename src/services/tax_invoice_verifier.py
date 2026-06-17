@@ -114,6 +114,7 @@ def verify_one_receipt(
     )
 
     best_failed: list[str] = []
+    found_vendor_match = False   # 업체명이 일치하는 세금계산서가 하나라도 있는지
 
     for ti in tax_invoices:
         ti_date   = _extract_receipt_date(ti)
@@ -132,6 +133,13 @@ def verify_one_receipt(
                 ti_amount = _item_amt
 
         failed: list[str] = []
+
+        # ── Gate 3: 업체명 (먼저 검사 — 불일치 시 날짜·금액 비교 생략) ──
+        if r_vendor_clean:
+            if not ti_vendor_clean or r_vendor_clean != ti_vendor_clean:
+                # 다른 업체 세금계산서 → 비교 대상 아님, 다음으로
+                continue
+        found_vendor_match = True
 
         # ── Gate 1: 날짜 (연월 및 월 경계 기준) ──────────────────
         if receipt_date and ti_date:
@@ -154,14 +162,6 @@ def verify_one_receipt(
             except (TypeError, ValueError):
                 failed.append("금액 파싱 오류")
 
-        # ── Gate 3: 업체명 ──────────────────────────────────────
-        if r_vendor_clean:                          # 영수증에 업체명 있을 때만 검사
-            if not ti_vendor_clean or r_vendor_clean != ti_vendor_clean:
-                failed.append(
-                    f"업체명 불일치 "
-                    f"(영수증: '{receipt_vendor}' / 세금계산서: '{ti_vendor}')"
-                )
-
         if not failed:
             # 모든 Gate 통과 → verified
             logger.debug(
@@ -178,6 +178,14 @@ def verify_one_receipt(
         # 가장 적게 실패한 후보를 기록 (진단 목적)
         if not best_failed or len(failed) < len(best_failed):
             best_failed = failed
+
+    # 동일 업체 세금계산서가 하나도 없으면 명확한 메시지로 반환
+    if not found_vendor_match:
+        return {
+            "tax_invoice_status":  "unverified",
+            "matched_tax_invoice": None,
+            "failed_gates":        ["동일 업체 세금계산서 없음"],
+        }
 
     logger.debug(
         "세금계산서 검증 실패: %s — %s",
