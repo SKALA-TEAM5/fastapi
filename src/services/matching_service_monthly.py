@@ -551,52 +551,32 @@ def _check_rejection(usage_item: dict, receipt: dict) -> Optional[str]:
 
 def _resolve_gate2_amount(receipt: dict, usage_amount) -> int | None:
     """
-    Gate 2 금액 비교를 위한 거래명세표 VAT 보정 함수.
+    Gate 2 금액 비교에 사용할 실지출금액을 반환한다.
 
-    delivery_statement의 경우 VLM이 total_amount를 공급가액(VAT 미포함)으로
-    반환할 수 있어 사용내역서 금액(VAT 포함)과 ~9.1% 차이가 발생한다.
-    3단계 보정을 시도해 Gate 2 통과 여부를 판정한다.
+    ▸ delivery_statement / tax_invoice
+        공급가액(supply_amount) + 세액(tax_amount) 합산값을 사용한다.
+        둘 중 하나라도 없으면 None 반환 → Gate 2 탈락.
 
-      1순위: raw total_amount 그대로 (이미 VAT 포함이거나 정상 금액)
-      2순위: raw + tax_amount (VLM이 세액 필드를 별도 반환한 경우)
-      3순위: raw × 1.1 (세액 필드 없을 때 10% VAT 추정)
-
-    거래명세표·세금계산서·영수증 등 증빙은 공급가액(VAT 미포함)과 세액을 분리 제공할 수
-    있으므로 doc_type에 관계없이 동일하게 VAT 보정한다. 보정이 게이트를 통과시키지 못하면
-    raw를 그대로 반환하므로(1순위 raw 우선), 이미 VAT 포함인 영수증은 영향받지 않는다.
+    ▸ receipt (및 기타 doc_type)
+        VAT 포함 실지불액인 total_amount를 그대로 사용한다.
     """
+    doc_type = receipt.get("doc_type", "")
+
+    if doc_type in ("delivery_statement", "tax_invoice"):
+        supply = receipt.get("supply_amount")
+        tax    = receipt.get("tax_amount")
+        if supply is None or tax is None:
+            return None
+        try:
+            return int(supply) + int(tax)
+        except (TypeError, ValueError):
+            return None
+
     raw = receipt.get("total_amount")
-    if raw is None:
-        return None
-
-    if usage_amount is None:
-        return raw
-
     try:
-        u, r = int(usage_amount), int(raw)
+        return int(raw) if raw is not None else None
     except (TypeError, ValueError):
-        return raw
-
-    def _within_gate(a: int, b: int) -> bool:
-        return max(a, b) > 0 and abs(a - b) / max(a, b) <= GATE_AMOUNT_PCT
-
-    # 1순위: raw 그대로
-    if _within_gate(u, r):
-        return r
-
-    # 2순위: raw + tax_amount
-    tax = receipt.get("tax_amount")
-    if tax is not None:
-        candidate = r + int(tax)
-        if _within_gate(u, candidate):
-            return candidate
-
-    # 3순위: raw × 1.1 추정
-    candidate_vat = int(r * 1.1)
-    if _within_gate(u, candidate_vat):
-        return candidate_vat
-
-    return r  # 보정 불가 → Gate 2 탈락
+        return None
 
 
 # ══════════════════════════════════════════════════════════════
@@ -660,9 +640,7 @@ def _check_hard_gates(
                 nearest = min(candidates, key=lambda c: abs(a1 - int(c)))
                 diff_pct = abs(a1 - int(nearest)) / max(a1, int(nearest), 1)
                 failed.append(
-                    f"금액 {diff_pct * 100:.1f}% 차이 "
-                    f"(내역서: {a1:,}원 / 영수증: {int(nearest):,}원, "
-                    f"허용: ±{GATE_AMOUNT_PCT * 100:.0f}%)"
+                    f"금액 불일치 (내역서: {a1:,}원 / 영수증: {int(nearest):,}원)"
                 )
         except (TypeError, ValueError):
             failed.append("금액 파싱 오류")
@@ -1130,6 +1108,31 @@ def match_best(
             best = max(item_relevant, key=lambda r: r["similarity_score"])
             best["gate_passed"] = True
             best["gate_failed"] = []
+
+            # ── 교차 증빙 불일치 감지 ─────────────────────────────────
+            # Gate를 통과한 최선 증빙(세금계산서 등)이 있더라도,
+            # Gate 탈락한 다른 증빙(거래명세표 등)이 세금계산서 검증까지 실패했으면
+            # 해당 문서가 위변조됐을 가능성이 있으므로 경고로 붙여서 올린다.
+            # 예) 세금계산서(400,000) matched ← 정상
+            #     거래명세표(200,000) Gate 실패 + ti_failed_gates 존재 ← 위변조 의심
+            discrepant: list[dict] = []
+            for r, gates in gate_failed_pairs:
+                if r.get("tax_invoice_status") == "unverified" and r.get("ti_failed_gates"):
+                    discrepant.append({
+                        "source_file":    r.get("source_file") or r.get("_parent_source", ""),
+                        "doc_type":       r.get("doc_type", ""),
+                        "amount":         r.get("total_amount"),
+                        "gate_failures":  gates,
+                        "ti_failed_gates": r.get("ti_failed_gates", []),
+                    })
+            if discrepant:
+                best["discrepant_evidence"] = discrepant
+                best["warnings"] = (best.get("warnings") or []) + [
+                    f"[교차증빙 금액 불일치] {d.get('source_file') or d['doc_type']}: "
+                    + "; ".join(d["ti_failed_gates"][:2])
+                    for d in discrepant
+                ]
+
             return best
 
         # 품목 유사도 미달뿐이면 → 이 항목의 증빙 아님 → 매칭 없음(증빙 미업로드로 처리되어 link TODO 생략)
