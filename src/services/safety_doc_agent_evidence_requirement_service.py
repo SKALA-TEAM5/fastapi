@@ -1,3 +1,15 @@
+# --------------------------------------------------------------------------
+# 작성자   : 한채윤
+# 작성일   : 2026-06-04
+# 수정일   : 2026-06-18
+#
+# [ 주요 클래스/함수 정의 ]
+#
+# 1. EvidenceRequirementService : LLM 기반 필수 증빙 추론 서비스
+# 2. infer_required_evidences() : 항목 1건 필수 증빙 추론
+# 3. infer_required_evidences_batch() : 여러 항목 필수 증빙 일괄 추론
+# 4. total_tokens() : Responses API usage에서 total token 추출
+# --------------------------------------------------------------------------
 from __future__ import annotations
 
 import json
@@ -75,6 +87,8 @@ class EvidenceRequirementService:
         openai_client: OpenAI,
         settings: Settings,
     ) -> None:
+        """Initialize the requirement service with repository, client, and settings."""
+
         self.repository = repository
         self.openai_client = openai_client
         self.settings = settings
@@ -121,67 +135,23 @@ class EvidenceRequirementService:
         ]
 
     def _search_reference_contexts(self, item_context) -> list[dict]:
-        query = " ".join(
-            str(part or "").strip()
-            for part in (
-                item_context.category_name,
-                item_context.item_name,
-                item_context.remark,
-            )
-            if str(part or "").strip()
-        )
-        if not query or self.settings.reference_top_k <= 0:
-            return []
+        """Search reference contexts for one usage-statement item."""
 
-        try:
-            hits = search_reference_vector_db(
-                query=query,
-                collection_name=self.settings.reference_collection,
-                top_k=self.settings.reference_top_k,
-            )
-        except Exception as exc:
-            SAFETY_DOC_REFERENCE_FAILURES.labels(mode="single").inc()
-            log.warning(
-                "safety-doc reference search skipped: collection=%s error=%s",
-                self.settings.reference_collection,
-                exc,
-            )
-            return []
-
-        contexts: list[dict] = []
-        for hit in hits:
-            payload = hit.get("payload") or {}
-            contexts.append(
-                {
-                    "score": hit.get("score"),
-                    "title": payload.get("title") or payload.get("section") or payload.get("source"),
-                    "text": payload.get("text") or payload.get("content") or payload.get("body"),
-                    "metadata": payload.get("metadata") or {},
-                }
-            )
-        return contexts
+        query = _reference_query([item_context])
+        return self._search_reference_contexts_for_query(query=query, mode="single")
 
     def _search_reference_contexts_for_items(self, item_contexts: list) -> list[dict]:
+        """Search reference contexts for a batch of usage-statement items."""
+
         if not item_contexts:
             return []
 
-        query = " ".join(
-            filter(
-                None,
-                (
-                    " ".join(
-                        str(part or "").strip()
-                        for part in (
-                            item_context.category_name,
-                            item_context.item_name,
-                            item_context.remark,
-                        )
-                        if str(part or "").strip()
-                    )
-                    for item_context in item_contexts
-                ),
-            )
-        )
+        query = _reference_query(item_contexts)
+        return self._search_reference_contexts_for_query(query=query, mode="batch")
+
+    def _search_reference_contexts_for_query(self, *, query: str, mode: str) -> list[dict]:
+        """Search and normalize safety-doc reference hits for a prepared query."""
+
         if not query or self.settings.reference_top_k <= 0:
             return []
 
@@ -192,27 +162,16 @@ class EvidenceRequirementService:
                 top_k=self.settings.reference_top_k,
             )
         except Exception as exc:
-            SAFETY_DOC_REFERENCE_FAILURES.labels(mode="batch").inc()
+            SAFETY_DOC_REFERENCE_FAILURES.labels(mode=mode).inc()
             log.warning(
-                "safety-doc batch reference search skipped: collection=%s error=%s",
+                "safety-doc reference search skipped: mode=%s collection=%s error=%s",
+                mode,
                 self.settings.reference_collection,
                 exc,
             )
             return []
 
-        return [
-            {
-                "score": hit.get("score"),
-                "title": (hit.get("payload") or {}).get("title")
-                or (hit.get("payload") or {}).get("section")
-                or (hit.get("payload") or {}).get("source"),
-                "text": (hit.get("payload") or {}).get("text")
-                or (hit.get("payload") or {}).get("content")
-                or (hit.get("payload") or {}).get("body"),
-                "metadata": (hit.get("payload") or {}).get("metadata") or {},
-            }
-            for hit in hits
-        ]
+        return [_reference_context_from_hit(hit) for hit in hits]
 
     @traceable(name="evidence_requirement_inference", run_type="chain")
     def infer_required_evidences(
@@ -376,16 +335,52 @@ class EvidenceRequirementService:
             reason="필수 증빙 요구사항 생성 완료",
             details=asdict(result),
             model_name=self.settings.chat_model,
-            token=_total_tokens(result.usage),
+            token=total_tokens(result.usage),
         )
         return result
 
 
-def _total_tokens(usage: dict[str, int] | None) -> int | None:
+def total_tokens(usage: dict[str, int] | None) -> int | None:
+    """Return total token count from a Responses API usage dict."""
+
     if not usage:
         return None
     total = usage.get("total_tokens")
     return total if isinstance(total, int) else None
+
+
+def _reference_query(item_contexts: list) -> str:
+    """Build a deterministic reference-search query from item contexts."""
+
+    return " ".join(
+        filter(
+            None,
+            (
+                " ".join(
+                    str(part or "").strip()
+                    for part in (
+                        item_context.category_name,
+                        item_context.item_name,
+                        item_context.remark,
+                    )
+                    if str(part or "").strip()
+                )
+                for item_context in item_contexts
+            ),
+        )
+    )
+
+
+def _reference_context_from_hit(hit: dict) -> dict:
+    """Normalize one Qdrant reference hit for prompt context."""
+
+    payload = hit.get("payload") or {}
+    return {
+        "score": hit.get("score"),
+        "title": payload.get("title") or payload.get("section") or payload.get("source"),
+        "text": payload.get("text") or payload.get("content") or payload.get("body"),
+        "metadata": payload.get("metadata") or {},
+    }
 
 
 def _record_model_observability(
@@ -394,6 +389,8 @@ def _record_model_observability(
     model: str,
     result: AIEvidenceRequirementOutput,
 ) -> None:
+    """Record model confidence and token metrics for safety-doc inference."""
+
     if isinstance(result.confidence, (int, float)):
         SAFETY_DOC_CONFIDENCE.labels(mode=mode).observe(float(result.confidence))
     if not result.usage:

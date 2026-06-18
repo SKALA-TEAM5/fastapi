@@ -1,7 +1,19 @@
+# --------------------------------------------------------------------------
+# 작성자   : 한채윤
+# 작성일   : 2026-06-04
+# 수정일   : 2026-06-18
+#
+# [ 주요 함수 정의 ]
+#
+# 1. check_missing_evidence()       : 항목 1건의 필수 증빙 누락 여부 판단
+# 2. check_missing_evidence_batch() : 여러 항목의 필수 증빙 누락 여부 일괄 판단
+# 3. _build_services()              : 설정·저장소·OpenAI client 기반 서비스 구성
+# --------------------------------------------------------------------------
 from __future__ import annotations
 
 import json
 from dataclasses import asdict
+from typing import NamedTuple
 
 from langsmith.wrappers import wrap_openai
 from openai import OpenAI
@@ -20,7 +32,40 @@ from src.repositories.safety_doc_agent_evidence_repository import EvidenceReposi
 from src.repositories.safety_doc_agent_postgres_evidence_repository import PostgresEvidenceRepository
 from src.schemas.safety_doc_agent_evidence import LinkedEvidenceFileContext
 from src.services.safety_doc_agent_evidence_check_service import EvidenceCheckService
-from src.services.safety_doc_agent_evidence_requirement_service import EvidenceRequirementService
+from src.services.safety_doc_agent_evidence_requirement_service import (
+    EvidenceRequirementService,
+    total_tokens,
+)
+
+
+class SafetyDocServices(NamedTuple):
+    """Container for safety-doc service dependencies."""
+
+    requirement_service: EvidenceRequirementService
+    check_service: EvidenceCheckService
+    settings: Settings
+
+
+def _build_services(
+    *,
+    settings: Settings | None = None,
+    repository: EvidenceRepository | None = None,
+    openai_client: OpenAI | None = None,
+) -> SafetyDocServices:
+    """Build shared safety-doc services from optional injected dependencies."""
+
+    settings = settings or load_settings()
+    repository = repository or PostgresEvidenceRepository(settings)
+    openai_client = openai_client or get_openai_client(settings)
+    return SafetyDocServices(
+        requirement_service=EvidenceRequirementService(
+            repository=repository,
+            openai_client=openai_client,
+            settings=settings,
+        ),
+        check_service=EvidenceCheckService(repository),
+        settings=settings,
+    )
 
 
 def check_missing_evidence(
@@ -38,15 +83,12 @@ def check_missing_evidence(
     `settings`, `repository`, `openai_client`를 주입해 같은 흐름을 재사용할 수 있다.
     """
 
-    settings = settings or load_settings()
-    repository = repository or PostgresEvidenceRepository(settings)
-    openai_client = openai_client or get_openai_client(settings)
-    requirement_service = EvidenceRequirementService(
+    requirement_service, check_service, settings = _build_services(
+        settings=settings,
         repository=repository,
         openai_client=openai_client,
-        settings=settings,
     )
-    check_service = EvidenceCheckService(repository)
+    repository = requirement_service.repository
 
     ai_input = requirement_service.build_ai_input(item_id)
     item_context = ai_input.item_context
@@ -124,15 +166,12 @@ def check_missing_evidence_batch(
     if not item_ids:
         return []
 
-    settings = settings or load_settings()
-    repository = repository or PostgresEvidenceRepository(settings)
-    openai_client = openai_client or get_openai_client(settings)
-    requirement_service = EvidenceRequirementService(
+    requirement_service, check_service, settings = _build_services(
+        settings=settings,
         repository=repository,
         openai_client=openai_client,
-        settings=settings,
     )
-    check_service = EvidenceCheckService(repository)
+    repository = requirement_service.repository
     SAFETY_DOC_BATCH_SIZE.observe(len(item_ids))
     try:
         ai_inputs, outputs = requirement_service.infer_required_evidences_batch(item_ids)
@@ -200,20 +239,17 @@ def get_openai_client(settings: Settings) -> OpenAI:
     return client
 
 
-def total_tokens(usage: dict[str, int] | None) -> int | None:
-    if not usage:
-        return None
-    total = usage.get("total_tokens")
-    return total if isinstance(total, int) else None
-
-
 def missing_evidence_reason(missing_codes: list[str]) -> str:
+    """Return a human-readable missing-evidence reason."""
+
     if not missing_codes:
         return "필수 증빙 누락 없음"
     return "필수 증빙 누락: " + ", ".join(missing_codes)
 
 
 def _record_missing_evidences(missing_codes: list[str]) -> None:
+    """Record Prometheus counters for missing evidence type codes."""
+
     for code in missing_codes:
         SAFETY_DOC_MISSING_EVIDENCE.labels(evidence_type=code).inc()
 
