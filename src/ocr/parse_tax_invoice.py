@@ -1,9 +1,26 @@
+# --------------------------------------------------------------------------
+# 작성자   : 이현수(kacalu0930)
+# 작성일   : 2026-05-11
+# 수정일   : 2026-06-18 (Clova→VLM 전환 + 세금계산서 PDF·이미지 모두 VLM 처리로 기능변경)
+#
+# [ 주요 함수 정의 ]  ※ 실제 호출되는 함수만 기재
+#
+# 1. parse_tax_invoice() : 세금계산서 파싱 메인 진입 — 확장자 무관 VLM 처리
+# 2. parse_with_vlm()    : VLM(call_vision) 호출 + 표준 스키마 매핑 (PDF·이미지 공통)
+# 3. parse_from_pdf()    : PDF pdfplumber 텍스트 추출 파싱 (거래명세표/임금명세서 PDF에서 사용)
+# 4. _extract_fields_from_text() : 추출 텍스트 → 공급자/공급받는자/품목/금액 필드 파싱
+# 5. _validate()         : 세금계산서 결과 검증(필수 필드 / 금액 정합)
+# 6. (CLI) main() / process_folder() / process_single() / save_result() / print_summary()
+#
+# [ 처리 단계 ]
+#   parse_tax_invoice → (이미지·PDF) parse_with_vlm → call_vision → 표준 스키마 매핑 → _validate
+# --------------------------------------------------------------------------
 """
 산업안전관리비 세금계산서 파싱 모듈 v1
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 파일 확장자를 자동 감지해 처리 방식을 분기한다.
   - .pdf              → pdfplumber 텍스트 직접 추출 (parse_usage_statement.py 동일 방식)
-  - .jpg/.jpeg/.png/.tif/.tiff → CLOVA OCR API 호출  (clova_ocr_receipt.py 동일 방식)
+  - .jpg/.jpeg/.png/.tif/.tiff → VLM(Gemini/OpenAI) 구조화 추출 (vlm_ocr.call_vision)
 
 두 경로 모두 처리 후 동일한 JSON 구조로 출력.
 
@@ -18,26 +35,20 @@
     # 출력 폴더 지정
     python parse_tax_invoice.py --file 세금계산서.pdf --output ./results/
 
-    # API 키 직접 지정 (이미지 경로일 때만 사용)
-    python parse_tax_invoice.py --file 세금계산서.jpg --secret YOUR_KEY --url YOUR_URL
-
 설치:
-    pip install pdfplumber requests python-dotenv
+    pip install pdfplumber python-dotenv
 
-환경변수 (이미지 처리 시 필요, .env 파일 또는 시스템 환경변수):
-    CLOVA_OCR_SECRET=발급받은_Secret_Key
-    CLOVA_OCR_URL=https://...apigw.ntruss.com/custom/v1/.../document/receipt
+환경변수 (이미지 처리 = VLM, .env 파일 또는 시스템 환경변수):
+    VLM_PROVIDER=gemini | openai
+    GEMINI_API_KEY / OPENAI_API_KEY (선택한 프로바이더 키)
 
     .env.example 파일을 복사하여 .env 파일을 생성하고 키를 입력하세요.
 """
 
-import os
 import re
 import json
-import uuid
 import time
 import argparse
-import requests
 from pathlib import Path
 from datetime import datetime
 
@@ -54,11 +65,11 @@ except ImportError:
 
 
 # ══════════════════════════════════════════════
-# 0. 설정 — API 키 / 엔드포인트 (.env 또는 환경변수에서 로드)
+# 0. 설정 — 지원 확장자
 # ══════════════════════════════════════════════
 
-CLOVA_SECRET = os.environ.get("CLOVA_OCR_SECRET")
-CLOVA_URL    = os.environ.get("CLOVA_OCR_URL")
+# [Clova→VLM 리팩토링] 여기 있던 CLOVA_SECRET / CLOVA_URL 환경변수 상수 삭제,
+#   관련 import(os, uuid, requests)도 제거.
 
 # 지원 확장자
 PDF_EXTS   = {".pdf"}
@@ -387,150 +398,88 @@ def parse_from_pdf(file_path: str) -> dict:
 
 
 # ══════════════════════════════════════════════
-# 4. 이미지 경로 — CLOVA OCR API 호출
+# 4. VLM(Gemini/OpenAI) 호출 — PDF·이미지 공통
 # ══════════════════════════════════════════════
+# [Clova→VLM 리팩토링] 구버전 parse_from_image(CLOVA OCR + 정규식)을 이 함수로 대체.
+#   _call_clova_ocr / _extract_raw_text_from_clova / CLOVA_SECRET·URL 상수는 삭제됨.
+#   call_vision 출력을 기존 표준 스키마로 매핑해 downstream 계약은 유지.
 
-def _call_clova_ocr(image_path: str, secret: str, url: str) -> dict:
+def parse_with_vlm(file_path: str) -> dict:
     """
-    CLOVA OCR API 호출 (clova_ocr_receipt.py와 동일 방식, multipart/form-data).
+    세금계산서 파싱 (VLM 사용, PDF·이미지 공통).
 
-    Returns:
-        CLOVA 원본 응답 dict (실패 시 {"error": "..."} 반환)
-    """
-    url = url.rstrip("/")
-    if not url.endswith("/document/receipt"):
-        url = url + "/document/receipt"
+    기존 NAVER CLOVA OCR + 정규식 파싱을 대체한다.
+    VLM(call_vision)에 type_hint="tax_invoice"로 파일을 전달해 구조화 JSON을 받고,
+    표준 세금계산서 JSON 스키마로 매핑한다.
+    → downstream(라우터·파이프라인·TaxInvoiceOCRResponse 변환) 스키마는 변하지 않는다.
 
-    ext = Path(image_path).suffix.lower().lstrip(".")
-    fmt_map = {"jpg": "jpg", "jpeg": "jpg", "png": "png",
-               "tif": "tif", "tiff": "tiff"}
-    img_format = fmt_map.get(ext, "jpg")
-
-    message = {
-        "version":   "V2",
-        "requestId": str(uuid.uuid4()),
-        "timestamp": int(time.time() * 1000),
-        "images": [
-            {
-                "format": img_format,
-                "name":   Path(image_path).stem,
-            }
-        ],
-    }
-
-    headers = {"X-OCR-SECRET": secret}
-
-    try:
-        with open(image_path, "rb") as f:
-            response = requests.post(
-                url,
-                headers=headers,
-                data={"message": json.dumps(message)},
-                files={"file": (Path(image_path).name, f, f"image/{img_format}")},
-                timeout=30,
-            )
-        response.raise_for_status()
-        return response.json()
-
-    except requests.exceptions.HTTPError as e:
-        return {"error": f"HTTP 오류 {response.status_code}: {response.text[:300]}"}
-    except requests.exceptions.Timeout:
-        return {"error": "요청 시간 초과 (30초)"}
-    except Exception as e:
-        return {"error": str(e)}
-
-
-def _extract_raw_text_from_clova(raw: dict) -> str:
-    """
-    CLOVA OCR 원본 응답에서 인식된 전체 텍스트를 추출.
-    receipt 구조화 응답과 일반 fields 응답 모두 처리.
-    """
-    if "error" in raw:
-        return ""
-
-    images = raw.get("images", [])
-    if not images:
-        return ""
-
-    img = images[0]
-    texts = []
-
-    # 방법 1: receipt 구조화 결과에서 텍스트 수집
-    receipt = img.get("receipt", {}).get("result", {})
-    if receipt:
-        # storeInfo → name
-        store = receipt.get("storeInfo", {})
-        if store.get("name", {}).get("text"):
-            texts.append(store["name"]["text"])
-
-        # subResults → items
-        for sub in receipt.get("subResults", []):
-            for item in sub.get("items", []):
-                name_obj = item.get("name", {})
-                if name_obj and name_obj.get("text"):
-                    texts.append(name_obj["text"])
-                price_obj = item.get("price", {})
-                for k in ["unitPrice", "price"]:
-                    if price_obj.get(k, {}).get("text"):
-                        texts.append(price_obj[k]["text"])
-
-        # totalPrice
-        tp = receipt.get("totalPrice", {}).get("price", {})
-        if tp.get("text"):
-            texts.append(tp["text"])
-
-    # 방법 2: fields 배열에서 직접 텍스트 수집 (일반 OCR 응답)
-    for field in img.get("fields", []):
-        t = field.get("inferText", "") or field.get("text", "")
-        if t.strip():
-            texts.append(t.strip())
-
-    return "\n".join(texts)
-
-
-def parse_from_image(file_path: str, secret: str, url: str) -> dict:
-    """
-    이미지 세금계산서 파싱 (CLOVA OCR 사용).
+    ※ PDF 입력은 VLM_PROVIDER=gemini 에서만 동작(OpenAI 경로는 PDF 미지원).
 
     Args:
-        file_path: 이미지 파일 경로
-        secret:    CLOVA OCR Secret Key
-        url:       CLOVA OCR Invoke URL
+        file_path: 세금계산서 파일 경로 (.pdf / 이미지)
 
     Returns:
         표준 세금계산서 JSON dict
     """
-    result = _empty_result(file_path, "image", "ocr")
+    # 지연 import: vlm_ocr ↔ parse_tax_invoice 순환 의존 방지
+    from src.ocr.vlm_ocr import call_vision
 
-    # CLOVA OCR API 호출
-    raw = _call_clova_ocr(str(file_path), secret, url)
+    file_type = "pdf" if Path(file_path).suffix.lower() in PDF_EXTS else "image"
+    result = _empty_result(file_path, file_type, "vlm")
 
-    if "error" in raw:
-        result["validation"]["warnings"].append(f"OCR 오류: {raw['error']}")
+    vlm_raw = call_vision(str(file_path), type_hint="tax_invoice")
+
+    if "error" in vlm_raw:
+        result["validation"]["warnings"].append(f"VLM 오류: {vlm_raw['error']}")
         return _validate(result)
 
-    images = raw.get("images", [])
-    if not images or images[0].get("inferResult") != "SUCCESS":
-        msg = images[0].get("message", "OCR 인식 실패") if images else "응답 없음"
-        result["validation"]["warnings"].append(f"OCR 실패: {msg}")
-        return _validate(result)
+    infer_result = vlm_raw.get("infer_result", "FAILED")
+    if infer_result == "FAILED":
+        reason = vlm_raw.get("fail_reason") or "VLM 판독 실패"
+        result["validation"]["warnings"].append(f"VLM 판독 실패: {reason}")
 
-    # 원본 텍스트 추출
-    raw_text = _extract_raw_text_from_clova(raw)
-    result["raw_text"] = raw_text
+    # ── 공급자 / 공급받는자 ───────────────────────────────
+    supplier = vlm_raw.get("supplier") or {}
+    buyer    = vlm_raw.get("buyer") or {}
+    result["supplier"] = {
+        "company_name":    supplier.get("name"),
+        "business_number": _normalize_biz_num(supplier.get("biz_num") or ""),
+        "representative":  None,  # VLM 미추출 필드
+    }
+    result["buyer"] = {
+        "company_name":    buyer.get("name"),
+        "business_number": _normalize_biz_num(buyer.get("biz_num") or ""),
+    }
 
-    # 필드 추출 (텍스트 파싱 공통 로직)
-    extracted = _extract_fields_from_text(raw_text)
-    result["supplier"]            = extracted["supplier"]
-    result["buyer"]               = extracted["buyer"]
-    result["issue_date"]          = extracted["issue_date"]
-    result["items"]               = extracted["items"]
-    result["total_supply_amount"] = extracted["total_supply_amount"]
-    result["total_tax_amount"]    = extracted["total_tax_amount"]
-    result["total_amount"]        = extracted["total_amount"]
+    # ── 작성일자 (VLM은 YYYY-MM-DD로 반환, _parse_date로 재정규화) ──
+    result["issue_date"] = _parse_date(vlm_raw.get("date") or "")
 
-    result = _validate(result)
-    return result
+    # ── 품목 (VLM 키 → 표준 키 매핑) ──────────────────────
+    items = []
+    for it in (vlm_raw.get("items") or []):
+        items.append({
+            "item_name":     it.get("name"),
+            "quantity":      _safe_int(it.get("count")),
+            "unit_price":    _safe_int(it.get("unit_price")),
+            "supply_amount": _safe_int(it.get("amount")),
+            "tax_amount":    _safe_int(it.get("tax_amount")),
+        })
+    result["items"] = items
+
+    # ── 합계 금액 ─────────────────────────────────────────
+    total_amount = _safe_int(vlm_raw.get("total_amount"))
+    total_tax    = _safe_int(vlm_raw.get("tax_amount"))
+    result["total_amount"]     = total_amount
+    result["total_tax_amount"] = total_tax
+
+    # 공급가액 합계: VLM 미제공 → 합계금액 − 세액, 둘 다 없으면 품목 공급가액 합산
+    if total_amount is not None and total_tax is not None:
+        result["total_supply_amount"] = total_amount - total_tax
+    else:
+        items_supply = sum(i["supply_amount"] or 0 for i in items)
+        result["total_supply_amount"] = items_supply or None
+
+    return _validate(result)
 
 
 # ══════════════════════════════════════════════
@@ -605,12 +554,14 @@ def parse_tax_invoice(
     """
     세금계산서 파일을 파싱해 표준 JSON을 반환하는 메인 함수.
 
-    확장자를 자동 감지해 PDF / 이미지 경로를 분기.
+    PDF·이미지 구분 없이 모두 VLM(Gemini/OpenAI)으로 처리한다.
+      ※ PDF 입력은 VLM_PROVIDER=gemini 에서만 동작한다.
+        (OpenAI 경로는 PDF 직접 입력을 지원하지 않음)
 
     Args:
         file_path: 세금계산서 파일 경로 (.pdf / .jpg / .jpeg / .png / .tif / .tiff)
-        secret:    CLOVA OCR Secret Key (이미지 처리 시 필요)
-        url:       CLOVA OCR Invoke URL  (이미지 처리 시 필요)
+        secret:    (deprecated) 과거 CLOVA OCR Secret. 더 이상 사용하지 않음(하위호환 유지).
+        url:       (deprecated) 과거 CLOVA OCR URL. 더 이상 사용하지 않음(하위호환 유지).
 
     Returns:
         표준 JSON dict
@@ -618,19 +569,10 @@ def parse_tax_invoice(
     path = Path(file_path)
     ext  = path.suffix.lower()
 
-    if ext in PDF_EXTS:
-        return parse_from_pdf(str(path))
-
-    elif ext in IMAGE_EXTS:
-        _secret = secret or CLOVA_SECRET
-        _url    = url    or CLOVA_URL
-        if not _secret:
-            result = _empty_result(file_path, "image", "ocr")
-            result["validation"]["warnings"].append(
-                "CLOVA OCR Secret Key 없음 — --secret 옵션 또는 환경변수 CLOVA_OCR_SECRET 설정 필요"
-            )
-            return result
-        return parse_from_image(str(path), _secret, _url)
+    # [기능변경] 세금계산서는 PDF·이미지 구분 없이 모두 VLM으로 처리.
+    #   (이전: PDF→pdfplumber, 이미지→VLM)  ※ PDF는 VLM_PROVIDER=gemini 필요
+    if ext in ALL_EXTS:
+        return parse_with_vlm(str(path))
 
     else:
         result = _empty_result(file_path, "unknown", "none")
@@ -784,12 +726,12 @@ def process_folder(
 
 def main():
     parser = argparse.ArgumentParser(
-        description="산업안전관리비 세금계산서 파싱 — PDF(pdfplumber) / 이미지(CLOVA OCR) 자동 분기",
+        description="산업안전관리비 세금계산서 파싱 — PDF(pdfplumber) / 이미지(VLM) 자동 분기",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 예시:
   python parse_tax_invoice.py --file 세금계산서.pdf
-  python parse_tax_invoice.py --file 세금계산서.jpg --secret KEY --url URL
+  python parse_tax_invoice.py --file 세금계산서.jpg
   python parse_tax_invoice.py --folder invoices/ --output ./results/
         """,
     )
@@ -801,9 +743,9 @@ def main():
     parser.add_argument("--output",  default=None,
                         help="결과 JSON 저장 폴더 (기본: 입력 파일 폴더 내 tax_invoice_results/)")
     parser.add_argument("--secret",  default=None,
-                        help="CLOVA OCR Secret Key (이미지 처리 시; 미입력 시 환경변수 CLOVA_OCR_SECRET)")
+                        help="(deprecated) 과거 CLOVA OCR Secret — 더 이상 사용하지 않음")
     parser.add_argument("--url",     default=None,
-                        help="CLOVA OCR Invoke URL (이미지 처리 시; 미입력 시 환경변수 CLOVA_OCR_URL)")
+                        help="(deprecated) 과거 CLOVA OCR URL — 더 이상 사용하지 않음")
 
     args = parser.parse_args()
 

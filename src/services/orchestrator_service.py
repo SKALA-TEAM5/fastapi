@@ -951,7 +951,7 @@ def _link_review_hint(component_scores: dict[str, Any]) -> str | None:
     """
     review_needed 검토 사유 안내.
 
-    링크 파이프라인(matching_service_monthly)에서 금액·날짜·거래처는 모두 Hard Gate로
+    링크 파이프라인(matching_service)에서 금액·날짜·거래처는 모두 Hard Gate로
     먼저 걸러진다(게이트 통과 시 금액 1.0 / 거래처는 완전일치 1.0 또는 미기재 면제).
     따라서 게이트를 통과해 review_needed 로 분류된 항목의 점수를 좌우하는 자유 변수는
     품목명(item_desc) 하나뿐이다. → 품목명 유사도를 직접 짚어 사용자가 품목 일치 여부를

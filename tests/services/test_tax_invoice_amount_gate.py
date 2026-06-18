@@ -13,7 +13,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent.parent.parent))
 
-from src.services.matching_service_monthly import (  # noqa: E402
+from src.services.matching_service import (  # noqa: E402
     _check_hard_gates,
     _resolve_gate2_amount,
 )
