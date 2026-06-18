@@ -1,3 +1,13 @@
+# --------------------------------------------------------------------------
+# 작성자   : 차현주
+# 작성일   : 2026-06-18
+# 수정일   : 2026-06-18
+#
+# [ 주요 클래스/함수 정의 ]
+#
+# 1. OpenAIReportLLMClient : 보고서 문장 생성을 위한 OpenAI 어댑터
+# 2. ReportLLMError        : 보고서 LLM 응답 오류
+# --------------------------------------------------------------------------
 from __future__ import annotations
 
 """보고서 문장 생성을 위한 OpenAI 어댑터입니다.
@@ -39,6 +49,7 @@ class OpenAIReportLLMClient:
         base_url: str = OPENAI_RESPONSES_URL,
         timeout_seconds: int = 60,
     ) -> None:
+        """Initialize this object."""
         self.api_key = api_key or os.getenv("OPENAI_API_KEY")
         self.model = model or os.getenv("OPENAI_REPORT_MODEL") or DEFAULT_OPENAI_MODEL
         self.base_url = base_url
@@ -113,6 +124,7 @@ class OpenAIReportLLMClient:
 
 
 def _build_user_prompt(payload: dict[str, Any]) -> str:
+    """Build build user prompt."""
     instruction = _read_prompt("report_agent_draft_template.md")
     context_json = json.dumps(payload.get("context", {}), ensure_ascii=False, indent=2)
     draft_json = json.dumps(payload.get("draft", {}), ensure_ascii=False, indent=2)
@@ -126,6 +138,7 @@ def _build_user_prompt(payload: dict[str, Any]) -> str:
 
 
 def _parse_response_json(raw: str) -> dict[str, Any]:
+    """Parse parse response json."""
     body = json.loads(raw)
     output_text = body.get("output_text")
     if isinstance(output_text, str) and output_text.strip():
@@ -142,12 +155,14 @@ def _parse_response_json(raw: str) -> dict[str, Any]:
 
 
 def _extract_usage(raw: str) -> dict[str, Any] | None:
+    """Extract extract usage."""
     body = json.loads(raw)
     usage = body.get("usage")
     return usage if isinstance(usage, dict) else None
 
 
 def _read_prompt(filename: str) -> str:
+    """Read read prompt."""
     return (Path(__file__).parents[2] / "prompts" / filename).read_text(encoding="utf-8")
 
 

@@ -1,3 +1,12 @@
+# --------------------------------------------------------------------------
+# 작성자   : 차현주
+# 작성일   : 2026-06-18
+# 수정일   : 2026-06-18
+#
+# [ 주요 엔드포인트 정의 ]
+#
+# 1. POST /agents/report/run : Report Agent 단독 실행/디버깅
+# --------------------------------------------------------------------------
 from __future__ import annotations
 
 """보고서 생성 agent 단독 실행 라우터.
@@ -26,6 +35,8 @@ router = APIRouter(prefix="/agents/report", tags=["보고서 Agent"])
 
 
 class ReportAgentRunRequest(BaseModel):
+    """Request body for running the report agent directly."""
+
     run_id: UUID
     project_id: int
     usage_statement_id: int
@@ -40,6 +51,8 @@ class ReportAgentRunRequest(BaseModel):
 
 
 class ReportAgentRunResponse(BaseModel):
+    """Response body returned by the direct report-agent route."""
+
     run_id: UUID
     agent_type: str = "report"
     status: str
@@ -60,6 +73,7 @@ ReportContext를 ReportDraft JSON으로 변환합니다.
     """,
 )
 async def run_report_agent(request: ReportAgentRunRequest) -> ReportAgentRunResponse:
+    """Run run report agent."""
     log_id: int | None = None
     written_date = request.report_written_date or date.today()
 
@@ -133,10 +147,12 @@ async def run_report_agent(request: ReportAgentRunRequest) -> ReportAgentRunResp
 
 
 def _default_period_label(report_month: date) -> str:
+    """Return default period label."""
     return f"{report_month:%Y년 %m월}"
 
 
 def _mark_failed(log_id: int | None, message: str) -> None:
+    """Mark mark failed."""
     if log_id is None:
         return
     with get_connection() as conn:
