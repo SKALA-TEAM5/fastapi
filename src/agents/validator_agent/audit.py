@@ -1,6 +1,7 @@
 # --------------------------------------------------------------------------
 # 작성자   : 송상민(ss19801)
 # 작성일   : 2026-05-04
+# 수정일   : 2026-06-18
 #
 # [ 주요 클래스 및 함수 정의 ]
 #
@@ -13,14 +14,10 @@ from __future__ import annotations
 import re
 from typing import Literal
 
-from pydantic import BaseModel, Field
-
 from src.agents.validator_agent.calculator import CategoryComputation
 from src.agents.validator_agent.context_retriever import CategoryRetrievedContext
 from src.agents.validator_agent.parser import CategoryInputBlock
 from src.agents.validator_agent.rule_matcher import CategoryRuleBundle, ItemRuleBundle
-import src.core.llm_config as llm_config
-from src.prompts import CATEGORY_DECISION_PROMPT
 from src.schemas.classifier import CATEGORIES
 from src.schemas.validator import CategoryAuditResult, ItemJudgment
 
@@ -61,19 +58,6 @@ _FALLBACK_EVIDENCE_PATTERNS = (
     "카테고리의 일반 허용 범위와",
     "신호가 일치합니다",
     "예외 또는 제한 조건으로 다뤄질 수 있습니다",
-)
-
-_DUPLICATE_COST_KEYWORDS = (
-    "중복",
-    "이중",
-    "이중계상",
-    "타 비용",
-    "환경관리비",
-    "공사비",
-    "기포함",
-    "별도 계상",
-    "동일 목적",
-    "타 법령",
 )
 
 # 조건부 제외 규칙 감지: 특정 조건에서만 불가하고 조건 충족 시 허용 가능한 규칙 패턴
@@ -135,11 +119,6 @@ def _wrap_law_name(text: str) -> str:
     return text
 
 
-class CategoryDecisionOutput(BaseModel):
-    status: Literal["적절", "부적절", "검토필요"] = Field(description="카테고리 최종 판정")
-    referenced_laws: list[str] = Field(default_factory=list)
-
-
 def decide_category(
     *,
     block: CategoryInputBlock,
@@ -154,7 +133,6 @@ def decide_category(
     ]
     referenced_laws = _collect_laws(rule_bundle=rule_bundle, computation=computation)
 
-    # _llm_decision() 제거 — 항목별 LLM이 판단+사유를 처리하므로 카테고리 레벨 LLM 불필요
     # 카테고리 적절성은 _hard_status() 수치 기반 하드룰로만 결정
     status = _resolve_final_status(
         hard_status=hard_status,
@@ -193,49 +171,6 @@ def decide_category(
         usage_shortfall_amount=computation.usage_shortfall_amount,
         token_usage=rule_bundle.token_usage,
     )
-
-
-def _llm_decision(
-    *,
-    block: CategoryInputBlock,
-    retrieved: CategoryRetrievedContext,
-    rule_bundle: CategoryRuleBundle,
-    computation: CategoryComputation,
-    law_candidates: list[str],
-) -> CategoryDecisionOutput | None:
-    try:
-        llm = llm_config.get()
-    except RuntimeError:
-        return None
-
-    item_lines = "\n".join(
-        f"- {item.item.item_name}: {item.item.amount:,.0f}원"
-        for item in rule_bundle.items
-    ) or "(없음)"
-    rule_lines = "\n".join(_format_item_rule_bundle(bundle) for bundle in rule_bundle.items) or "(없음)"
-    exception_lines = "\n".join(
-        _clean_text(doc.page_content, limit=240)
-        for doc in retrieved.exception_docs[:5]
-    ) or "(없음)"
-    metric_lines = _format_metric_lines(computation)
-    law_lines = "\n".join(f"- {law}" for law in law_candidates) or "(없음)"
-
-    try:
-        return (
-            CATEGORY_DECISION_PROMPT | llm.with_structured_output(CategoryDecisionOutput)
-        ).invoke(
-            {
-                "category": block.category_name,
-                "item_lines": item_lines,
-                "rule_lines": rule_lines,
-                "exception_lines": exception_lines,
-                "metric_lines": metric_lines,
-                "law_candidates": law_lines,
-            }
-        )
-    except Exception:
-        return None
-
 
 def _hard_status(
     *,
@@ -326,19 +261,20 @@ def _item_is_signage(item_name: str) -> bool:
     return "표지판" in name
 
 
-def _build_item_judgment(bundle: ItemRuleBundle, *, category_name: str) -> ItemJudgment:
-    allowed = bundle.top_allowed
-    disallowed = bundle.top_disallowed
-    exception_source = _best_exception_source(bundle)
-    exception_summary = _extract_exception_summary(exception_source)
+def _resolve_item_allowed_state(
+    *,
+    bundle: ItemRuleBundle,
+    allowed,
+    disallowed,
+    exception_summary: str,
+    exception_source: str,
+) -> tuple[bool, bool, bool, bool, bool]:
+    """Resolve item allowed state and related conditional flags."""
     exception_directly_disallows_item = _exception_directly_disallows_item(
         item_name=bundle.item.item_name,
         exception_text=exception_summary or exception_source,
     )
     item_is_signage = _item_is_signage(bundle.item.item_name)
-
-    # 조건부 불허 규칙은 항목 자체를 확정 불허하지 않는다.
-    # 운영상 allowed=True 항목은 "적절"로 넘기고, 확인 조건은 reason_text에 남긴다.
     disallowed_is_conditional = disallowed is not None and _is_conditional_exclusion(disallowed)
     llm_disallowed_is_conditional = (
         disallowed is not None
@@ -357,17 +293,30 @@ def _build_item_judgment(bundle: ItemRuleBundle, *, category_name: str) -> ItemJ
     elif exception_directly_disallows_item:
         item_allowed = False
     elif disallowed_is_conditional or llm_disallowed_is_conditional:
-        # 조건부 불허(RDB) 또는 LLM이 조건부 언어("충족해야", "안전인증" 등)로 불허 판단 →
-        # 확정 불허가 아닌 "허용 + 다만 확인 필요"로 완화한다.
         item_allowed = True
     else:
         item_allowed = bool(allowed and (not disallowed or allowed.score >= disallowed.score))
 
-    # conditional_review: status를 "검토필요"로 끌어올릴지 결정하는 좁은 게이트.
-    # disallowed_is_conditional/llm_disallowed_is_conditional은 일반 법령 문구에도 자주 등장하는
-    # 단어("목적", "용도" 등)라서 그대로 status에 쓰면 무관한 항목까지 오탐된다 → 인건비성
-    # 카테고리(CAT_01/CAT_08) + 항목명 키워드 + 전담/선임/신고/자격 키워드 2개 이상 동시 등장
-    # 조건으로 추가 게이팅한다.
+    return (
+        item_allowed,
+        item_is_signage,
+        exception_directly_disallows_item,
+        disallowed_is_conditional,
+        llm_disallowed_is_conditional,
+    )
+
+
+def _conditional_review_for_item(
+    *,
+    bundle: ItemRuleBundle,
+    category_name: str,
+    disallowed,
+    exception_summary: str,
+    exception_source: str,
+    disallowed_is_conditional: bool,
+    llm_disallowed_is_conditional: bool,
+) -> bool:
+    """Gate conditional-review status to personnel-like categories only."""
     category_code = _CATEGORY_NAME_TO_CODE.get(category_name, category_name)
     conditional_review_text = "\n".join(
         text
@@ -380,7 +329,7 @@ def _build_item_judgment(bundle: ItemRuleBundle, *, category_name: str) -> ItemJ
         )
         if text
     )
-    conditional_review = bool(
+    return bool(
         (disallowed_is_conditional or llm_disallowed_is_conditional)
         and _is_personnel_conditional_exclusion(
             category_code=category_code,
@@ -389,12 +338,118 @@ def _build_item_judgment(bundle: ItemRuleBundle, *, category_name: str) -> ItemJ
         )
     )
 
+
+def _select_best_match_for_judgment(*, item_allowed: bool, allowed, disallowed, matches: list) -> object | None:
+    """Select the rule whose direction matches the final item judgment."""
+    if item_allowed:
+        return allowed or disallowed or (matches[0] if matches else None)
+    return disallowed or allowed or (matches[0] if matches else None)
+
+
+def _llm_confirmed_disallow(
+    *,
+    disallowed,
+    item_allowed: bool,
+    disallowed_is_conditional: bool,
+    llm_disallowed_is_conditional: bool,
+) -> bool:
+    """Return True when LLM fallback made a final non-conditional disallow decision."""
+    return bool(
+        disallowed is not None
+        and getattr(disallowed, "match_source", "") == "llm_fallback"
+        and not item_allowed
+        and not disallowed_is_conditional
+        and not llm_disallowed_is_conditional
+    )
+
+
+def _needs_item_review(
+    *,
+    item_is_signage: bool,
+    exception_directly_disallows_item: bool,
+    llm_confirmed_disallow: bool,
+    exception_summary: str,
+    has_conflict: bool,
+    disallowed_is_conditional: bool,
+    llm_disallowed_is_conditional: bool,
+) -> bool:
+    """Determine whether item-level judgment should be surfaced as review-needed."""
+    return bool(
+        not item_is_signage
+        and not exception_directly_disallows_item
+        and not llm_confirmed_disallow
+        and (exception_summary or has_conflict or disallowed_is_conditional or llm_disallowed_is_conditional)
+    )
+
+
+def _reasoning_and_laws_for_best(
+    *,
+    bundle: ItemRuleBundle,
+    best,
+    category_name: str,
+    item_allowed: bool,
+) -> tuple[str, list[str]]:
+    """Build item reasoning and law refs from the selected rule."""
+    reasoning = "직접 매칭된 규칙이 없습니다."
+    referenced_laws: list[str] = []
+    if best is None:
+        return reasoning, referenced_laws
+
+    raw_evidence = _clean_text(best.evidence or "", limit=220)
+    if raw_evidence and not _is_fallback_evidence(raw_evidence):
+        reasoning = raw_evidence
+    else:
+        reasoning = _verbalize_from_match(
+            item_name=bundle.item.item_name,
+            category_name=category_name,
+            best=best,
+            item_allowed=item_allowed,
+        ) or "직접 매칭된 규칙이 없습니다."
+    return reasoning, best.referenced_laws[:]
+
+
+def _build_item_judgment(bundle: ItemRuleBundle, *, category_name: str) -> ItemJudgment:
+    allowed = bundle.top_allowed
+    disallowed = bundle.top_disallowed
+    exception_source = _best_exception_source(bundle)
+    exception_summary = _extract_exception_summary(exception_source)
+    (
+        item_allowed,
+        item_is_signage,
+        exception_directly_disallows_item,
+        disallowed_is_conditional,
+        llm_disallowed_is_conditional,
+    ) = _resolve_item_allowed_state(
+        bundle=bundle,
+        allowed=allowed,
+        disallowed=disallowed,
+        exception_summary=exception_summary,
+        exception_source=exception_source,
+    )
+
+    # conditional_review: status를 "검토필요"로 끌어올릴지 결정하는 좁은 게이트.
+    # disallowed_is_conditional/llm_disallowed_is_conditional은 일반 법령 문구에도 자주 등장하는
+    # 단어("목적", "용도" 등)라서 그대로 status에 쓰면 무관한 항목까지 오탐된다 → 인건비성
+    # 카테고리(CAT_01/CAT_08) + 항목명 키워드 + 전담/선임/신고/자격 키워드 2개 이상 동시 등장
+    # 조건으로 추가 게이팅한다.
+    conditional_review = _conditional_review_for_item(
+        bundle=bundle,
+        category_name=category_name,
+        disallowed=disallowed,
+        exception_summary=exception_summary,
+        exception_source=exception_source,
+        disallowed_is_conditional=disallowed_is_conditional,
+        llm_disallowed_is_conditional=llm_disallowed_is_conditional,
+    )
+
     # ★ best는 item_allowed 판단 방향과 일치하는 규칙을 우선 선택한다.
     #   이전: 항상 allowed 규칙 우선 → allowed=false인 항목에 허용 근거가 붙는 문제
-    if item_allowed:
-        best = allowed or disallowed or (bundle.matches[0] if bundle.matches else None)
-    else:
-        best = disallowed or allowed or (bundle.matches[0] if bundle.matches else None)
+    best = _select_best_match_for_judgment(
+        item_allowed=item_allowed,
+        allowed=allowed,
+        disallowed=disallowed,
+        matches=bundle.matches,
+    )
     has_conflict = bool(allowed and disallowed and abs(allowed.score - disallowed.score) < 1.0)
     # llm_fallback이 조건부 언어 힌트 없이("충족해야"/"안전인증" 등 無) 확정적으로 불허
     # 판단했고 그 결과 실제로 item_allowed=False가 된 경우("사무실 소화기 구입" 등) →
@@ -402,12 +457,11 @@ def _build_item_judgment(bundle: ItemRuleBundle, *, category_name: str) -> ItemJ
     # 카테고리의 일반 허용 규정 본문에 우연히 들어있는 "...사용 불가" 단서 문구)에서
     # 추출된 노이즈일 뿐이다. LLM이 이미 전체 컨텍스트를 보고 확정 판단했으므로 그 노이즈
     # 때문에 "부적절"이 "검토필요"로 완화되지 않도록 한다.
-    llm_confirmed_disallow = bool(
-        disallowed is not None
-        and getattr(disallowed, "match_source", "") == "llm_fallback"
-        and not item_allowed
-        and not disallowed_is_conditional
-        and not llm_disallowed_is_conditional
+    llm_confirmed_disallow = _llm_confirmed_disallow(
+        disallowed=disallowed,
+        item_allowed=item_allowed,
+        disallowed_is_conditional=disallowed_is_conditional,
+        llm_disallowed_is_conditional=llm_disallowed_is_conditional,
     )
     # 조건부 불허이면 조건 확인이 필요하므로 needs_human_review 강제 설정
     # exception_directly_disallows_item=True(항목명에 직접 매칭된 확정 불허)이거나
@@ -415,28 +469,21 @@ def _build_item_judgment(bundle: ItemRuleBundle, *, category_name: str) -> ItemJ
     # 네 가지 사유(exception_summary/has_conflict/disallowed_is_conditional/
     # llm_disallowed_is_conditional) 전부 검토 대상에서 제외한다.
     # item_is_signage(표지판류)는 항목명 기준으로 확정 허용했으므로 검토 대상에서 제외한다.
-    needs_review = bool(
-        not item_is_signage
-        and not exception_directly_disallows_item
-        and not llm_confirmed_disallow
-        and (exception_summary or has_conflict or disallowed_is_conditional or llm_disallowed_is_conditional)
+    needs_review = _needs_item_review(
+        item_is_signage=item_is_signage,
+        exception_directly_disallows_item=exception_directly_disallows_item,
+        llm_confirmed_disallow=llm_confirmed_disallow,
+        exception_summary=exception_summary,
+        has_conflict=has_conflict,
+        disallowed_is_conditional=disallowed_is_conditional,
+        llm_disallowed_is_conditional=llm_disallowed_is_conditional,
     )
-    reasoning = "직접 매칭된 규칙이 없습니다."
-    referenced_laws: list[str] = []
-    if best is not None:
-        raw_evidence = _clean_text(best.evidence or "", limit=220)
-        if raw_evidence and not _is_fallback_evidence(raw_evidence):
-            # 실제 법령 원문 → Zero Verbalization (그대로 사용)
-            reasoning = raw_evidence
-        else:
-            # fallback 진단 문자열 → DB 필드 기반 최소 verbalization
-            reasoning = _verbalize_from_match(
-                item_name=bundle.item.item_name,
-                category_name=category_name,
-                best=best,
-                item_allowed=item_allowed,
-            ) or "직접 매칭된 규칙이 없습니다."
-        referenced_laws = best.referenced_laws[:]
+    reasoning, referenced_laws = _reasoning_and_laws_for_best(
+        bundle=bundle,
+        best=best,
+        category_name=category_name,
+        item_allowed=item_allowed,
+    )
 
     return ItemJudgment(
         item=bundle.item.item_name,
@@ -634,7 +681,7 @@ def _looks_like_traffic_safety_condition(text: str) -> bool:
 def _resolve_final_status(
     *,
     hard_status: Literal["적절", "부적절"],
-    decision: CategoryDecisionOutput | None,
+    decision,
     rule_bundle: CategoryRuleBundle,
     computation: CategoryComputation,
     retrieved: CategoryRetrievedContext,
@@ -655,21 +702,6 @@ def _bundle_confidence(bundle: ItemRuleBundle) -> float:
     return round(max(0.0, min(confidence, 0.95)), 2)
 
 
-def _format_item_rule_bundle(bundle: ItemRuleBundle) -> str:
-    lines = [f"- 항목: {bundle.item.item_name}"]
-    for match in bundle.matches[:4]:
-        lines.append(
-            f"  * allowed={match.allowed} score={match.score:.2f} law={','.join(match.referenced_laws[:2])} evidence={_clean_text(match.evidence, limit=140)}"
-        )
-    if bundle.has_exception:
-        summary = _extract_exception_summary(_best_exception_source(bundle))
-        if summary:
-            lines.append(f"  * 예외 문구: {summary}")
-        else:
-            lines.append("  * 예외 문구(단/다만/제외/불가) 포함")
-    return "\n".join(lines)
-
-
 def _build_item_evidence_snippets(*, bundle: ItemRuleBundle, best) -> list[str]:
     snippets: list[str] = []
     if best is not None and best.evidence:
@@ -679,23 +711,6 @@ def _build_item_evidence_snippets(*, bundle: ItemRuleBundle, best) -> list[str]:
         if context_snippet and context_snippet not in snippets:
             snippets.append(context_snippet)
     return snippets[:3]
-
-
-def _format_metric_lines(computation: CategoryComputation) -> str:
-    lines = [f"- 카테고리 합계: {computation.total:,.0f}원"]
-    if computation.limit_amount is not None:
-        lines.append(f"- 카테고리 한도: {computation.limit_amount:,.0f}원")
-        lines.append(f"- 한도 초과 여부: {computation.exceeded}")
-    if computation.progress_rate is not None:
-        lines.append(f"- 공정률: {computation.progress_rate:.1f}%")
-    if computation.required_usage_rate is not None and computation.required_used_amount is not None:
-        lines.append(f"- 요구 최소 사용률: {computation.required_usage_rate * 100:.0f}%")
-        lines.append(f"- 요구 최소 사용액: {computation.required_used_amount:,.0f}원")
-    if computation.cumulative_used_amount is not None:
-        lines.append(f"- 실제 누적 사용액: {computation.cumulative_used_amount:,.0f}원")
-    if computation.usage_shortfall_amount is not None:
-        lines.append(f"- 부족액: {computation.usage_shortfall_amount:,.0f}원")
-    return "\n".join(lines)
 
 
 def _collect_laws(*, rule_bundle: CategoryRuleBundle, computation: CategoryComputation) -> list[str]:
@@ -717,27 +732,9 @@ def _compose_category_reason(
     *,
     status: str,
     hard_reason: str,
-    decision: CategoryDecisionOutput | None,
+    decision,
 ) -> str:
     return hard_reason
-
-
-def _needs_conservative_review(
-    *,
-    rule_bundle: CategoryRuleBundle,
-    computation: CategoryComputation,
-    retrieved: CategoryRetrievedContext,
-) -> bool:
-    if computation.has_progress_shortfall or computation.exceeded:
-        return True
-    for bundle in rule_bundle.items:
-        if not bundle.matches:
-            return True
-        allowed = bundle.top_allowed
-        disallowed = bundle.top_disallowed
-        if allowed and disallowed and abs(allowed.score - disallowed.score) < 1.0:
-            return True
-    return False
 
 
 def _build_evidence_snippets(retrieved: CategoryRetrievedContext) -> list[str]:
@@ -836,15 +833,8 @@ def _has_condition_limited_text(text: str) -> bool:
            any(pattern.search(text) for pattern in _LLM_CONDITIONAL_HINT_PATTERNS)
 
 
-def _has_duplicate_cost_risk(bundle: ItemRuleBundle) -> bool:
-    texts = [bundle.context_text, bundle.item_exception_text]
-    for match in bundle.matches[:4]:
-        texts.append(match.evidence or "")
-    normalized = " ".join(_clean_text(text, limit=600) for text in texts if text)
-    return any(keyword in normalized for keyword in _DUPLICATE_COST_KEYWORDS)
-
-
 def _exception_snippet_score(text: str) -> tuple[int, int]:
+    """Score exception snippets for selecting the most informative phrase."""
     snippet = re.sub(r"\s+", " ", text).strip()
     keywords = sum(1 for pattern in _EXCEPTION_PATTERNS if pattern.search(snippet))
     has_paren = 1 if "(" in snippet or ")" in snippet else 0
