@@ -9,7 +9,7 @@ from __future__ import annotations
 from fastapi import APIRouter, HTTPException, status
 
 from src.schemas.ocr import MatchRequest, MatchResponse
-from src.services.matching_service_monthly import match_all_usage_to_receipts
+from src.services.matching_service import match_all_usage_to_receipts
 
 router = APIRouter(prefix="/matching", tags=["OCR 매칭"])
 

@@ -1,3 +1,20 @@
+# --------------------------------------------------------------------------
+# 작성자   : 이현수(kacalu0930)
+# 작성일   : 2026-05-15
+# 수정일   : 2026-06-18 (Clova→VLM 전환: 죽은 clova import 제거, SUPPORTED_EXTS 출처 변경)
+#
+# [ 주요 함수 정의 ]  ※ 실제 호출되는 함수만 기재
+#
+# 1. parse_usage_statement()       : 사용내역서 파싱 파이프라인 (Orchestrator 진입점)
+# 2. run_link_pipeline()           : 사용내역서 ↔ 영수증 링크(매칭) 파이프라인
+# 3. _classify_usage_statement()   : 사용내역서 품목 분류 단계
+# 4. _attach_classifier_item_ids() : 분류 결과에 품목 ID 매핑
+# 5. _complete_classifier_log()    : 분류 로그 완료 처리
+# 6. _fetch_and_save_temp() / _cleanup() : 임시 파일 다운로드/정리
+#
+# [ 처리 단계 ]
+#   parse_usage_statement → (파싱 → 분류 → 저장) / run_link_pipeline → (OCR → 매칭 → 링크)
+# --------------------------------------------------------------------------
 """
 사용내역서 파이프라인 서비스 (API 호출용)
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -41,14 +58,9 @@ from typing import Any
 
 from src.agents.classifier_agent.agent import review_usage_statement
 from src.core.json_utils import to_json_compatible
-from src.ocr.clova_ocr_receipt import (
-    SUPPORTED_EXTS,
-    call_clova_receipt,
-    parse_clova_response,
-)
-from src.ocr.clova_ocr_receipt import (
-    validate_result as validate_ocr_result,
-)
+# [Clova→VLM 리팩토링] 죽은 import(call_clova_receipt/parse_clova_response/validate_ocr_result) 제거,
+#   SUPPORTED_EXTS는 삭제된 clova_ocr_receipt 대신 receipt_validator에서 가져옴.
+from src.ocr.receipt_validator import SUPPORTED_EXTS
 from src.ocr.parse_tax_invoice import ALL_EXTS as TAX_INVOICE_EXTS
 from src.ocr.parse_usage_statement import parse_pdf as parse_usage_pdf
 from src.repositories.db import get_connection
@@ -69,7 +81,7 @@ from src.services.usage_statement_validation import (
     to_report_month,
     validate_usage_against_project,
 )
-from src.services.matching_service_monthly import (
+from src.services.matching_service import (
     THRESHOLD_MATCHED,
     THRESHOLD_REVIEW,
     match_all_usage_to_receipts,

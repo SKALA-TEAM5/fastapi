@@ -1,3 +1,20 @@
+# --------------------------------------------------------------------------
+# 작성자   : 이현수(kacalu0930)
+# 작성일   : 2026-05-11
+# 수정일   : 2026-06-18 (Clova→VLM 전환: 죽은 clova import·CLI 가드 제거)
+#
+# ※ 이 모듈은 독립 실행 CLI 도구로, 다른 모듈에서 import되지 않음(운영 API/Orchestrator 경로 아님).
+#    → "삭제 후보 보고" 참고: 사용 여부 검토 필요.
+#
+# [ 주요 함수 정의 ]  (CLI 파이프라인 단계)
+#
+# 1. main()                    : CLI 진입점
+# 2. step1_parse_usage()       : 1단계 — 사용내역서 파싱
+# 3. step2_ocr_receipts()      : 2단계 — 영수증 OCR(VLM)
+# 4. step2b_parse_tax_invoices(): 2b단계 — 세금계산서 파싱
+# 5. step3_match()             : 3단계 — 매칭
+# 6. print_pipeline_summary()  : 결과 요약 출력
+# --------------------------------------------------------------------------
 """
 산업안전관리비 AI 검증 시스템 — 전체 실행 서비스
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -6,7 +23,7 @@
   1. src/ocr/parse_usage_statement  : 사용내역서 PDF 파싱
   2. src/ocr/clova_ocr_receipt      : 영수증 이미지 배치 OCR
   2b. src/ocr/parse_tax_invoice     : 세금계산서 파싱 (PDF or 이미지 자동 분기)
-  3. src/services/matching_service_monthly : 2-way 매칭 — 월 단위 날짜 비교 (임계값 0.85 / 0.75)
+  3. src/services/matching_service : 2-way 매칭 — 월 단위 날짜 비교 (임계값 0.85 / 0.75)
 
 파이프라인 흐름:
   입력: 사용내역서 PDF + 영수증 이미지 폴더
@@ -60,12 +77,10 @@ from src.ocr.parse_usage_statement import (
     parse_pdf,
     print_summary as print_usage_summary,
 )
-from src.ocr.clova_ocr_receipt import SUPPORTED_EXTS
+# [Clova→VLM 리팩토링] 죽은 clova import(SUPPORTED_EXTS/CLOVA_SECRET/URL 등) 제거.
+#   SUPPORTED_EXTS는 receipt_validator에서 가져오고, main()의 'OCR_ENGINE==clova' 가드도 삭제됨.
+from src.ocr.receipt_validator import SUPPORTED_EXTS
 from src.ocr import ocr_engine
-try:
-    from src.ocr.clova_ocr_receipt import CLOVA_SECRET, CLOVA_URL
-except ImportError:
-    CLOVA_SECRET, CLOVA_URL = "", ""
 from src.ocr.parse_tax_invoice import (
     parse_tax_invoice,
     process_folder as tax_invoice_process_folder,
@@ -73,7 +88,7 @@ from src.ocr.parse_tax_invoice import (
     print_summary as print_tax_invoice_summary,
     ALL_EXTS as TAX_INVOICE_EXTS,
 )
-from src.services.matching_service_monthly import (
+from src.services.matching_service import (
     match_all_usage_to_receipts,
     save_match_result,
     print_batch_summary,
@@ -367,9 +382,9 @@ def main():
     parser.add_argument("--output", default=None,
                         help="결과 저장 폴더 (기본: 사용내역서 폴더 내 pipeline_results/)")
     parser.add_argument("--secret", default=None,
-                        help="CLOVA OCR Secret Key (미입력 시 환경변수 CLOVA_OCR_SECRET 사용)")
+                        help="(deprecated) 과거 CLOVA OCR Secret — 더 이상 사용하지 않음")
     parser.add_argument("--url", default=None,
-                        help="CLOVA OCR 엔드포인트 URL (미입력 시 환경변수 CLOVA_OCR_URL 사용)")
+                        help="(deprecated) 과거 CLOVA OCR URL — 더 이상 사용하지 않음")
     parser.add_argument("--threshold-matched", type=float, default=THRESHOLD_MATCHED,
                         help=f"matched 임계값 (기본: {THRESHOLD_MATCHED})")
     parser.add_argument("--threshold-review", type=float, default=THRESHOLD_REVIEW,
@@ -398,17 +413,9 @@ def main():
     )
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    secret = args.secret or CLOVA_SECRET
-    url    = args.url    or CLOVA_URL
-
-    # CLOVA 설정은 OCR_ENGINE=clova 일 때만 필수
-    if ocr_engine.get_engine_name() == "clova":
-        if not secret:
-            print("[오류] CLOVA OCR Secret Key가 없습니다. --secret 또는 환경변수 CLOVA_OCR_SECRET을 설정하세요.")
-            sys.exit(1)
-        if not url:
-            print("[오류] CLOVA OCR URL이 없습니다. --url 또는 환경변수 CLOVA_OCR_URL을 설정하세요.")
-            sys.exit(1)
+    # OCR은 VLM 전면 사용. secret/url 인자는 더 이상 사용하지 않으며 하위호환용으로만 유지.
+    secret = args.secret or ""
+    url    = args.url    or ""
 
     print("\n" + "═" * 60)
     print("  산업안전관리비 AI 검증 시스템 — 통합 파이프라인")
@@ -468,7 +475,7 @@ def main():
     )
 
     if args.verbose:
-        from src.services.matching_service_monthly import print_match_result
+        from src.services.matching_service import print_match_result
         for r in batch["results"]:
             print_match_result(r)
 

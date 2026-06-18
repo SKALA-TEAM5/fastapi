@@ -1,3 +1,12 @@
+# --------------------------------------------------------------------------
+# 작성자   : 이현수(kacalu0930)
+# 작성일   : 2026-05-11
+# 수정일   : 2026-06-18 (Clova→VLM 전환: CLOVA 설정 가드·인자 제거)
+#
+# [ 주요 함수 정의 ]
+#
+# 1. ocr_tax_invoice() : POST /tax-invoices/ocr — 세금계산서 파일 OCR 엔드포인트
+# --------------------------------------------------------------------------
 """
 세금계산서 OCR 라우터
 ━━━━━━━━━━━━━━━━━━━
@@ -13,8 +22,9 @@ from pathlib import Path
 from fastapi import APIRouter, File, HTTPException, UploadFile, status
 
 from src.schemas.ocr import TaxInvoiceOCRResponse, TaxInvoiceParty, TaxInvoiceValidation
-from src.core.config import CLOVA_OCR_SECRET, CLOVA_OCR_URL
-from src.ocr.parse_tax_invoice import ALL_EXTS, PDF_EXTS, parse_tax_invoice
+# [Clova→VLM 리팩토링] CLOVA_OCR_SECRET/URL import 및 PDF_EXTS 제거.
+#   이미지 CLOVA 설정 가드 삭제, parse_tax_invoice 호출 시 secret/url 인자 제거.
+from src.ocr.parse_tax_invoice import ALL_EXTS, parse_tax_invoice
 
 router = APIRouter(prefix="/tax-invoices", tags=["세금계산서 OCR"])
 
@@ -30,17 +40,15 @@ router = APIRouter(prefix="/tax-invoices", tags=["세금계산서 OCR"])
 **처리 흐름**
 1. 파일 확장자 자동 감지
 2. PDF → `pdfplumber` 텍스트 직접 추출
-3. 이미지 → CLOVA OCR → 텍스트 추출 → 정규식 파싱
+3. 이미지 → VLM(Gemini/OpenAI) 구조화 추출
 4. 공급가액 + 세액 = 합계금액 검증
 
 **지원 형식**: pdf, jpg, jpeg, png, tif, tiff
-
-**참고**: 이미지 파일 처리 시 `CLOVA_OCR_URL`, `CLOVA_OCR_SECRET` 환경변수가 필요합니다.
     """,
     responses={
         200: {"description": "파싱 성공"},
         400: {"description": "지원하지 않는 파일 형식"},
-        503: {"description": "이미지 처리 시 CLOVA 설정 누락"},
+        503: {"description": "파싱 처리 실패"},
     },
 )
 async def ocr_tax_invoice(
@@ -54,13 +62,6 @@ async def ocr_tax_invoice(
             detail=f"지원하지 않는 파일 형식: {suffix}. 지원 형식: {sorted(ALL_EXTS)}",
         )
 
-    # ── 이미지 파일 → CLOVA 설정 확인 ────────────────
-    if suffix not in PDF_EXTS and (not CLOVA_OCR_URL or not CLOVA_OCR_SECRET):
-        raise HTTPException(
-            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-            detail="이미지 처리를 위한 CLOVA_OCR_URL 또는 CLOVA_OCR_SECRET 환경변수가 설정되지 않았습니다.",
-        )
-
     # ── 임시 파일 저장 후 파싱 ───────────────────────
     file_bytes = await file.read()
     with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as tmp:
@@ -68,7 +69,7 @@ async def ocr_tax_invoice(
         tmp_path = tmp.name
 
     try:
-        parsed = parse_tax_invoice(tmp_path, secret=CLOVA_OCR_SECRET, url=CLOVA_OCR_URL)
+        parsed = parse_tax_invoice(tmp_path)
     except Exception as e:
         raise HTTPException(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
