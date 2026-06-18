@@ -1,3 +1,15 @@
+# --------------------------------------------------------------------------
+# 작성자   : 이현수(kacalu0930)
+# 작성일   : 2026-05-11
+# 수정일   : 2026-06-18 (Clova→VLM 전환: OCR_ENGINE / CLOVA_OCR_URL / CLOVA_OCR_SECRET 제거)
+#
+# [ 모듈 설명 ]
+#   환경변수 기반 전역 설정 상수 모듈 (함수 없음).
+#
+# [ 주요 설정 ]
+#   - VLM_PROVIDER / GEMINI_API_KEY / OPENAI_API_KEY : OCR용 VLM 프로바이더·API 키
+#   - (그 외 DB · MinIO · Qdrant 등 인프라 환경설정)
+# --------------------------------------------------------------------------
 """
 산업안전관리비 AI 검증 시스템 — 전역 설정
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -19,25 +31,10 @@ load_dotenv(
 
 
 # ══════════════════════════════════════════════
-# OCR 엔진 선택
+# VLM — Gemini / OpenAI (OCR 엔진)
 # ══════════════════════════════════════════════
-# OCR_ENGINE=clova  → NAVER CLOVA OCR (인쇄 영수증, 저비용)
-# OCR_ENGINE=vlm    → Gemini / OpenAI VLM (수기 포함, 고품질) ← 기본값
-
-OCR_ENGINE: str = os.getenv("OCR_ENGINE", "vlm").lower()
-
-
-# ══════════════════════════════════════════════
-# CLOVA OCR (OCR_ENGINE=clova 시 사용)
-# ══════════════════════════════════════════════
-
-CLOVA_OCR_URL: str = os.getenv("CLOVA_OCR_URL", "")
-CLOVA_OCR_SECRET: str = os.getenv("CLOVA_OCR_SECRET", "")
-
-
-# ══════════════════════════════════════════════
-# VLM — Gemini / OpenAI (OCR_ENGINE=vlm 시 사용)
-# ══════════════════════════════════════════════
+# [Clova→VLM 리팩토링] 기존 OCR_ENGINE / CLOVA_OCR_URL / CLOVA_OCR_SECRET 설정 제거.
+#   OCR은 VLM 전면 사용으로 전환되어 Clova 관련 환경변수는 더 이상 필요 없음.
 
 VLM_PROVIDER: str = os.getenv("VLM_PROVIDER", "gemini").lower()
 

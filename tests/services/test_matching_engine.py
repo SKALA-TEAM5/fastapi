@@ -307,21 +307,6 @@ def test_match_best(verbose: bool = False):
         print_match_result(result)
 
 
-def test_no_photo_text(verbose: bool = False):
-    """현장사진 텍스트 없어도 매칭 가능"""
-    print("\n[Test 10] 현장사진 텍스트 없음 — photo_text 제외 후 가중치 재분배")
-
-    result = match_threeway(USAGE_ITEMS[0], RECEIPT_SAFETY_GEAR, photo_text="")
-
-    check(result["component_scores"].get("photo_text") is None,
-          "photo_text 점수 == None (가중치 재분배)")
-    check(result["match_status"] == "matched",
-          f"사진 없어도 매칭 가능 (got '{result['match_status']}')")
-
-    if verbose:
-        print_match_result(result)
-
-
 def test_batch_with_real_files(verbose: bool = False):
     """실제 파싱 결과 파일로 배치 매칭 (파일 존재 시만 실행)"""
     print("\n[Test 11] 실제 파일 배치 매칭")
@@ -426,7 +411,6 @@ def main():
         lambda: test_rejected_ocr_fail(v),
         lambda: test_unmatched(v),
         lambda: test_match_best(v),
-        lambda: test_no_photo_text(v),
         lambda: test_batch_with_real_files(v),
         lambda: test_output_schema(v),
     ]

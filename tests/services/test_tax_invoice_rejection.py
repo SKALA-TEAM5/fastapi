@@ -16,7 +16,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent.parent.parent))
 
-from src.services.matching_service_monthly import _check_rejection  # noqa: E402
+from src.services.matching_service import _check_rejection  # noqa: E402
 
 USAGE_ITEM = {
     "name": "낙하물 방지망 구입",

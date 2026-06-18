@@ -1,3 +1,15 @@
+# --------------------------------------------------------------------------
+# 작성자   : 이현수(kacalu0930)
+# 작성일   : 2026-06-04
+# 수정일   : 2026-06-18 (삭제된 clova_ocr_receipt.py의 SUPPORTED_EXTS 상수 이전)
+#
+# [ 주요 함수 정의 ]
+#
+# 1. validate_result() : OCR 파싱 결과 검증(필수 필드 / 금액 합산 / VAT / 사업자번호 등)
+#
+# [ 주요 상수 ]
+#   - SUPPORTED_EXTS : OCR 처리 지원 확장자(이미지 + PDF)
+# --------------------------------------------------------------------------
 """
 영수증 파싱 결과 후처리 검증 모듈
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -20,6 +32,11 @@ from __future__ import annotations
 
 import re
 from datetime import date as _date
+
+
+# [Clova→VLM 리팩토링] 삭제된 clova_ocr_receipt.py의 SUPPORTED_EXTS를 이 모듈로 이전.
+# OCR 처리 지원 파일 확장자 (이미지 + PDF)
+SUPPORTED_EXTS = {".jpg", ".jpeg", ".png", ".tif", ".tiff", ".pdf"}
 
 
 def validate_result(parsed: dict) -> dict:

@@ -15,7 +15,7 @@
   세금계산서 없음 / 금액 불일치(±1% 초과) / 업체명(공급자) 불일치 → 반려(rejected).
   날짜는 월 ±2일 유예로 판정하며, 벗어나면 unverified → 반려.
   ※ 이 모듈은 verified/unverified 판정만 한다. 실제 반려(match_status="rejected") 전환은
-    matching_service_monthly.match_all_usage_to_receipts 에서 수행한다.
+    matching_service.match_all_usage_to_receipts 에서 수행한다.
 
 [매칭 기준 — Hard Gate 3가지]
   Gate 1 — 날짜  : 같은 연월 (또는 월 경계 ±2일)
@@ -31,7 +31,7 @@ import re
 import logging
 from typing import Optional
 
-from src.services.matching_service_monthly import (
+from src.services.matching_service import (
     _date_gate_monthly,
     _extract_receipt_date,
     _extract_receipt_vendor,
@@ -49,7 +49,7 @@ logger = logging.getLogger(__name__)
 # ══════════════════════════════════════════════════════════════
 
 def _clean_vendor_for_gate(text: str) -> str:
-    """업체명 Gate용 정규화 (matching_service_monthly._check_hard_gates와 동일 로직)"""
+    """업체명 Gate용 정규화 (matching_service._check_hard_gates와 동일 로직)"""
     if not text:
         return ""
     t = _normalize_vendor(text)

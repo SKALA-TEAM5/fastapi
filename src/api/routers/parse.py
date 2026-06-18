@@ -1,3 +1,16 @@
+# --------------------------------------------------------------------------
+# 작성자   : 이현수(kacalu0930)
+# 작성일   : 2026-05-11
+# 수정일   : 2026-06-18 (Clova→VLM 전환 + 거래명세표 PDF·이미지 모두 VLM 기능변경)
+#
+# [ 주요 함수 정의 ]
+#
+# 1. parse()                      : POST /ocr/parse — evidence_code별 파싱 디스패치 엔드포인트
+# 2. _refine_doc_type()           : 파일명/내용 기반 문서 유형 보정
+# 3. _parse_usage_statement()     : 사용내역서(PDF) 파싱 헬퍼
+# 4. _parse_receipt_or_statement(): 영수증/거래명세표/임금명세서 파싱 헬퍼
+# 5. _parse_tax_invoice()         : 세금계산서 파싱 헬퍼
+# --------------------------------------------------------------------------
 """
 단일 OCR 파싱 엔드포인트
 ━━━━━━━━━━━━━━━━━━━━━━━━
@@ -32,12 +45,10 @@ from src.schemas.ocr import (
     TaxInvoiceParty,
     TaxInvoiceValidation,
 )
-from src.core.config import CLOVA_OCR_SECRET, CLOVA_OCR_URL
 from src.ocr.ocr_engine import parse_receipt, parse_document_image, get_engine_name
+# [Clova→VLM 리팩토링] CLOVA_OCR_SECRET/URL import 및 죽은 import(parse_from_image, PDF_EXTS) 제거.
 from src.ocr.parse_tax_invoice import (
     ALL_EXTS as TAX_EXTS,
-    PDF_EXTS,
-    parse_from_image,
     parse_from_pdf,
     parse_tax_invoice,
 )
@@ -138,7 +149,9 @@ def _parse_receipt_or_statement(
 
     try:
         if doc_type in ("transaction_statement", "wage_statement"):
-            if suffix in _PDF_EXT:
+            # [기능변경] 거래명세표(transaction_statement): PDF·이미지 모두 VLM (이전: PDF→pdfplumber)
+            #            임금명세서(wage_statement): 기존 유지 — PDF는 pdfplumber, 이미지는 VLM
+            if doc_type == "wage_statement" and suffix in _PDF_EXT:
                 parsed = parse_from_pdf(tmp_path)
             else:
                 parsed = parse_document_image(tmp_path, type_hint=doc_type)
@@ -217,7 +230,8 @@ def _parse_tax_invoice(file_bytes: bytes, suffix: str, filename: str) -> dict:
         tmp_path = tmp.name
 
     try:
-        parsed = parse_tax_invoice(tmp_path, secret=CLOVA_OCR_SECRET, url=CLOVA_OCR_URL)
+        # [Clova→VLM 리팩토링] 기존 parse_tax_invoice(tmp_path, secret=..., url=...) 의 CLOVA 인자 제거
+        parsed = parse_tax_invoice(tmp_path)
     except Exception as e:
         raise HTTPException(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,

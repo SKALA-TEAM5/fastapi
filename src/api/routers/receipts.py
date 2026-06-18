@@ -1,3 +1,15 @@
+# --------------------------------------------------------------------------
+# 작성자   : 이현수(kacalu0930)
+# 작성일   : 2026-05-11
+# 수정일   : 2026-06-18 (Clova→VLM 전환 + 거래명세표 PDF·이미지 모두 VLM 기능변경)
+#
+# [ 주요 함수 정의 ]
+#
+# 1. ocr_receipt()              : POST /receipts/ocr — 영수증/거래명세표/임금명세서 OCR 엔드포인트
+# 2. _classify_document()       : 파일명/내용 기반 문서 유형 분류
+# 3. _map_transaction_statement(): 거래명세표·임금명세서 파싱결과 → 응답 스키마 매핑
+# 4. _map_receipt()             : 영수증 파싱결과 → 응답 스키마 매핑
+# --------------------------------------------------------------------------
 """
 영수증 / 거래명세표 / 임금명세서 OCR 라우터
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -42,8 +54,7 @@ from pathlib import Path
 from fastapi import APIRouter, File, HTTPException, UploadFile, status
 
 from src.schemas.ocr import ReceiptOCRResponse, ReceiptValidation
-from src.core.config import CLOVA_OCR_SECRET, CLOVA_OCR_URL, OCR_ENGINE
-from src.ocr.clova_ocr_receipt import SUPPORTED_EXTS
+# [Clova→VLM 리팩토링] 죽은 import(SUPPORTED_EXTS) 및 CLOVA_OCR_SECRET/URL/OCR_ENGINE import 제거.
 from src.ocr.parse_tax_invoice import parse_from_pdf
 from src.ocr import ocr_engine
 
@@ -317,19 +328,15 @@ async def ocr_receipt(
         # STEP 2-A. 거래명세표 / 임금명세서 처리
         #   세금계산서 파서(parse_tax_invoice.py)와 동일한 로직 사용.
         #   PDF → pdfplumber 직접 추출
-        #   이미지 → CLOVA 일반 OCR + 정규식
+        #   이미지 → VLM
         # ══════════════════════════════════════════════════════
         if doc_type in ("delivery_statement", "wage_statement"):
 
-            # 이미지 + CLOVA 엔진 조합일 때만 설정 확인
-            if suffix in _IMAGE_EXT and OCR_ENGINE == "clova" and (not CLOVA_OCR_URL or not CLOVA_OCR_SECRET):
-                raise HTTPException(
-                    status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-                    detail="이미지 문서 처리를 위한 CLOVA 환경변수가 설정되지 않았습니다.",
-                )
-
+            # [기능변경] 거래명세표(delivery_statement): PDF·이미지 모두 VLM (이전: PDF→pdfplumber)
+            #            임금명세서(wage_statement): 기존 유지 — PDF는 pdfplumber, 이미지는 VLM
+            # [Clova→VLM 리팩토링] 기존 'CLOVA 설정 가드' 제거(VLM은 항상 사용 가능).
             try:
-                if suffix in _PDF_EXT:
+                if doc_type == "wage_statement" and suffix in _PDF_EXT:
                     parsed = parse_from_pdf(tmp_path)
                 else:
                     parsed = ocr_engine.parse_document_image(tmp_path, type_hint=doc_type)
@@ -343,11 +350,10 @@ async def ocr_receipt(
 
         # ══════════════════════════════════════════════════════
         # STEP 2-B. 영수증 처리
-        #   CLOVA OCR 영수증 특화 모델 호출.
-        #   카드 승인일시를 날짜 기준으로 사용.
+        #   VLM 영수증 파싱. 카드 승인일시를 날짜 기준으로 사용.
         # ══════════════════════════════════════════════════════
         else:
-            # 영수증: OCR_ENGINE 설정에 따라 CLOVA 또는 VLM 자동 선택
+            # 영수증: VLM 경로
             try:
                 parsed = ocr_engine.parse_receipt(tmp_path)
             except Exception as e:
