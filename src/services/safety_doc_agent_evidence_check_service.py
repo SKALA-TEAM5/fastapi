@@ -1,3 +1,12 @@
+# --------------------------------------------------------------------------
+# 작성자   : 한채윤
+# 작성일   : 2026-06-04
+# 수정일   : 2026-06-18
+#
+# [ 주요 클래스 정의 ]
+#
+# 1. EvidenceCheckService : 필수 증빙과 제출 파일 연결 상태 비교
+# --------------------------------------------------------------------------
 from __future__ import annotations
 
 from src.repositories.safety_doc_agent_evidence_repository import EvidenceRepository
@@ -8,6 +17,8 @@ class EvidenceCheckService:
     """필수 증빙과 제출된 파일 연결 정보를 비교한다."""
 
     def __init__(self, repository: EvidenceRepository) -> None:
+        """Initialize the evidence check service with a repository."""
+
         self.repository = repository
 
     def run(self, item_id: int) -> EvidenceStatusResult:

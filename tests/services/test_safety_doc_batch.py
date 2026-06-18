@@ -3,8 +3,10 @@ from types import SimpleNamespace
 
 from src.agents.safety_doc_agent.config import Settings
 from src.agents.safety_doc_agent.agent import (
+    _build_services,
     _linked_file_audit_context,
     check_missing_evidence,
+    total_tokens,
 )
 from src.core.metrics import SAFETY_DOC_LLM_FAILURES
 from src.schemas.safety_doc_agent_evidence import (
@@ -105,7 +107,7 @@ def test_batch_inference_uses_one_llm_call_and_filters_evidence_types():
 
     assert len(responses.calls) == 1
     assert len(ai_inputs) == 2
-    assert outputs[1].required_evidences == ["site_photo", "tax_invoice"]
+    assert outputs[1].required_evidences == ["tax_invoice"]
     assert outputs[2].required_evidences == ["receipt", "wearing_photo"]
     assert outputs[1].usage == {"input_tokens": 100, "output_tokens": 20, "total_tokens": 120}
     assert outputs[2].usage is None
@@ -188,6 +190,97 @@ def test_single_agent_builds_item_context_once():
 
     assert result["input_from_db_views"]["item_context"]["item_id"] == 1
     assert repository.context_call_count == 1
+
+
+def test_build_services_uses_injected_dependencies():
+    settings = _settings()
+    repository = FakeRepository()
+    openai_client = SimpleNamespace(responses=FakeResponses(FakeResponse("{}", None)))
+
+    requirement_service, check_service, resolved_settings = _build_services(
+        settings=settings,
+        repository=repository,
+        openai_client=openai_client,
+    )
+
+    assert resolved_settings is settings
+    assert requirement_service.repository is repository
+    assert requirement_service.openai_client is openai_client
+    assert check_service.repository is repository
+
+
+def test_total_tokens_contract_is_shared():
+    assert total_tokens(None) is None
+    assert total_tokens({}) is None
+    assert total_tokens({"total_tokens": 12}) == 12
+    assert total_tokens({"total_tokens": "12"}) is None
+
+
+def test_photo_evidence_rules_are_deterministic():
+    repository = FakeRepository()
+    responses = FakeResponses(
+        FakeResponse(
+            output_text=(
+                '{"results":['
+                '{"item_id":1,"required_evidences":["site_photo","wearing_photo","receipt"]},'
+                '{"item_id":2,"required_evidences":["site_photo","tax_invoice"]}'
+                ']}'
+            ),
+            usage=SimpleNamespace(input_tokens=10, output_tokens=5, total_tokens=15),
+        )
+    )
+    service = EvidenceRequirementService(
+        repository,
+        SimpleNamespace(responses=responses),
+        _settings(),
+    )
+
+    _, outputs = service.infer_required_evidences_batch([1, 2])
+
+    assert outputs[1].required_evidences == ["receipt"]
+    assert outputs[2].required_evidences == ["tax_invoice", "wearing_photo"]
+
+
+def test_reference_context_search_keeps_single_and_batch_modes(monkeypatch):
+    calls: list[dict] = []
+
+    def fake_search(**kwargs):
+        calls.append(kwargs)
+        return [
+            {
+                "score": 0.9,
+                "payload": {
+                    "section": "가이드",
+                    "content": "필수 증빙 설명",
+                    "metadata": {"page": 1},
+                },
+            }
+        ]
+
+    monkeypatch.setattr(
+        "src.services.safety_doc_agent_evidence_requirement_service.search_reference_vector_db",
+        fake_search,
+    )
+    settings = Settings(openai_api_key="test", reference_top_k=2, reference_collection="safety-guide")
+    repository = FakeRepository()
+    service = EvidenceRequirementService(
+        repository,
+        SimpleNamespace(responses=FakeResponses(FakeResponse("{}", None))),
+        settings,
+    )
+
+    single_contexts = service._search_reference_contexts(repository.contexts[1])
+    batch_contexts = service._search_reference_contexts_for_items([repository.contexts[1], repository.contexts[2]])
+
+    assert single_contexts == [
+        {"score": 0.9, "title": "가이드", "text": "필수 증빙 설명", "metadata": {"page": 1}}
+    ]
+    assert batch_contexts == single_contexts
+    assert calls[0]["query"] == "테스트 분류 안전난간 설치"
+    assert "안전난간 설치" in calls[1]["query"]
+    assert "안전모 구입" in calls[1]["query"]
+    assert all(call["collection_name"] == "safety-guide" for call in calls)
+    assert all(call["top_k"] == 2 for call in calls)
 
 
 def test_linked_file_audit_context_excludes_file_name_and_storage_key():

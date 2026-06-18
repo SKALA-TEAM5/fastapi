@@ -1,6 +1,7 @@
 # --------------------------------------------------------------------------
 # 작성자   : 송상민(ss19801)
 # 작성일   : 2026-06-04
+# 수정일   : 2026-06-18
 #
 # [ 주요 함수 정의 ]
 #
@@ -43,7 +44,7 @@ _graph_lock = Lock()
 
 
 def build_chatbot_graph() -> StateGraph:
-    """LangGraph StateGraph를 조립하고 반환한다. (미컴파일 상태)"""
+    """Build the uncompiled chatbot LangGraph state machine."""
     graph = StateGraph(ChatbotState)
 
     # 노드 등록
@@ -92,7 +93,7 @@ def build_chatbot_graph() -> StateGraph:
 
 
 def get_compiled_graph():
-    """MemorySaver checkpointer가 연결된 컴파일 그래프를 반환한다.
+    """Return the singleton compiled graph with MemorySaver checkpointer.
 
     앱 생명주기 동안 단 1회 초기화되며 이후 재사용된다.
     thread_id(=session_id)를 기준으로 대화 상태를 분리 보관한다.

@@ -1,133 +1,22 @@
 # --------------------------------------------------------------------------
 # 작성자   : 송상민(ss19801)
 # 작성일   : 2026-05-29
+# 수정일   : 2026-06-18
 #
-# [ 엔드포인트 ]
+# [ 사용 현황 ]
 #
-# /classi/item
-#   - 설명 : 단일 항목 카테고리 분류 + DB 적재
-#   - Body : {
-#               "project_id": int,
-#               "usage_statement_id": int,
-#               "item_name": str,
-#               "used_on": str,          # YYYY-MM-DD
-#               "unit": str | null,
-#               "quantity": float,
-#               "unit_price": float,
-#               "total_amount": float,
-#               "basic_info": dict | null
-#             }
-#   - 호출 : classify_item_service()
-#   - 적재 : usage_statement_items INSERT → agent_logs INSERT (classi)
+# - 이 모듈의 라우터 엔드포인트는 현재 등록되어 있지 않다.
+# - services.orchestrator_service가 insert_usage_statement_item()을 import해
+#   저장된 사용내역서 세부항목 classi 재분류 결과를 usage_statement_items에 적재한다.
 #
 # [ 주요 함수 정의 ]
 #
-# 1. classify_item_service()        : 단일 항목 카테고리 분류 + DB 적재
-# 2. _insert_usage_statement_item() : usage_statement_items INSERT
-# 3. _write_classi_log()            : agent_logs INSERT (classi 전용)
+# 1. insert_usage_statement_item() : usage_statement_items INSERT
 # --------------------------------------------------------------------------
 from __future__ import annotations
 
-import json
-import logging
-from typing import Any
-
-from src.agents.classifier_agent.agent import classify_document
-
-try:
-    from langchain_community.callbacks import get_openai_callback
-except ImportError:  # pragma: no cover
-    get_openai_callback = None  # type: ignore
-from src.core.storage import DEFAULT_COLLECTION
-from src.schemas.classifier import DocumentClassification
-
-logger = logging.getLogger(__name__)
-
-_MODEL_NAME = "classifier_agent"
 _PAGE_NO_MANUAL = 999  # 수동 추가 항목 고정값
 
-
-# ── 단일 항목 분류 + DB 적재 ──────────────────────────────────────────────────
-
-def classify_item_service(
-    *,
-    project_id: int,
-    usage_statement_id: int,
-    item_name: str,
-    used_on: str,
-    unit: str | None = None,
-    quantity: float = 0,
-    unit_price: float = 0,
-    total_amount: float,
-    basic_info: dict[str, Any] | None = None,
-    collection: str = DEFAULT_COLLECTION,
-) -> DocumentClassification:
-    """
-    단일 항목을 카테고리 분류 후 usage_statement_items와 agent_logs에 INSERT한다.
-
-    Args:
-        project_id          : projects.id
-        usage_statement_id  : usage_statements.id
-        item_name           : 품목명
-        used_on             : 사용일자 (YYYY-MM-DD)
-        unit                : 단위 (선택)
-        quantity            : 수량 (기본 0)
-        unit_price          : 단가 (기본 0)
-        total_amount        : 합계금액
-        basic_info          : 분류 참고 기본정보 (선택)
-        collection          : Qdrant 컬렉션명
-
-    Returns:
-        DocumentClassification (category_id, category_name, confidence 등)
-    """
-    # 1. 카테고리 분류 (토큰 집계 포함)
-    total_tokens: int | None = None
-    if get_openai_callback is not None:
-        with get_openai_callback() as cb:
-            result = classify_document(
-                items={item_name: total_amount},
-                basic_info=basic_info or {},
-                collection=collection,
-            )
-        total_tokens = cb.total_tokens or None
-    else:
-        result = classify_document(
-            items={item_name: total_amount},
-            basic_info=basic_info or {},
-            collection=collection,
-        )
-
-    from src.repositories.db import get_connection
-
-    with get_connection() as conn:
-        # 2. usage_statement_items INSERT
-        item_id = _insert_usage_statement_item(
-            conn,
-            usage_statement_id=usage_statement_id,
-            category_code=result.category_id,
-            used_on=used_on,
-            item_name=item_name,
-            unit=unit,
-            quantity=quantity,
-            unit_price=unit_price,
-            total_amount=total_amount,
-        )
-
-        # 3. agent_logs INSERT
-        _write_classi_log(
-            conn,
-            project_id=project_id,
-            usage_statement_id=usage_statement_id,
-            usage_statement_item_id=item_id,
-            item_name=item_name,
-            result=result,
-            token=total_tokens,
-        )
-
-    return result
-
-
-# ── usage_statement_items INSERT ──────────────────────────────────────────────
 
 _INSERT_ITEM_SQL = """
     INSERT INTO usage_statement_items (
@@ -146,7 +35,7 @@ _INSERT_ITEM_SQL = """
 """
 
 
-def _insert_usage_statement_item(
+def insert_usage_statement_item(
     conn,
     *,
     usage_statement_id: int,
@@ -158,63 +47,35 @@ def _insert_usage_statement_item(
     unit_price: float,
     total_amount: float,
 ) -> int:
+    """Insert one usage-statement item row and return its database id.
+
+    Args:
+        conn: Open database connection with cursor support.
+        usage_statement_id: Usage statement identifier.
+        category_code: Final category code to store.
+        used_on: Usage date string.
+        item_name: Item name.
+        unit: Unit label, if present.
+        quantity: Item quantity.
+        unit_price: Unit price.
+        total_amount: Total amount for the row.
+
+    Returns:
+        Inserted ``usage_statement_items.id``.
+    """
     with conn.cursor() as cur:
-        cur.execute(_INSERT_ITEM_SQL, {
-            "usage_statement_id": usage_statement_id,
-            "category_code":      category_code,
-            "used_on":            used_on,
-            "item_name":          item_name,
-            "unit":               unit,
-            "quantity":           quantity,
-            "unit_price":         unit_price,
-            "total_amount":       int(total_amount),
-            "page_no":            _PAGE_NO_MANUAL,
-        })
+        cur.execute(
+            _INSERT_ITEM_SQL,
+            {
+                "usage_statement_id": usage_statement_id,
+                "category_code": category_code,
+                "used_on": used_on,
+                "item_name": item_name,
+                "unit": unit,
+                "quantity": quantity,
+                "unit_price": unit_price,
+                "total_amount": int(total_amount),
+                "page_no": _PAGE_NO_MANUAL,
+            },
+        )
         return cur.fetchone()[0]
-
-
-# ── agent_logs INSERT ─────────────────────────────────────────────────────────
-
-_INSERT_LOG_SQL = """
-    INSERT INTO agent_logs (
-        project_id, usage_statement_id, usage_statement_item_id,
-        agent_type_code, status_code, result_code,
-        reason, details, model_name, token
-    )
-    VALUES (
-        %(project_id)s, %(usage_statement_id)s, %(usage_statement_item_id)s,
-        'classi', 'success', 'success',
-        '', %(details)s::jsonb, %(model_name)s, %(token)s
-    )
-    RETURNING id
-"""
-
-
-def _write_classi_log(
-    conn,
-    *,
-    project_id: int,
-    usage_statement_id: int,
-    usage_statement_item_id: int,
-    item_name: str,
-    result: DocumentClassification,
-    token: int | None = None,
-) -> None:
-    details = {
-        "item": {
-            "item_name":     item_name,
-            "category_id":   result.category_id,
-            "category_name": result.category_name,
-            "confidence":    result.confidence,
-        }
-    }
-    with conn.cursor() as cur:
-        cur.execute(_INSERT_LOG_SQL, {
-            "project_id":               project_id,
-            "usage_statement_id":       usage_statement_id,
-            "usage_statement_item_id":  usage_statement_item_id,
-            "details":                  json.dumps(details, ensure_ascii=False),
-            "model_name":               _MODEL_NAME,
-            "token":                    token,
-        })
-    logger.info("[agent_log] classi INSERT 완료 (item=%s, category=%s)", item_name, result.category_id)

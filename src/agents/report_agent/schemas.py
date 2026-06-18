@@ -1,3 +1,13 @@
+# --------------------------------------------------------------------------
+# 작성자   : 차현주
+# 작성일   : 2026-06-18
+# 수정일   : 2026-06-18
+#
+# [ 주요 타입 정의 ]
+#
+# 1. ReportContext : 보고서 생성을 위한 입력 컨텍스트
+# 2. ReportDraft   : 화면/API 반환용 보고서 초안 JSON 구조
+# --------------------------------------------------------------------------
 from __future__ import annotations
 
 """보고서 생성 경계에서 사용하는 타입 계약입니다.
@@ -21,6 +31,8 @@ LegalValidationStatus = Literal["적절", "부적절", "검토필요"]
 
 
 class ProjectContext(BaseModel):
+    """Project information needed for the report cover and totals."""
+
     id: int
     contract_no: str | None = None
     construction_company: str
@@ -35,6 +47,8 @@ class ProjectContext(BaseModel):
 
 
 class UsageStatementContext(BaseModel):
+    """Usage-statement document metadata for the report scope."""
+
     id: int
     report_month: date
     revision_no: int
@@ -44,6 +58,8 @@ class UsageStatementContext(BaseModel):
 
 
 class UsageCategorySummary(BaseModel):
+    """Aggregated amount and count for one usage category."""
+
     category_code: str
     category_name: str
     previous_amount: Decimal
@@ -53,6 +69,8 @@ class UsageCategorySummary(BaseModel):
 
 
 class EvidenceFileContext(BaseModel):
+    """Submitted evidence-file metadata attached to a usage item."""
+
     file_id: int
     original_filename: str
     evidence_type_code: EvidenceTypeCode | str
@@ -63,11 +81,15 @@ class EvidenceFileContext(BaseModel):
 
 
 class EvidenceRequirementContext(BaseModel):
+    """Required evidence status for one evidence type."""
+
     evidence_type_code: EvidenceTypeCode | str
     is_satisfied: bool
 
 
 class ValidationLogContext(BaseModel):
+    """Validation log payload from upstream agents."""
+
     id: int
     validation_type_code: str
     result_code: str
@@ -109,6 +131,8 @@ class LegalValidationResultContext(BaseModel):
 
 
 class UsageStatementItemContext(BaseModel):
+    """One usage-statement item with evidence and agent outputs."""
+
     id: int
     category_code: str
     category_name: str
@@ -128,6 +152,8 @@ class UsageStatementItemContext(BaseModel):
 
 
 class ActionRequestContext(BaseModel):
+    """Supplement or correction request linked to the report scope."""
+
     id: int
     usage_statement_item_id: int | None = None
     title: str
@@ -140,6 +166,8 @@ class ActionRequestContext(BaseModel):
 
 
 class ReviewerContext(BaseModel):
+    """Reviewer label used on the generated report."""
+
     name: str
     department: str | None = None
     title: str | None = None
@@ -161,6 +189,8 @@ class ReportContext(BaseModel):
 
 
 class AmountSummaryDraft(BaseModel):
+    """Rendered amount summary row for ReportDraft."""
+
     label: str
     amount: Decimal
     ratio_label: str
@@ -168,6 +198,8 @@ class AmountSummaryDraft(BaseModel):
 
 
 class CategorySummaryDraft(BaseModel):
+    """Rendered category summary row for ReportDraft."""
+
     category_code: str
     category_name: str
     amount: Decimal
@@ -176,6 +208,8 @@ class CategorySummaryDraft(BaseModel):
 
 
 class EvidenceValidationSummaryDraft(BaseModel):
+    """Rendered evidence validation summary row for ReportDraft."""
+
     evidence_type_code: str
     evidence_type_name: str
     submitted_count: int
@@ -186,6 +220,8 @@ class EvidenceValidationSummaryDraft(BaseModel):
 
 
 class ItemReviewDraft(BaseModel):
+    """Rendered per-item review decision for ReportDraft."""
+
     no: int
     usage_statement_item_id: int
     category_code: str
@@ -208,6 +244,8 @@ class LegalCitationDraft(BaseModel):
 
 
 class IssueDetailDraft(BaseModel):
+    """Rendered issue detail used by the detailed report sections."""
+
     issue_type: Literal["inappropriate", "needs_review"]
     no: int
     usage_statement_item_id: int | None = None

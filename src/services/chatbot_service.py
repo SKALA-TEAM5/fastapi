@@ -1,11 +1,15 @@
 # --------------------------------------------------------------------------
 # 작성자   : 송상민(ss19801)
 # 작성일   : 2026-06-04
+# 수정일   : 2026-06-18
 #
 # [ 주요 함수 정의 ]
 #
 # 1. stream_chat() : LangGraph astream_events를 실행하고
 #                    SSE 포맷 이벤트를 async generator로 반환한다.
+# 2. _stream_events() : LangGraph 이벤트를 SSE 이벤트로 변환한다.
+# 3. _chatbot_memory_key() / _load_chatbot_messages() / _save_chatbot_messages()
+#                    Redis 기반 대화 메모리를 읽고 저장한다.
 #
 # [ SSE 이벤트 변환 규칙 ]
 # - on_chain_start (노드 진입)       → {"type": "status",  "value": "...중..."}
@@ -90,10 +94,12 @@ def _has_session_state(session_id: str) -> bool:
 
 
 def _chatbot_memory_key(session_id: str) -> str:
+    """Return the Redis key for persisted chatbot messages."""
     return f"chatbot:session:{session_id}:messages"
 
 
 def _load_chatbot_messages(session_id: str) -> list:
+    """Load and trim chatbot messages from Redis."""
     payload = _redis_get_json(_chatbot_memory_key(session_id))
     if not isinstance(payload, list):
         return []
@@ -109,6 +115,7 @@ def _load_chatbot_messages(session_id: str) -> list:
 
 
 def _save_chatbot_messages(session_id: str, messages: list) -> None:
+    """Persist recent chatbot messages to Redis."""
     if not messages:
         return
     try:
@@ -118,6 +125,83 @@ def _save_chatbot_messages(session_id: str, messages: list) -> None:
         log.info("[chatbot_service] Redis 대화 메모리 저장: session=%s messages=%s", session_id, len(trimmed))
     except Exception as e:
         log.warning("[chatbot_service] Redis 대화 메모리 저장 실패 (%s): %s", session_id, e)
+
+
+async def _next_event(ait):
+    """Return the next event from a LangGraph async iterator."""
+    return await ait.__anext__()
+
+
+def _status_sse(event: dict) -> str | None:
+    """Build a status SSE event for LangGraph node start events."""
+    ev_name = event.get("name", "")
+    if event.get("event", "") == "on_chain_start" and ev_name in _NODE_STATUS:
+        return _sse("status", _NODE_STATUS[ev_name])
+    return None
+
+
+def _intent_sse(event: dict) -> str | None:
+    """Build an intent SSE event from the intent classifier output."""
+    if event.get("event", "") != "on_chain_end" or event.get("name", "") != "intent_classifier":
+        return None
+    output = event.get("data", {}).get("output", {})
+    intent = output.get("intent", "")
+    return _sse("intent", intent) if intent else None
+
+
+def _token_sse(event: dict) -> str | None:
+    """Build a token SSE event for answer-generator LLM chunks."""
+    if event.get("event", "") != "on_chat_model_stream":
+        return None
+    node = event.get("metadata", {}).get("langgraph_node", "")
+    if node != "answer_generator":
+        return None
+    chunk = event.get("data", {}).get("chunk")
+    if chunk and hasattr(chunk, "content") and chunk.content:
+        return _sse("token", chunk.content)
+    return None
+
+
+def _fallback_sse(event: dict) -> str | None:
+    """Build a token SSE event for fallback-handler answers."""
+    if event.get("event", "") != "on_chain_end" or event.get("name", "") != "fallback_handler":
+        return None
+    output = event.get("data", {}).get("output", {})
+    answer = output.get("answer", "")
+    return _sse("token", answer) if answer else None
+
+
+def _sources_sse(event: dict) -> str | None:
+    """Build a sources SSE event from answer-generator output."""
+    if event.get("event", "") != "on_chain_end" or event.get("name", "") != "answer_generator":
+        return None
+    output = event.get("data", {}).get("output", {})
+    sources = output.get("sources", [])
+    return _sse("sources", sources) if sources else None
+
+
+def _accumulate_usage(event: dict, usage: dict) -> None:
+    """Accumulate LLM token usage from chat model end events."""
+    if event.get("event", "") != "on_chat_model_end":
+        return
+    output = event.get("data", {}).get("output", {})
+    meta = output.usage_metadata if hasattr(output, "usage_metadata") else {}
+    if meta:
+        usage["input_tokens"] += meta.get("input_tokens", 0)
+        usage["output_tokens"] += meta.get("output_tokens", 0)
+    if not usage["model_name"]:
+        resp_meta = output.response_metadata if hasattr(output, "response_metadata") else {}
+        usage["model_name"] = resp_meta.get("model_name")
+
+
+def _event_to_sse(event: dict, usage: dict) -> str | None:
+    """Convert one LangGraph event to the current SSE payload, if any."""
+    for build in (_status_sse, _intent_sse, _token_sse, _fallback_sse, _sources_sse):
+        sse_event = build(event)
+        if sse_event:
+            return sse_event
+    _accumulate_usage(event, usage)
+    return None
 
 
 async def _stream_events(
@@ -132,9 +216,6 @@ async def _stream_events(
     - 토큰 간 타임아웃: _STREAM_TOKEN_TIMEOUT 초
     - usage: 토큰 누적용 mutable dict {"input_tokens": int, "output_tokens": int, "model_name": str | None}
     """
-    async def _next_event(ait):
-        return await ait.__anext__()
-
     ait = graph.astream_events(initial_state, config=config, version="v2").__aiter__()
     total_deadline = asyncio.get_event_loop().time() + _STREAM_TOTAL_TIMEOUT
 
@@ -153,54 +234,73 @@ async def _stream_events(
         except asyncio.TimeoutError:
             raise asyncio.TimeoutError("응답 대기 시간 초과")
 
-        ev_name = event.get("name", "")
-        ev_type = event.get("event", "")
-        data    = event.get("data", {})
+        sse_event = _event_to_sse(event, usage)
+        if sse_event:
+            yield sse_event
 
-        # 노드 진입 시 상태 메시지 전송
-        if ev_type == "on_chain_start" and ev_name in _NODE_STATUS:
-            yield _sse("status", _NODE_STATUS[ev_name])
 
-        # intent 분류 결과 전송
-        elif ev_type == "on_chain_end" and ev_name == "intent_classifier":
-            output = data.get("output", {})
-            intent = output.get("intent", "")
-            if intent:
-                yield _sse("intent", intent)
+def _initial_chatbot_state(
+    *,
+    question: str,
+    redis_messages: list,
+    has_memory_state: bool,
+) -> dict:
+    """Build the initial LangGraph state without changing public keys."""
+    return {
+        "question": question,
+        "intent": "",
+        "retrieved_docs": [],
+        "graded_docs": [],
+        "retry_count": 0,
+        "sources": [],
+        "answer": "",
+        "messages": redis_messages if not has_memory_state else [],
+    }
 
-        # LLM 토큰 단위 스트리밍 — answer_generator 노드에서 발생한 것만 통과
-        elif ev_type == "on_chat_model_stream":
-            node = event.get("metadata", {}).get("langgraph_node", "")
-            if node != "answer_generator":
-                continue
-            chunk = data.get("chunk")
-            if chunk and hasattr(chunk, "content") and chunk.content:
-                yield _sse("token", chunk.content)
 
-        # fallback 안내 메시지 전송
-        elif ev_type == "on_chain_end" and ev_name == "fallback_handler":
-            output = data.get("output", {})
-            answer = output.get("answer", "")
-            if answer:
-                yield _sse("token", answer)
+def _record_chatbot_tokens(usage: dict) -> None:
+    """Record chatbot token metrics for input, output, and total."""
+    for token_type in ("input_tokens", "output_tokens"):
+        record_agent_tokens(
+            agent="chatbot",
+            model=usage["model_name"],
+            token_type=token_type.removesuffix("_tokens"),
+            value=usage[token_type],
+        )
+    record_agent_tokens(
+        agent="chatbot",
+        model=usage["model_name"],
+        token_type="total",
+        value=usage["input_tokens"] + usage["output_tokens"],
+    )
 
-        # 참조 법령 출처 전송
-        elif ev_type == "on_chain_end" and ev_name == "answer_generator":
-            output = data.get("output", {})
-            sources = output.get("sources", [])
-            if sources:
-                yield _sse("sources", sources)
 
-        # LLM 호출 완료 시 토큰 누적
-        elif ev_type == "on_chat_model_end":
-            output = data.get("output", {})
-            meta = output.usage_metadata if hasattr(output, "usage_metadata") else {}
-            if meta:
-                usage["input_tokens"]  += meta.get("input_tokens", 0)
-                usage["output_tokens"] += meta.get("output_tokens", 0)
-            if not usage["model_name"]:
-                resp_meta = output.response_metadata if hasattr(output, "response_metadata") else {}
-                usage["model_name"] = resp_meta.get("model_name")
+def _schedule_chatbot_usage_record(user_id: int | None, usage: dict) -> None:
+    """Schedule persistent chatbot usage storage when user and usage exist."""
+    if user_id is None or (usage["input_tokens"] <= 0 and usage["output_tokens"] <= 0):
+        return
+    asyncio.create_task(
+        asyncio.to_thread(
+            insert_agent_usage_record,
+            project_id=999,
+            usage_statement_id=None,
+            agent_type_code="chatbot",
+            model_name=usage["model_name"],
+            input_tokens=usage["input_tokens"],
+            output_tokens=usage["output_tokens"],
+            requested_by_user_id=user_id,
+        )
+    )
+
+
+def _save_graph_messages(graph, config: dict, session_id: str) -> None:
+    """Persist messages from the compiled graph state into Redis."""
+    try:
+        state = graph.get_state(config)
+        messages = list((state.values or {}).get("messages") or [])
+        _save_chatbot_messages(session_id, messages)
+    except Exception as e:
+        log.warning("[chatbot_service] 그래프 상태 저장 실패: %s", e)
 
 
 async def stream_chat(
@@ -255,16 +355,11 @@ async def stream_chat(
             graph = get_compiled_graph()
             config = {"configurable": {"thread_id": session_id}}
 
-            initial_state = {
-                "question":       question,
-                "intent":         "",
-                "retrieved_docs": [],
-                "graded_docs":    [],
-                "retry_count":    0,
-                "sources":        [],
-                "answer":         "",
-                "messages":       redis_messages if not has_memory_state else [],
-            }
+            initial_state = _initial_chatbot_state(
+                question=question,
+                redis_messages=redis_messages,
+                has_memory_state=has_memory_state,
+            )
 
             try:
                 async for sse_event in _stream_events(graph, initial_state, config, usage):
@@ -280,41 +375,9 @@ async def stream_chat(
                 log.error(f"[chatbot_service] 스트리밍 오류: {e}", exc_info=True)
                 yield _sse("error", "일시적인 오류가 발생했습니다. 다시 시도해 주세요.")
 
-            try:
-                state = graph.get_state(config)
-                messages = list((state.values or {}).get("messages") or [])
-                _save_chatbot_messages(session_id, messages)
-            except Exception as e:
-                log.warning("[chatbot_service] 그래프 상태 저장 실패: %s", e)
-
-            for token_type in ("input_tokens", "output_tokens"):
-                record_agent_tokens(
-                    agent="chatbot",
-                    model=usage["model_name"],
-                    token_type=token_type.removesuffix("_tokens"),
-                    value=usage[token_type],
-                )
-            record_agent_tokens(
-                agent="chatbot",
-                model=usage["model_name"],
-                token_type="total",
-                value=usage["input_tokens"] + usage["output_tokens"],
-            )
-
-            # 토큰이 수집됐고 user_id가 있으면 agent_usage_records에 기록 (fire-and-forget)
-            if user_id is not None and (usage["input_tokens"] > 0 or usage["output_tokens"] > 0):
-                asyncio.create_task(
-                    asyncio.to_thread(
-                        insert_agent_usage_record,
-                        project_id=999,
-                        usage_statement_id=None,
-                        agent_type_code="chatbot",
-                        model_name=usage["model_name"],
-                        input_tokens=usage["input_tokens"],
-                        output_tokens=usage["output_tokens"],
-                        requested_by_user_id=user_id,
-                    )
-                )
+            _save_graph_messages(graph, config, session_id)
+            _record_chatbot_tokens(usage)
+            _schedule_chatbot_usage_record(user_id, usage)
 
             yield _DONE_SIGNAL
         except (asyncio.CancelledError, GeneratorExit):

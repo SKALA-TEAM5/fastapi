@@ -1,13 +1,14 @@
 # --------------------------------------------------------------------------
 # 작성자   : 송상민(ss19801)
 # 작성일   : 2026-05-04
+# 수정일   : 2026-06-18
 #
 # [ 주요 클래스 및 함수 정의 ]
 #
 # 1. summarize_audit_response()      : 카테고리별 감사 결과 요약 생성
-# 2. to_validator_response()         : 전체 감사 응답 DTO 변환
+# 2. _synthesize_item_reason_with_llm() : 항목별 표시 사유 LLM 재작성
 # 3. _build_sources()                : 출처 목록(법령·규정) 구성
-# 4. _build_reason()                 : 항목별 LLM 사유 텍스트 생성
+# 4. _build_reason()                 : 항목별 사유 텍스트 생성
 # 5. _derive_reasoning_summary_for_law() : 법령별 출처 요지 추출
 # --------------------------------------------------------------------------
 from __future__ import annotations
@@ -18,18 +19,13 @@ import re
 from pydantic import BaseModel, Field
 
 import src.core.llm_config as llm_config
-from src.prompts import (
-    AUDIT_REASON_SYNTHESIS_PROMPT,
-    ITEM_REASON_SYNTHESIS_PROMPT,
-)
+from src.prompts import ITEM_REASON_SYNTHESIS_PROMPT
 from src.schemas.classifier import CATEGORIES
 from src.schemas.validator import (
     AuditResponse,
     AuditSourceSummary,
     CategoryAuditSummary,
     UsageStatementAuditSummaryResponse,
-    ValidatorAuditResponse,
-    ValidatorCategoryMetrics,
 )
 
 logger = logging.getLogger(__name__)
@@ -57,57 +53,42 @@ def summarize_audit_response(
     response: AuditResponse,
     usage_statement_id: int | str | None = None,
 ) -> UsageStatementAuditSummaryResponse:
-    summaries: list[CategoryAuditSummary] = []
-    for category_name, result in response.categories.items():
-        category_code = next((code for code, name in CATEGORIES.items() if name == category_name), category_name)
-        detailed_sources = _build_sources(
+    """감사 엔진 결과를 orchestrator/frontend가 소비하는 요약 응답으로 변환한다."""
+    summaries = [
+        _build_category_summary(
             category_name=category_name,
-            category_code=category_code,
             result=result,
             base_amount=response.base_amount,
         )
-        display_sources = _compact_display_sources(detailed_sources)
-        summaries.append(
-            CategoryAuditSummary(
-                category_code=category_code,
-                status=result.status,
-                reason=_build_reason(
-                    category_name=category_name,
-                    category_code=category_code,
-                    result=result,
-                    base_amount=response.base_amount,
-                    sources=detailed_sources,
-                ),
-                sources=display_sources,
-            )
-        )
+        for category_name, result in response.categories.items()
+    ]
     return UsageStatementAuditSummaryResponse(
         usage_statement_id=usage_statement_id,
         results=summaries,
     )
 
 
-def to_validator_response(
-    *,
-    response: AuditResponse,
-    usage_statement_id: int | str | None = None,
-) -> ValidatorAuditResponse:
-    summary = summarize_audit_response(response=response, usage_statement_id=usage_statement_id)
-    metrics: dict[str, ValidatorCategoryMetrics] = {}
-    for category_name, cat_result in response.categories.items():
-        category_code = next((code for code, name in CATEGORIES.items() if name == category_name), category_name)
-        avg_confidence = sum(j.confidence for j in cat_result.items) / len(cat_result.items) if cat_result.items else 0.0
-        metrics[category_code] = ValidatorCategoryMetrics(
-            confidence=round(avg_confidence, 2),
-            total=cat_result.total,
-            limit=cat_result.limit,
-            exceeded=cat_result.exceeded,
-            needs_human_review=cat_result.needs_human_review,
-            progress_rate=cat_result.progress_rate,
-            required_usage_rate=cat_result.required_usage_rate,
-            usage_shortfall_amount=cat_result.usage_shortfall_amount,
-        )
-    return ValidatorAuditResponse(result=summary, metrics=metrics)
+def _build_category_summary(*, category_name: str, result, base_amount: float) -> CategoryAuditSummary:
+    """Build one category summary with detailed sources compacted for display."""
+    category_code = next((code for code, name in CATEGORIES.items() if name == category_name), category_name)
+    detailed_sources = _build_sources(
+        category_name=category_name,
+        category_code=category_code,
+        result=result,
+        base_amount=base_amount,
+    )
+    return CategoryAuditSummary(
+        category_code=category_code,
+        status=result.status,
+        reason=_build_reason(
+            category_name=category_name,
+            category_code=category_code,
+            result=result,
+            base_amount=base_amount,
+            sources=detailed_sources,
+        ),
+        sources=_compact_display_sources(detailed_sources),
+    )
 
 
 def _build_sources(*, category_name: str, category_code: str, result, base_amount: float) -> list[AuditSourceSummary]:
@@ -163,128 +144,8 @@ def _build_sources(*, category_name: str, category_code: str, result, base_amoun
     return sources
 
 
-class _AuditSynthesisOutput(BaseModel):
-    reason: str = Field(description="전문 감사 의견 사유 (합니다체, 3단락 이상)")
-
-
 class _ItemReasonSynthesisOutput(BaseModel):
     reason: str = Field(description="항목별 검토 사유 2~3문장")
-
-
-def _synthesize_reason_with_llm(
-    *,
-    category_name: str,
-    result,
-    base_amount: float,
-    sources: list[AuditSourceSummary],
-) -> str:
-    """
-    AUDIT_REASON_SYNTHESIS_PROMPT를 사용해 전문 감사 의견 사유를 한 번에 생성한다.
-    audit.py가 pack한 수치·원본 텍스트·법령 후보만을 사용하며
-    새로운 수치나 법령을 창작하지 않도록 프롬프트가 제한한다.
-    """
-    try:
-        llm = llm_config.get()
-    except RuntimeError as exc:
-        logger.info("[validator_reason] LLM unavailable for category synthesis: %s", exc)
-        return ""
-
-    # ── 판정 유형 코드 (조치 문장 선택 기준) ─────────────────────────────────
-    # ★ _classify_reason_code와 동일한 로직으로 산출해야 PROMPT 지침과 일치한다.
-    disallowed_items_for_code = [item.item for item in getattr(result, "items", []) if not item.allowed]
-    allowed_items_for_code = [item.item for item in getattr(result, "items", []) if item.allowed]
-    exception_texts_for_code = _collect_exception_summaries(result, allowed=None)
-    _reason_code = _classify_reason_code(
-        result=result,
-        disallowed_items=disallowed_items_for_code,
-        allowed_items=allowed_items_for_code,
-        exception_texts=exception_texts_for_code,
-    )
-
-    # ── 집행 수치 ────────────────────────────────────────────────────────────
-    metric_parts: list[str] = [
-        f"- 판정 유형 코드: {_reason_code}",
-        f"- 카테고리 집행 합계: {result.total:,.0f}원",
-    ]
-    if result.limit is not None:
-        metric_parts.append(f"- 법정 한도: {result.limit:,.0f}원")
-        if base_amount:
-            pct = result.limit / base_amount * 100
-            metric_parts.append(f"- 한도 비율: 산안비 총액의 {pct:.0f}%")
-        exceeded_amount = max(0.0, result.total - result.limit)
-        metric_parts.append(f"- 초과 여부: {'초과 ' + f'{exceeded_amount:,.0f}원' if result.exceeded else '한도 이내'}")
-    if result.progress_rate is not None:
-        metric_parts.append(f"- 공정률: {result.progress_rate:.1f}%")
-    if result.required_usage_rate is not None:
-        metric_parts.append(f"- 요구 최소 사용률: {result.required_usage_rate * 100:.0f}%")
-        # ★ 요구 최소 사용액을 명시해야 LLM이 직접 계산을 시도하지 않는다.
-        #   이 값이 없으면 LLM이 금회사용금액 × 사용률로 잘못 계산해 틀린 수치가 사유에 나온다.
-        if getattr(result, "required_used_amount", None) is not None:
-            metric_parts.append(f"- 요구 최소 사용액: {result.required_used_amount:,.0f}원")
-    if getattr(result, "cumulative_used_amount", None) is not None:
-        metric_parts.append(f"- 실제 누적 사용액: {result.cumulative_used_amount:,.0f}원")
-    if result.usage_shortfall_amount is not None and result.usage_shortfall_amount > 0:
-        metric_parts.append(f"- 공정률 기준 부족액: {result.usage_shortfall_amount:,.0f}원")
-    metric_lines = "\n".join(metric_parts)
-
-    # ── 항목별 판정 데이터 ────────────────────────────────────────────────────
-    item_parts: list[str] = []
-    for item in getattr(result, "items", []) or []:
-        verdict = "허용" if item.allowed else "불허"
-        laws = ", ".join(getattr(item, "referenced_laws", []) or []) or "(법령 미확인)"
-        reasoning_raw = " ".join((getattr(item, "reasoning", "") or "").split())[:180]
-        item_parts.append(
-            f"- {item.item} ({item.amount:,.0f}원): {verdict} | 근거조항={laws}\n"
-            f"  원본근거={reasoning_raw}"
-        )
-    item_lines = "\n".join(item_parts) or "(항목 없음)"
-
-    # ── 예외·단서 문구 ────────────────────────────────────────────────────────
-    exception_parts: list[str] = []
-    for item in getattr(result, "items", []) or []:
-        exc = " ".join((getattr(item, "exception_summary", "") or "").split())
-        if exc and exc not in exception_parts:
-            exception_parts.append(exc)
-    exception_lines = "\n".join(f"- {e}" for e in exception_parts) or "(단서 없음)"
-
-    # ── 법령 후보 ─────────────────────────────────────────────────────────────
-    law_parts: list[str] = []
-    seen_laws: set[str] = set()
-    for source in sources:
-        law = (source.law or "").strip()
-        if law and law not in seen_laws:
-            seen_laws.add(law)
-            summary = (source.summary or "").strip()
-            law_parts.append(f"- {law}: {summary}" if summary else f"- {law}")
-    for law in getattr(result, "referenced_laws", []) or []:
-        if law and law not in seen_laws:
-            seen_laws.add(law)
-            law_parts.append(f"- {law}")
-    law_candidates = "\n".join(law_parts) or "(법령 정보 없음)"
-
-    try:
-        output: _AuditSynthesisOutput = (
-            AUDIT_REASON_SYNTHESIS_PROMPT
-            | llm.with_structured_output(_AuditSynthesisOutput)
-        ).invoke(
-            {
-                "category": category_name,
-                "status": result.status,
-                "hard_reason": (result.rejection_reason or "").strip() or "(하드룰 판정 없음)",
-                "metric_lines": metric_lines,
-                "item_lines": item_lines,
-                "exception_lines": exception_lines,
-                "law_candidates": law_candidates,
-            }
-        )
-    except Exception as exc:
-        logger.warning("[validator_reason] category synthesis failed: %s", exc)
-        return ""
-
-    text = " ".join((output.reason or "").split()).strip()
-    if len(text) < 60:
-        return ""
-    return text
 
 
 def _synthesize_item_reason_with_llm(
@@ -525,20 +386,6 @@ def _build_reason(
     return _qualify_law_refs_in_reason(body)
 
 
-def _classify_reason_code(*, result, disallowed_items: list[str], allowed_items: list[str], exception_texts: list[str]) -> str:
-    if result.status == "부적절" and result.exceeded and result.limit is not None:
-        return "improper_limit_exceeded"
-    if result.status == "부적절" and result.required_usage_rate is not None and result.usage_shortfall_amount is not None:
-        return "improper_progress_shortfall"
-    if result.status == "부적절" and disallowed_items:
-        return "improper_mixed_items" if allowed_items else "improper_scope_exclusion"
-    if result.status == "부적절":
-        return "improper_scope_exclusion"
-    if result.status == "적절" and result.required_usage_rate is not None:
-        return "appropriate_progress_compliant"
-    return "appropriate_compliant"
-
-
 def _compact_display_sources(sources: list[AuditSourceSummary]) -> list[AuditSourceSummary]:
     grouped = _group_sources_by_summary(sources)
     compacted: list[AuditSourceSummary] = []
@@ -719,17 +566,6 @@ def _qualify_law_for_display(law: str) -> str:
         return cleaned
 
     return cleaned
-
-
-def _collect_exception_summaries(result, *, allowed: bool | None) -> list[str]:
-    seen: list[str] = []
-    for item in result.items:
-        if allowed is not None and item.allowed is not allowed:
-            continue
-        text = (item.exception_summary or "").strip()
-        if text and text not in seen:
-            seen.append(text)
-    return seen
 
 
 def _collect_candidate_laws(*, result) -> list[str]:

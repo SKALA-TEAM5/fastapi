@@ -1,13 +1,15 @@
 # --------------------------------------------------------------------------
 # 작성자   : 송상민(ss19801)
 # 작성일   : 2026-05-04
+# 수정일   : 2026-06-18
 #
 # [ 주요 클래스 및 함수 정의 ]
 #
 # 1. ItemRuleBundle       : 항목별 허용/불허 규칙 매칭 결과 집계
 # 2. CategoryRuleBundle   : 카테고리 전체 규칙 매칭 결과 집계
 # 3. match_category_rules() : RDB + LLM fallback 기반 규칙 매칭 수행
-# 4. _llm_item_fallback() : RDB 매칭 실패 시 LLM 기반 보조 판정
+# 4. _process_single_item() : 항목 단위 RDB/LLM 판단 경로 조립
+# 5. _llm_item_fallback() : RDB 매칭 실패 시 LLM 기반 보조 판정
 # --------------------------------------------------------------------------
 from __future__ import annotations
 
@@ -67,6 +69,8 @@ class _ItemReasonOnlyLLMOutput(BaseModel):
 
 @dataclass
 class ItemRuleBundle:
+    """RDB/LLM rule matching result for a single usage-statement item."""
+
     item: CategoryItemRow
     matches: list[ValidatorRuleMatch]
     context_text: str
@@ -78,6 +82,7 @@ class ItemRuleBundle:
 
     @property
     def top_allowed(self) -> ValidatorRuleMatch | None:
+        """Return the first allowed match in match priority order."""
         for match in self.matches:
             if match.allowed is True:
                 return match
@@ -85,6 +90,7 @@ class ItemRuleBundle:
 
     @property
     def top_disallowed(self) -> ValidatorRuleMatch | None:
+        """Return the first disallowed match in match priority order."""
         for match in self.matches:
             if match.allowed is False:
                 return match
@@ -92,11 +98,14 @@ class ItemRuleBundle:
 
     @property
     def has_exception(self) -> bool:
+        """Return whether item exception text contains an exclusion marker."""
         return any(keyword in self.item_exception_text for keyword in ("단,", "다만", "제외", "불가"))
 
 
 @dataclass
 class CategoryRuleBundle:
+    """Rule matching aggregate for one legal category block."""
+
     category_code: str
     category_name: str
     limit_pct: float | None
@@ -109,10 +118,31 @@ class CategoryRuleBundle:
     token_usage: int = 0        # 카테고리 내 전체 항목의 LLM 토큰 합계
 
 
+@dataclass
+class _ItemProcessingContext:
+    """Intermediate text context used while processing one item."""
+
+    docs: list
+    context_text: str
+    item_exception_text: str
+    item_text_with_remark: str
+
+
+@dataclass
+class _ItemProcessingResult:
+    """Intermediate processing result before building ``ItemRuleBundle``."""
+
+    matches: list[ValidatorRuleMatch]
+    judgment_tier: str
+    reason_text: str
+    qdrant_citations: list[dict]
+
+
 _AUTHORITATIVE_SOURCES = {"law_rule", "qa_rule"}  # [9] DB 기반 근거
 
 
 def _is_profile_decision_match(match: ValidatorRuleMatch, *, allowed: bool | None = None) -> bool:
+    """Return whether a corpus fallback match came from a profile decision."""
     if match.match_source != "corpus_fallback":
         return False
     if match.rule_type not in {"profile_allowed", "profile_disallowed"}:
@@ -170,6 +200,7 @@ def _has_strong_allowed_match(matches: list[ValidatorRuleMatch], category_code: 
 
 
 def _profile_allowed_outweighs_disallowed(matches: list[ValidatorRuleMatch], category_code: str) -> bool:
+    """Return whether a profile-allowed rule is stronger than a disallowed rule."""
     allowed = next(
         (
             m for m in matches
@@ -285,6 +316,7 @@ def _select_exception_context(context_text: str, limit: int = 1500) -> str:
 
 
 def _message_content_text(response) -> str:
+    """Extract plain text content from a LangChain response-like object."""
     content = getattr(response, "content", response)
     if isinstance(content, list):
         parts: list[str] = []
@@ -298,6 +330,7 @@ def _message_content_text(response) -> str:
 
 
 def _json_object_from_text(text: str) -> dict:
+    """Parse a JSON object from raw LLM text or a fenced code block."""
     raw = (text or "").strip()
     if raw.startswith("```"):
         raw = re.sub(r"^```(?:json)?\s*", "", raw)
@@ -316,11 +349,13 @@ def _json_object_from_text(text: str) -> dict:
 
 
 def _reason_text_from_plain_llm_response(response) -> str:
+    """Extract ``reason_text`` from a non-structured LLM response."""
     data = _json_object_from_text(_message_content_text(response))
     return str(data.get("reason_text") or "").strip()
 
 
 def _item_judgment_from_plain_llm_response(response) -> _ItemJudgmentLLMOutput | None:
+    """Parse item judgment output from a non-structured LLM response."""
     data = _json_object_from_text(_message_content_text(response))
     if not data:
         return None
@@ -339,6 +374,7 @@ def _fallback_reason_text(
     referenced_laws: list[str],
     law_context: str,
 ) -> str:
+    """Build deterministic reason text when LLM reason generation fails."""
     verdict = "허용" if allowed else "불허"
     laws_str = ", ".join(referenced_laws[:3]) if referenced_laws else "관련 법령"
     evidence = " ".join((rdb_evidence or law_context or "").split())
@@ -491,6 +527,7 @@ def _llm_item_fallback(
 
 
 def _qdrant_citations_from_docs(*, docs, referenced_laws: list[str], judgment_source: str) -> list[dict]:
+    """Build a compact Qdrant citation from the first usable retrieved document."""
     for doc in docs or []:
         original_text = _clean_qdrant_original_text(str(getattr(doc, "page_content", "") or ""))
         if not original_text:
@@ -512,6 +549,7 @@ def _qdrant_citations_from_docs(*, docs, referenced_laws: list[str], judgment_so
 
 
 def _clean_qdrant_original_text(value: str) -> str:
+    """Remove internal markers and normalize retrieved Qdrant source text."""
     text = _LEGAL_CITE_RE.sub("", value or "")
     cleaned_lines: list[str] = []
     for raw_line in text.replace("\r\n", "\n").replace("\r", "\n").splitlines():
@@ -527,6 +565,7 @@ def _clean_qdrant_original_text(value: str) -> str:
 
 
 def _primary_qdrant_legal_basis(*, referenced_laws: list[str], metadata: dict, source: str) -> str:
+    """Choose the most specific legal basis label for a Qdrant citation."""
     for law in referenced_laws or []:
         text = str(law or "").strip()
         if text:
@@ -536,6 +575,177 @@ def _primary_qdrant_legal_basis(*, referenced_laws: list[str], metadata: dict, s
         if text:
             return text
     return source
+
+
+def _build_item_processing_context(
+    *,
+    item: "CategoryItemRow",
+    retrieved: "CategoryRetrievedContext",
+) -> _ItemProcessingContext:
+    """Build Qdrant text context and item display text for one validator row."""
+    docs = retrieved.item_docs.get(item.item_name) or []
+    context_parts = [doc.page_content for doc in (docs or retrieved.category_docs)]
+    raw_context = "\n\n---\n\n".join(context_parts)
+    context_text = _LEGAL_CITE_RE.sub("", raw_context)
+    item_exception_text = _LEGAL_CITE_RE.sub(
+        "",
+        "\n\n---\n\n".join(
+            doc.page_content for doc in docs
+            if any(keyword in (doc.page_content or "") for keyword in ("단,", "다만", "제외", "불가"))
+        ),
+    )
+    item_text_with_remark = (
+        f"{item.item_name} ({item.remark})" if item.remark else item.item_name
+    )
+    return _ItemProcessingContext(
+        docs=docs,
+        context_text=context_text,
+        item_exception_text=item_exception_text,
+        item_text_with_remark=item_text_with_remark,
+    )
+
+
+def _citation_docs(
+    *,
+    item_context: _ItemProcessingContext,
+    retrieved: "CategoryRetrievedContext",
+):
+    """Return item-specific docs first, then category docs as citation fallback."""
+    return item_context.docs or retrieved.category_docs
+
+
+def _best_profile_allowed_match(
+    *,
+    matches: list[ValidatorRuleMatch],
+    category_code: str,
+) -> ValidatorRuleMatch | None:
+    """Select the profile-allowed match that outweighed a disallowed rule."""
+    return next(
+        (
+            m for m in matches
+            if m.allowed is True
+            and _is_profile_decision_match(m, allowed=True)
+            and m.category_code == category_code
+        ),
+        None,
+    )
+
+
+def _best_authoritative_match(
+    *,
+    matches: list[ValidatorRuleMatch],
+    allowed: bool,
+) -> ValidatorRuleMatch | None:
+    """Select the first authoritative/profile match for the requested direction."""
+    return next(
+        (
+            m for m in matches
+            if m.allowed is allowed
+            and (m.match_source in _AUTHORITATIVE_SOURCES or _is_profile_decision_match(m, allowed=allowed))
+        ),
+        None,
+    )
+
+
+def _rdb_item_result(
+    *,
+    matches: list[ValidatorRuleMatch],
+    item_context: _ItemProcessingContext,
+    retrieved: "CategoryRetrievedContext",
+    category_name: str,
+    allowed: bool,
+    best: ValidatorRuleMatch | None,
+) -> _ItemProcessingResult:
+    """Build an RDB-tier item result and generate display reason only."""
+    citations = _qdrant_citations_from_docs(
+        docs=_citation_docs(item_context=item_context, retrieved=retrieved),
+        referenced_laws=best.referenced_laws if best else [],
+        judgment_source="qdrant_support",
+    )
+    reason_text = _llm_generate_reason_only(
+        item_text=item_context.item_text_with_remark,
+        category_name=category_name,
+        allowed=allowed,
+        rdb_evidence=best.evidence if best else "",
+        referenced_laws=best.referenced_laws if best else [],
+        retrieved_context=item_context.context_text,
+    )
+    return _ItemProcessingResult(
+        matches=matches,
+        judgment_tier="rdb",
+        reason_text=reason_text,
+        qdrant_citations=citations,
+    )
+
+
+def _llm_conflict_item_result(
+    *,
+    matches: list[ValidatorRuleMatch],
+    item_context: _ItemProcessingContext,
+    retrieved: "CategoryRetrievedContext",
+    category_name: str,
+    category_code: str,
+) -> _ItemProcessingResult:
+    """Resolve qa_allowed/qa_disallowed conflict through the item LLM fallback."""
+    conflict_context = _build_conflict_context(
+        matches=matches,
+        category_code=category_code,
+        retrieved_context=item_context.context_text,
+    )
+    llm_match, reason_text = _llm_item_fallback(
+        item_text=item_context.item_text_with_remark,
+        category_name=category_name,
+        category_code=category_code,
+        retrieved_context=conflict_context,
+    )
+    qdrant_citations: list[dict] = []
+    if llm_match is not None:
+        qdrant_citations = _qdrant_citations_from_docs(
+            docs=_citation_docs(item_context=item_context, retrieved=retrieved),
+            referenced_laws=llm_match.referenced_laws,
+            judgment_source="llm_fallback",
+        )
+        matches = [llm_match] + matches
+    return _ItemProcessingResult(
+        matches=matches,
+        judgment_tier="llm",
+        reason_text=reason_text,
+        qdrant_citations=qdrant_citations,
+    )
+
+
+def _llm_fallback_item_result(
+    *,
+    matches: list[ValidatorRuleMatch],
+    item_context: _ItemProcessingContext,
+    retrieved: "CategoryRetrievedContext",
+    category_name: str,
+    category_code: str,
+) -> _ItemProcessingResult:
+    """Use LLM judgment when RDB evidence is absent or too weak."""
+    llm_match, reason_text = _llm_item_fallback(
+        item_text=item_context.item_text_with_remark,
+        category_name=category_name,
+        category_code=category_code,
+        retrieved_context=item_context.context_text,
+    )
+    qdrant_citations: list[dict] = []
+    if llm_match is not None:
+        qdrant_citations = _qdrant_citations_from_docs(
+            docs=_citation_docs(item_context=item_context, retrieved=retrieved),
+            referenced_laws=llm_match.referenced_laws,
+            judgment_source="llm_fallback",
+        )
+        if _has_rdb_match(matches, category_code):
+            matches = matches + [llm_match]
+        else:
+            matches = [llm_match] + matches
+    return _ItemProcessingResult(
+        matches=matches,
+        judgment_tier="llm",
+        reason_text=reason_text,
+        qdrant_citations=qdrant_citations,
+    )
 
 
 def _process_single_item(
@@ -549,28 +759,11 @@ def _process_single_item(
     단일 항목에 대해 컨텍스트 구성 → RDB 매칭 → LLM fallback 을 수행한다.
     ThreadPoolExecutor에서 병렬 호출된다.
     """
-    docs = retrieved.item_docs.get(item.item_name) or []
-    context_parts = [doc.page_content for doc in (docs or retrieved.category_docs)]
-    raw_context = "\n\n---\n\n".join(context_parts)
-    # [LEGAL_CITE: ...] 내부 마커 제거 — LLM 입력 및 evidence_snippets 오염 방지
-    context_text = _LEGAL_CITE_RE.sub("", raw_context)
-    item_exception_text = _LEGAL_CITE_RE.sub(
-        "",
-        "\n\n---\n\n".join(
-            doc.page_content for doc in docs
-            if any(keyword in (doc.page_content or "") for keyword in ("단,", "다만", "제외", "불가"))
-        ),
-    )
-    # 비고(remark)가 있으면 항목명에 붙여서 LLM 판단 정확도 향상
-    # 예: "안전표지판 설치 (현장 진입로 표지판)" → LLM이 용도를 명확히 파악
-    item_text_with_remark = (
-        f"{item.item_name} ({item.remark})" if item.remark else item.item_name
-    )
-
+    item_context = _build_item_processing_context(item=item, retrieved=retrieved)
     matches = rules_repo.find_validator_matches(
         category=block.category_name,
         item_text=item.item_name,
-        retrieved_context=context_text,
+        retrieved_context=item_context.context_text,
         limit=8,
     )
 
@@ -580,132 +773,65 @@ def _process_single_item(
     #    1-b. 충돌 없음 → 판단은 RDB, 사유만 LLM 생성
     # 2. 강한 허용 RDB → LLM 판단 스킵, 사유만 LLM 생성
     # 3. 애매함 → LLM이 판단 + 사유 동시 생성
-    reason_text = ""
-    qdrant_citations: list[dict] = []
-
     if _profile_allowed_outweighs_disallowed(matches, block.category_code):
-        judgment_tier = "rdb"
-        best = next(
-            (
-                m for m in matches
-                if m.allowed is True
-                and _is_profile_decision_match(m, allowed=True)
-                and m.category_code == block.category_code
-            ),
-            None,
+        best = _best_profile_allowed_match(
+            matches=matches,
+            category_code=block.category_code,
         )
-        qdrant_citations = _qdrant_citations_from_docs(
-            docs=(docs or retrieved.category_docs),
-            referenced_laws=best.referenced_laws if best else [],
-            judgment_source="qdrant_support",
-        )
-        reason_text = _llm_generate_reason_only(
-            item_text=item_text_with_remark,
+        result = _rdb_item_result(
+            matches=matches,
+            item_context=item_context,
+            retrieved=retrieved,
             category_name=block.category_name,
             allowed=True,
-            rdb_evidence=best.evidence if best else "",
-            referenced_laws=best.referenced_laws if best else [],
-            retrieved_context=context_text,
+            best=best,
         )
     elif _has_rdb_disallowed_match(matches, block.category_code):
         if _has_qa_conflict(matches, block.category_code):
-            # qa_allowed/qa_disallowed 충돌 → LLM이 아이템 문맥으로 조건 판단
-            # 양쪽 evidence를 context로 제공해 LLM이 어느 케이스에 해당하는지 판단
-            conflict_context = _build_conflict_context(
+            result = _llm_conflict_item_result(
                 matches=matches,
-                category_code=block.category_code,
-                retrieved_context=context_text,
-            )
-            llm_match, reason_text = _llm_item_fallback(
-                item_text=item_text_with_remark,
+                item_context=item_context,
+                retrieved=retrieved,
                 category_name=block.category_name,
                 category_code=block.category_code,
-                retrieved_context=conflict_context,
             )
-            if llm_match is not None:
-                qdrant_citations = _qdrant_citations_from_docs(
-                    docs=(docs or retrieved.category_docs),
-                    referenced_laws=llm_match.referenced_laws,
-                    judgment_source="llm_fallback",
-                )
-                matches = [llm_match] + matches
-            judgment_tier = "llm"
         else:
-            # 충돌 없는 불허 → 판단은 RDB, 사유만 LLM
-            judgment_tier = "rdb"
-            best = next(
-                (
-                    m for m in matches
-                    if m.allowed is False
-                    and (m.match_source in _AUTHORITATIVE_SOURCES or _is_profile_decision_match(m, allowed=False))
-                ),
-                None,
-            )
-            qdrant_citations = _qdrant_citations_from_docs(
-                docs=(docs or retrieved.category_docs),
-                referenced_laws=best.referenced_laws if best else [],
-                judgment_source="qdrant_support",
-            )
-            reason_text = _llm_generate_reason_only(
-                item_text=item_text_with_remark,
+            best = _best_authoritative_match(matches=matches, allowed=False)
+            result = _rdb_item_result(
+                matches=matches,
+                item_context=item_context,
+                retrieved=retrieved,
                 category_name=block.category_name,
                 allowed=False,
-                rdb_evidence=best.evidence if best else "",
-                referenced_laws=best.referenced_laws if best else [],
-                retrieved_context=context_text,
+                best=best,
             )
     elif _has_strong_allowed_match(matches, block.category_code):
-        # 강한 허용 → 판단은 RDB, 사유만 LLM
-        judgment_tier = "rdb"
-        best = next(
-            (
-                m for m in matches
-                if m.allowed is True
-                and (m.match_source in _AUTHORITATIVE_SOURCES or _is_profile_decision_match(m, allowed=True))
-            ),
-            None,
-        )
-        qdrant_citations = _qdrant_citations_from_docs(
-            docs=(docs or retrieved.category_docs),
-            referenced_laws=best.referenced_laws if best else [],
-            judgment_source="qdrant_support",
-        )
-        reason_text = _llm_generate_reason_only(
-            item_text=item_text_with_remark,
+        best = _best_authoritative_match(matches=matches, allowed=True)
+        result = _rdb_item_result(
+            matches=matches,
+            item_context=item_context,
+            retrieved=retrieved,
             category_name=block.category_name,
             allowed=True,
-            rdb_evidence=best.evidence if best else "",
-            referenced_laws=best.referenced_laws if best else [],
-            retrieved_context=context_text,
+            best=best,
         )
     else:
-        # 애매함 → LLM 판단 + 사유 동시
-        llm_match, reason_text = _llm_item_fallback(
-            item_text=item_text_with_remark,
+        result = _llm_fallback_item_result(
+            matches=matches,
+            item_context=item_context,
+            retrieved=retrieved,
             category_name=block.category_name,
             category_code=block.category_code,
-            retrieved_context=context_text,
         )
-        if llm_match is not None:
-            qdrant_citations = _qdrant_citations_from_docs(
-                docs=(docs or retrieved.category_docs),
-                referenced_laws=llm_match.referenced_laws,
-                judgment_source="llm_fallback",
-            )
-            if _has_rdb_match(matches, block.category_code):
-                matches = matches + [llm_match]
-            else:
-                matches = [llm_match] + matches
-        judgment_tier = "llm"
 
     return ItemRuleBundle(
         item=item,
-        matches=matches,
-        context_text=context_text,
-        item_exception_text=item_exception_text,
-        judgment_tier=judgment_tier,
-        reason_text=reason_text,
-        qdrant_citations=qdrant_citations,
+        matches=result.matches,
+        context_text=item_context.context_text,
+        item_exception_text=item_context.item_exception_text,
+        judgment_tier=result.judgment_tier,
+        reason_text=result.reason_text,
+        qdrant_citations=result.qdrant_citations,
     )
 
 
@@ -715,6 +841,7 @@ def match_category_rules(
     retrieved: CategoryRetrievedContext,
     repo: LegalRulesRepository | None = None,
 ) -> CategoryRuleBundle:
+    """Match legal rules for every item in a category, collecting LLM token usage."""
     rules_repo = repo or LegalRulesRepository()
     limit_pct, limit_rule, limit_laws = rules_repo.find_category_limit(block.category_name)
     progress_required_rate, progress_rule_text, progress_laws = rules_repo.find_progress_requirement(block.progress_rate)

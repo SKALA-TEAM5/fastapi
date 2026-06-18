@@ -1,6 +1,7 @@
 # --------------------------------------------------------------------------
 # 작성자   : 송상민(ss19801)
 # 작성일   : 2026-05-04
+# 수정일   : 2026-06-18
 #
 # [ 주요 클래스 및 함수 정의 ]
 #
@@ -18,6 +19,8 @@ from src.agents.validator_agent.rule_matcher import CategoryRuleBundle
 
 @dataclass
 class CategoryComputation:
+    """Computed category-level legal metrics used by audit decisions."""
+
     total: float
     limit_checked_total: float
     limit_pct: float | None
@@ -31,6 +34,7 @@ class CategoryComputation:
 
     @property
     def has_progress_shortfall(self) -> bool:
+        """Return whether cumulative usage is below the progress-based minimum."""
         return bool(self.usage_shortfall_amount and self.usage_shortfall_amount > 0)
 
 
@@ -40,6 +44,7 @@ def calculate_category_metrics(
     rule_bundle: CategoryRuleBundle,
     total_cumulative_used_amount: float | None = None,
 ) -> CategoryComputation:
+    """Calculate amount limits and progress shortfall for one category block."""
     total = sum(item.amount for item in block.items)
     limit_pct = rule_bundle.limit_pct
     limit_checked_total = total
@@ -79,6 +84,7 @@ def calculate_category_metrics(
 
 
 def _to_float(value) -> float | None:
+    """Coerce numeric-ish values into float, returning ``None`` on failure."""
     if value is None:
         return None
     try:
