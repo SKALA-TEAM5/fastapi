@@ -1,3 +1,12 @@
+# --------------------------------------------------------------------------
+# 작성자   : 차현주
+# 작성일   : 2026-06-18
+# 수정일   : 2026-06-18
+#
+# [ 주요 클래스 정의 ]
+#
+# 1. ReportAgent : ReportContext에서 ReportDraft JSON 초안 생성
+# --------------------------------------------------------------------------
 from __future__ import annotations
 
 """ReportContext에서 ReportDraft JSON을 생성합니다.
@@ -8,7 +17,6 @@ from __future__ import annotations
 """
 
 import json
-import re
 from collections import Counter
 from decimal import Decimal
 from pathlib import Path
@@ -27,13 +35,12 @@ from .schemas import (
     ReportContext,
     ReportDraft,
     ReportSectionDraft,
-    ReportTableDraft,
 )
+from .template_renderer import ReportTemplateRenderer
 
 
 LLMClient = Callable[[str, dict], dict]
 REPORT_TEMPLATE_PATH = Path(__file__).parent / "templates" / "report_template.json"
-TEMPLATE_TOKEN_PATTERN = re.compile(r"{{\s*([^}]+?)\s*}}")
 MIN_LLM_OVERALL_OPINION_CHARS = 350
 
 
@@ -73,6 +80,7 @@ class ReportAgent:
     """필수 LLM 문장 보강을 포함한 보고서 초안 생성기입니다."""
 
     def __init__(self, llm_client: LLMClient | None = None, *, use_default_llm: bool = True) -> None:
+        """Initialize this object."""
         self.llm_client = llm_client
         if self.llm_client is None:
             if not use_default_llm:
@@ -180,6 +188,7 @@ class ReportAgent:
         return draft.model_copy(update={"report_sections": self._build_report_sections(draft)})
 
     def _build_item_review(self, no: int, item) -> ItemReviewDraft:
+        """Build build item review."""
         worst_result = "ok"
         reasons: list[str] = []
         issue_reasons: list[str] = []
@@ -243,12 +252,14 @@ class ReportAgent:
         )
 
     def _validation_log_decision(self, result_code: str | None) -> DecisionCode | None:
+        """Return validation log decision."""
         normalized = str(result_code or "").strip().lower()
         if not normalized:
             return None
         return RESULT_TO_DECISION.get(normalized)
 
     def _build_issues(self, item_reviews: list[ItemReviewDraft], context: ReportContext) -> list[IssueDetailDraft]:
+        """Build build issues."""
         items_by_id = {item.id: item for item in context.items}
         issues: list[IssueDetailDraft] = []
         for review in item_reviews:
@@ -318,12 +329,14 @@ class ReportAgent:
         ]
 
     def _build_conclusion(self, issues: list[IssueDetailDraft]) -> str:
+        """Build build conclusion."""
         if not issues:
             return "제출된 사용내역서와 증빙자료 검토 결과, 중대한 부적정 또는 보완 필요 사항은 확인되지 않았습니다."
         first = issues[0]
         return f"{first.title} 건에서 {first.problem or first.agent_conclusion} 사항이 확인되어 보완 또는 정정 처리가 필요합니다."
 
     def _build_overall_opinion(self, *, context: ReportContext, current_total: Decimal, item_count: int, issue_count: int) -> str:
+        """Build build overall opinion."""
         return (
             f"이번 검토 대상 기간({context.report_period_label}) 산업안전보건관리비 집행 내역 "
             f"{item_count}건, {self._money(current_total)}에 대한 증빙 검토를 완료했습니다. "
@@ -359,138 +372,15 @@ class ReportAgent:
     def _build_report_sections(self, draft: ReportDraft) -> list[ReportSectionDraft]:
         """구조 기반 JSON 템플릿을 ReportDraft 값으로 채워 report_sections를 만듭니다."""
 
-        template = self._load_report_template()
-        data = draft.model_dump(mode="python")
-        data["department_full_label"] = self._department_full_label(draft)
-
-        sections: list[ReportSectionDraft] = []
-        for section_template in template.get("sections", []):
-            section_context = {"draft": data}
-            tables: list[ReportTableDraft] = []
-            for table_template in section_template.get("tables", []):
-                tables.extend(self._render_table_templates(table_template, section_context))
-            sections.append(
-                ReportSectionDraft(
-                    section_id=str(section_template["section_id"]),
-                    title=self._render_template_text(str(section_template["title"]), section_context),
-                    kind=section_template["kind"],
-                    paragraphs=[
-                        self._render_template_text(str(paragraph), section_context)
-                        for paragraph in section_template.get("paragraphs", [])
-                    ],
-                    tables=tables,
-                )
-            )
-        return sections
-
-    def _load_report_template(self) -> dict[str, Any]:
-        return json.loads(REPORT_TEMPLATE_PATH.read_text(encoding="utf-8"))
-
-    def _render_table_templates(self, table_template: dict[str, Any], context: dict[str, Any]) -> list[ReportTableDraft]:
-        repeat_for = table_template.get("repeat_for")
-        repeat_mode = table_template.get("repeat_mode", "rows")
-        if repeat_for and repeat_mode == "tables":
-            items = self._get_template_value(context, f"draft.{repeat_for}")
-            if not isinstance(items, list) or not items:
-                return [
-                    ReportTableDraft(
-                        title=self._render_template_text(str(table_template.get("empty_title", table_template.get("title", "-"))), context),
-                        headers=[str(header) for header in table_template.get("headers", [])],
-                        rows=[
-                            [self._render_template_text(str(cell), context) for cell in row]
-                            for row in table_template.get("empty_rows", [["-"]])
-                        ],
-                    )
-                ]
-            rendered_tables: list[ReportTableDraft] = []
-            for index, item in enumerate(items, start=1):
-                item_context = {**context, "item": self._augment_repeat_item(str(repeat_for), item, index), "index": index}
-                rendered_tables.append(
-                    ReportTableDraft(
-                        title=self._render_template_text(str(table_template.get("title", "")), item_context) or None,
-                        headers=[str(header) for header in table_template.get("headers", [])],
-                        rows=[
-                            [self._render_template_text(str(cell), item_context) for cell in row]
-                            for row in table_template.get("rows", [])
-                        ],
-                    )
-                )
-            return rendered_tables
-
-        rows = [
-            [self._render_template_text(str(cell), context) for cell in row]
-            for row in table_template.get("rows", [])
-        ]
-        if repeat_for:
-            items = self._get_template_value(context, f"draft.{repeat_for}")
-            if isinstance(items, list) and items:
-                for index, item in enumerate(items, start=1):
-                    item_context = {**context, "item": self._augment_repeat_item(str(repeat_for), item, index), "index": index}
-                    rows.append(
-                        [
-                            self._render_template_text(str(cell), item_context)
-                            for cell in table_template.get("row_template", [])
-                        ]
-                    )
-            else:
-                rows.append([str(cell) for cell in table_template.get("empty_row", ["-"])])
-
-        return [
-            ReportTableDraft(
-                title=self._render_template_text(str(table_template.get("title", "")), context) or None,
-                headers=[str(header) for header in table_template.get("headers", [])],
-                rows=rows,
-            )
-        ]
-
-    def _augment_repeat_item(self, repeat_for: str, item: object, index: int) -> dict[str, Any]:
-        item_data = item if isinstance(item, dict) else {"value": item}
-        augmented = {**item_data, "index": index}
-        if repeat_for == "issue_details":
-            issue_type = str(item_data.get("issue_type", ""))
-            augmented["issue_label"] = "부적정" if issue_type == "inappropriate" else "검토 필요"
-            augmented["problem_label"] = "확인된 문제" if issue_type == "needs_review" else "집행 경위"
-            augmented["decision_label"] = "부적정" if issue_type == "inappropriate" else "검토필요"
-            augmented["problem_text"] = item_data.get("problem") or item_data.get("agent_conclusion") or "-"
-            augmented["action_text"] = item_data.get("required_action") or item_data.get("agent_conclusion") or "-"
-        return augmented
-
-    def _render_template_text(self, template_text: str, context: dict[str, Any]) -> str:
-        def replace(match) -> str:
-            expression = match.group(1)
-            path, *filters = [part.strip() for part in expression.split("|")]
-            value = self._get_template_value(context, path)
-            for filter_name in filters:
-                value = self._apply_template_filter(value, filter_name)
-            return "-" if value in (None, "") else str(value)
-
-        return TEMPLATE_TOKEN_PATTERN.sub(replace, template_text)
-
-    def _get_template_value(self, context: dict[str, Any], path: str) -> Any:
-        value: Any = context
-        for part in path.split("."):
-            if isinstance(value, dict):
-                value = value.get(part)
-            else:
-                value = getattr(value, part, None)
-            if value is None:
-                return None
-        return value
-
-    def _apply_template_filter(self, value: Any, filter_name: str) -> Any:
-        if filter_name == "money":
-            try:
-                return self._money(Decimal(str(value)))
-            except Exception:
-                return value
-        if filter_name == "count":
-            try:
-                return self._count(int(value))
-            except Exception:
-                return value
-        return value
+        return ReportTemplateRenderer(
+            template_path=REPORT_TEMPLATE_PATH,
+            money_formatter=self._money,
+            count_formatter=self._count,
+            department_label_formatter=self._department_full_label,
+        ).build_report_sections(draft)
 
     def _merge_llm_issues(self, draft: ReportDraft, payload: object):
+        """Merge merge llm issues."""
         if not isinstance(payload, list):
             return draft.issue_details
 
@@ -515,6 +405,7 @@ class ReportAgent:
         return [updates.get(issue.no, issue) for issue in draft.issue_details]
 
     def _find_missing_critical_inputs(self, context: ReportContext) -> list[str]:
+        """Find find missing critical inputs."""
         missing: list[str] = []
         if not context.items:
             missing.append("사용내역서 상세항목이 없습니다.")
@@ -525,6 +416,7 @@ class ReportAgent:
         return missing
 
     def _category_note(self, category_code: str, item_reviews: list[ItemReviewDraft]) -> str:
+        """Return category note."""
         related = [review for review in item_reviews if review.category_code == category_code]
         bad = [review for review in related if review.decision == "inappropriate"]
         review = [review for review in related if review.decision == "needs_review"]
@@ -535,6 +427,7 @@ class ReportAgent:
         return "적정"
 
     def _first_detail_value(self, logs, keys: list[str]) -> str | None:
+        """Return the first first detail value."""
         for log in logs:
             for key in keys:
                 value = log.details.get(key)
@@ -543,6 +436,7 @@ class ReportAgent:
         return None
 
     def _issue_problem(self, item, fallback: str) -> str:
+        """Return whether issue problem."""
         if item.legal_validation_result and item.legal_validation_result.reason:
             return item.legal_validation_result.reason
         if item.classification_result and item.classification_result.reason:
@@ -550,6 +444,7 @@ class ReportAgent:
         return self._first_detail_value(item.validation_logs, ["problem", "error", "reason", "사유"]) or fallback
 
     def _build_legal_citations(self, item) -> list[LegalCitationDraft]:
+        """Build build legal citations."""
         if item.legal_validation_result and item.legal_validation_result.citations:
             return [
                 LegalCitationDraft(
@@ -585,6 +480,7 @@ class ReportAgent:
         return citations
 
     def _legal_basis_label(self, citations: list[LegalCitationDraft]) -> str | None:
+        """Return legal basis label."""
         if not citations:
             return None
         bases = []
@@ -594,15 +490,19 @@ class ReportAgent:
         return ", ".join(bases)
 
     def _date_label(self, value) -> str:
+        """Return date label."""
         return value.strftime("%Y년 %m월 %d일")
 
     def _money(self, value: Decimal) -> str:
+        """Return money."""
         return f"{value:,.0f}원"
 
     def _count(self, value: int) -> str:
+        """Return count."""
         return "-" if value == 0 else f"{value}건"
 
     def _department_full_label(self, draft: ReportDraft) -> str:
+        """Return department full label."""
         company = draft.basic_info.get("시공사", "").strip()
         department = draft.department_label.strip()
         if company and department and company not in department:
@@ -610,6 +510,7 @@ class ReportAgent:
         return department or company or "-"
 
     def _evidence_type_name(self, code: str) -> str:
+        """Return evidence type name."""
         if code.startswith("other:"):
             detail = code.split(":", 1)[1]
             return f"기타 서류({detail})" if detail else "기타 서류(세부명 미확인)"
@@ -635,10 +536,12 @@ class ReportAgent:
         return f"other:{detail or '세부명 미확인'}"
 
     def _is_evidence_validation_log(self, log) -> bool:
+        """Return whether is evidence validation log."""
         validation_type = str(log.validation_type_code).lower()
         return any(keyword in validation_type for keyword in ["evidence", "ocr", "vision", "receipt", "tax"])
 
     def _evidence_detail_from_log(self, log) -> str:
+        """Return evidence detail from log."""
         for key in [
             "evidence_detail_name",
             "document_name",
@@ -653,6 +556,7 @@ class ReportAgent:
         return ""
 
     def _other_document_detail_from_filename(self, filename: str) -> str:
+        """Return other document detail from filename."""
         stem = Path(filename).stem.strip()
         if not stem:
             return ""
@@ -675,6 +579,7 @@ class ReportAgent:
         return normalized
 
     def _evidence_sort_key(self, code: str) -> tuple[int, str]:
+        """Return evidence sort key."""
         order = {
             "usage_statement": 0,
             "receipt": 1,

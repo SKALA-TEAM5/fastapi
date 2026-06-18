@@ -1,6 +1,7 @@
 # --------------------------------------------------------------------------
 # 작성자   : 송상민(ss19801)
 # 작성일   : 2026-06-04
+# 수정일   : 2026-06-18
 #
 # [ 주요 엔드포인트 정의 ]
 #
@@ -47,6 +48,7 @@ router = APIRouter(prefix="/chat", tags=["챗봇"])
     response_description="SSE 스트리밍 응답 (text/event-stream)",
 )
 async def chat(req: ChatRequest) -> StreamingResponse:
+    """Stream chatbot responses through the stable SSE contract."""
     return StreamingResponse(
         stream_chat(question=req.question, session_id=req.session_id, user_id=req.user_id),
         media_type="text/event-stream",

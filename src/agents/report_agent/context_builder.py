@@ -1,3 +1,13 @@
+# --------------------------------------------------------------------------
+# 작성자   : 차현주
+# 작성일   : 2026-06-18
+# 수정일   : 2026-06-18
+#
+# [ 주요 함수 정의 ]
+#
+# 1. build_report_context() : 저장소 row를 ReportContext로 정규화
+# 2. decimal_ratio()        : Decimal 비율 계산
+# --------------------------------------------------------------------------
 from __future__ import annotations
 
 """저장소 row에서 ReportContext를 조립합니다.
@@ -28,15 +38,41 @@ from .schemas import (
 class ReportRepository(Protocol):
     """FastAPI 또는 작업자가 구현해야 하는 DB 접근 경계입니다."""
 
-    def get_project(self, project_id: int) -> dict: ...
-    def get_usage_statement(self, usage_statement_id: int) -> dict: ...
-    def list_usage_categories(self) -> list[dict]: ...
-    def list_usage_statement_summaries(self, usage_statement_id: int) -> list[dict]: ...
-    def list_usage_statement_items(self, usage_statement_id: int) -> list[dict]: ...
-    def list_evidence_files_by_item(self, usage_statement_id: int) -> dict[int, list[dict]]: ...
-    def list_evidence_requirements_by_item(self, usage_statement_id: int) -> dict[int, list[dict]]: ...
-    def list_validation_logs_by_item(self, usage_statement_id: int) -> dict[int, list[dict]]: ...
-    def list_action_requests(self, project_id: int, usage_statement_id: int) -> list[dict]: ...
+    def get_project(self, project_id: int) -> dict:
+        """Return one project row."""
+        ...
+
+    def get_usage_statement(self, usage_statement_id: int) -> dict:
+        """Return one usage-statement row."""
+        ...
+
+    def list_usage_categories(self) -> list[dict]:
+        """Return all usage category rows."""
+        ...
+
+    def list_usage_statement_summaries(self, usage_statement_id: int) -> list[dict]:
+        """Return category summary rows for a usage statement."""
+        ...
+
+    def list_usage_statement_items(self, usage_statement_id: int) -> list[dict]:
+        """Return item rows for a usage statement."""
+        ...
+
+    def list_evidence_files_by_item(self, usage_statement_id: int) -> dict[int, list[dict]]:
+        """Return evidence-file rows grouped by item id."""
+        ...
+
+    def list_evidence_requirements_by_item(self, usage_statement_id: int) -> dict[int, list[dict]]:
+        """Return evidence-requirement rows grouped by item id."""
+        ...
+
+    def list_validation_logs_by_item(self, usage_statement_id: int) -> dict[int, list[dict]]:
+        """Return validation-log rows grouped by item id."""
+        ...
+
+    def list_action_requests(self, project_id: int, usage_statement_id: int) -> list[dict]:
+        """Return action request rows for the report scope."""
+        ...
 
 
 def build_report_context(
@@ -94,6 +130,7 @@ def build_report_context(
 
 
 def decimal_ratio(numerator: Decimal, denominator: Decimal) -> Decimal:
+    """Run decimal ratio."""
     if denominator == 0:
         return Decimal("0")
     return (numerator / denominator * Decimal("100")).quantize(Decimal("0.1"))

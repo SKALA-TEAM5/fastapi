@@ -1,37 +1,22 @@
 # --------------------------------------------------------------------------
 # 작성자   : 송상민(ss19801)
 # 작성일   : 2026-05-04
+# 수정일   : 2026-06-18
 #
-# [ 엔드포인트 ]
+# [ 사용 현황 ]
 #
 # /validator/usage-statement
 #   - 설명 : 사용내역서 전체 법령 검증 + agent_logs 항목별 INSERT
-#   - Body : {
-#               "사용내역서ID": int,
-#               "기본정보": { "산안비총액": float, "누계공정률": float },
-#               "카테고리별데이터": [ ... ]
-#             }
 #   - 호출 : validate_usage_statement_service()
 #   - 적재 : agent_logs INSERT (legal, 항목당 1행)
 #
-# /validator/document
-#   - 설명 : 단일 카테고리 법령 검증 (DB 적재 없음, 결과만 반환)
-#   - Body : { "category": str, "items": dict, "base_amount": float, ... }
-#   - 호출 : validate_document_service()
-#
-# /validator/audit
-#   - 설명 : 복수 카테고리 묶음 법령 검증 (DB 적재 없음, 결과만 반환)
-#   - Body : { "base_amount": float, "categories": { ... } }
-#   - 호출 : run_audit_service()
-#
 # [ 주요 클래스 및 함수 정의 ]
 #
-# 1. run_audit_service()               : 카테고리 묶음 검토 서비스
-# 2. validate_document_service()       : 단일 카테고리 검토 서비스
-# 3. validate_usage_statement_service(): 사용내역서 검토 서비스
-# 4. _write_legal_agent_log()          : agent_logs INSERT (legal 전용)
-# 5. _derive_log_result()              : 검증 결과에서 result_code/reason 파생
-# 6. _build_log_details()              : agent_logs.details JSONB 구성
+# 1. validate_usage_statement_service(): 사용내역서 검토 서비스
+# 2. _write_legal_agent_log()          : agent_logs INSERT (legal 전용)
+# 3. _item_result_code()               : 항목 로그 result_code 파생
+# 4. _item_reason()                    : 항목 로그 reason 구성
+# 5. _item_details()                   : 항목 로그 details JSONB 구성
 # --------------------------------------------------------------------------
 from __future__ import annotations
 
@@ -51,56 +36,13 @@ except ImportError:  # pragma: no cover
 from src.agents.validator_agent.audit import decide_category
 from src.agents.validator_agent.calculator import calculate_category_metrics
 from src.agents.validator_agent.context_retriever import retrieve_category_context
-from src.agents.validator_agent.parser import (
-    build_legacy_blocks,
-    parse_single_category_request,
-    parse_usage_statement,
-)
+from src.agents.validator_agent.parser import parse_usage_statement
 from src.agents.validator_agent.rule_matcher import match_category_rules
 from src.core.storage import DEFAULT_COLLECTION
 from src.schemas.classifier import CATEGORIES as _CATEGORIES
 from src.schemas.validator import AuditResponse, CategoryAuditResult
 
 logger = logging.getLogger(__name__)
-
-
-def run_audit_service(
-    *,
-    base_amount: float,
-    categories: dict[str, dict[str, float]],
-    collection: str = DEFAULT_COLLECTION,
-    basic_info_by_category: dict[str, dict[str, Any]] | None = None,
-    summaries_by_category: dict[str, dict[str, Any]] | None = None,
-    progress_rate: float | None = None,
-) -> AuditResponse:
-    parsed = build_legacy_blocks(
-        base_amount=base_amount,
-        categories=categories,
-        basic_info_by_category=basic_info_by_category,
-        summaries_by_category=summaries_by_category,
-        progress_rate=progress_rate,
-    )
-    return _validate_blocks(parsed.base_amount, parsed.blocks, collection=collection)
-
-
-def validate_document_service(
-    *,
-    category: str,
-    items: dict[str, float] | None = None,
-    basic_info: dict[str, Any] | None = None,
-    base_amount: float | None = None,
-    document: dict[str, Any] | None = None,
-    collection: str = DEFAULT_COLLECTION,
-) -> CategoryAuditResult:
-    block = parse_single_category_request(
-        category=category,
-        items=items,
-        basic_info=basic_info,
-        base_amount=base_amount,
-        document=document,
-    )
-    response = _validate_blocks(block.base_amount, [block], collection=collection)
-    return response.categories[block.category_name]
 
 
 def validate_usage_statement_service(
@@ -111,6 +53,18 @@ def validate_usage_statement_service(
     usage_statement_id: int | None = None,
     model_name: str = "claude-sonnet-4-6",
 ) -> AuditResponse:
+    """Validate the legal suitability of a full usage statement.
+
+    Args:
+        document: Parsed usage-statement validator input.
+        collection: Qdrant collection used for legal retrieval.
+        project_id: Optional project id for agent log insertion.
+        usage_statement_id: Optional usage-statement id for agent log insertion.
+        model_name: Model name stored when logs are inserted.
+
+    Returns:
+        Legal audit response grouped by category.
+    """
     parsed = parse_usage_statement(document)
 
     # 토큰 집계는 _validate_blocks 내부에서 per-thread get_openai_callback()으로 처리한다.
@@ -272,58 +226,6 @@ def _item_result_code(item, result: "CategoryAuditResult") -> str:
     return "success"
 
 
-def _category_result_code(result) -> str:
-    """카테고리 레벨 result_code: 부적절이면 hil, 그 외 success."""
-    status = getattr(result, "status", "") or ""
-    if status == "부적절":
-        return "hil"
-    shortfall = getattr(result, "usage_shortfall_amount", None)
-    if shortfall is not None and shortfall > 0:
-        return "hil"
-    if getattr(result, "exceeded", False):
-        return "hil"
-    return "success"
-
-
-def _category_reason(result) -> str:
-    """카테고리 레벨 reason: rejection_reason 우선, 없으면 공정률/한도 정보."""
-    reason = getattr(result, "rejection_reason", "") or ""
-    if reason:
-        return reason[:1000]
-    shortfall = getattr(result, "usage_shortfall_amount", None)
-    if shortfall and shortfall > 0:
-        rate = getattr(result, "required_usage_rate", None)
-        return f"공정률 기준 미달: 누적사용액이 기준({rate * 100:.0f}%)에 {shortfall:,.0f}원 부족합니다."[
-            :1000
-        ]
-    if getattr(result, "exceeded", False):
-        limit = getattr(result, "limit", None)
-        return (
-            f"한도 초과: 카테고리 사용한도({limit:,.0f}원)를 초과하였습니다."[:1000]
-            if limit
-            else "한도 초과"
-        )
-    return ""
-
-
-def _category_details(category_name: str, result) -> dict:
-    """카테고리 레벨 agent_logs.details."""
-    return {
-        "category": {
-            "category_name": category_name,
-            "status": getattr(result, "status", None),
-            "total": getattr(result, "total", None),
-            "limit": getattr(result, "limit", None),
-            "exceeded": getattr(result, "exceeded", False),
-            "progress_rate": getattr(result, "progress_rate", None),
-            "required_usage_rate": getattr(result, "required_usage_rate", None),
-            "required_used_amount": getattr(result, "required_used_amount", None),
-            "cumulative_used_amount": getattr(result, "cumulative_used_amount", None),
-            "usage_shortfall_amount": getattr(result, "usage_shortfall_amount", None),
-        }
-    }
-
-
 _DUPLICATE_CONCLUSION_RE = re.compile(
     r"(허용됩니다|사용이 가능합니다|불허됩니다|사용이 불가합니다)\s*[.\s]+"
     r"(허용됩니다|사용이 가능합니다|불허됩니다|사용이 불가합니다)[.\s]*$"
@@ -365,17 +267,6 @@ def _enrich_reason_law(reason: str, referenced_laws: list[str]) -> str:
         return best if best else m.group(0)
 
     return _BARE_ARTICLE_RE.sub(_replace, reason)
-
-
-def _category_metrics_suffix(result) -> str:
-    """카테고리 사용한도 정보를 reason에 추가할 접미 문장 생성.
-    공정률 shortfall은 사용내역서 전체 기준이므로 개별 항목 reason에 포함하지 않는다.
-    """
-    limit = getattr(result, "limit", None)
-    exceeded = getattr(result, "exceeded", False)
-    if limit is None or not exceeded:
-        return ""
-    return f"이 카테고리 사용한도는 {limit:,.0f}원이며, 현재 한도를 초과하였습니다."
 
 
 def _item_reason(item, result: "CategoryAuditResult" | None = None) -> str:

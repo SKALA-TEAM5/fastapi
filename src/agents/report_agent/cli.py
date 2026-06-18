@@ -1,3 +1,13 @@
+# --------------------------------------------------------------------------
+# 작성자   : 차현주
+# 작성일   : 2026-06-18
+# 수정일   : 2026-06-18
+#
+# [ 주요 함수 정의 ]
+#
+# 1. generate_report_json() : ReportContext JSON을 ReportDraft JSON으로 변환
+# 2. main()                 : report-agent CLI 진입점
+# --------------------------------------------------------------------------
 from __future__ import annotations
 
 """ReportContext JSON을 ReportDraft JSON 보고서로 생성하는 CLI입니다."""
@@ -15,11 +25,13 @@ DEFAULT_REPORT_OUTPUT = EXAMPLES_REPORT_AGENT_DIR / "sample_report_llm_output.js
 
 
 def load_report_context(path: str | Path) -> ReportContext:
+    """Load load report context."""
     data = json.loads(Path(path).read_text(encoding="utf-8"))
     return ReportContext.model_validate(data)
 
 
 def resolve_report_output_path(output_path: str | Path | None = None) -> Path:
+    """Resolve resolve report output path."""
     if output_path is None:
         return DEFAULT_REPORT_OUTPUT
 
@@ -30,6 +42,7 @@ def resolve_report_output_path(output_path: str | Path | None = None) -> Path:
 
 
 def write_report_draft_json(draft: ReportDraft, output_path: str | Path) -> Path:
+    """Write write report draft json."""
     output = Path(output_path)
     output.parent.mkdir(parents=True, exist_ok=True)
     output.write_text(
@@ -45,12 +58,14 @@ def generate_report_json(
     *,
     use_default_llm: bool = True,
 ) -> Path:
+    """Generate generate report json."""
     context = load_report_context(input_context_path)
     draft = ReportAgent(use_default_llm=use_default_llm).generate(context)
     return write_report_draft_json(draft, resolve_report_output_path(output_json_path))
 
 
 def main() -> None:
+    """Run main."""
     parser = argparse.ArgumentParser(description="Generate ReportDraft JSON from ReportContext JSON.")
     parser.add_argument("input_context_json", help="Path to ReportContext JSON.")
     parser.add_argument(

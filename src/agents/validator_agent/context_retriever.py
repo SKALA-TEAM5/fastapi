@@ -1,7 +1,7 @@
 # --------------------------------------------------------------------------
 # 작성자   : 송상민(ss19801)
 # 작성일   : 2026-05-04
-# 수정일   : 2026-05-26
+# 수정일   : 2026-06-18
 #
 # [ 주요 클래스 및 함수 정의 ]
 #
@@ -25,12 +25,15 @@ from src.repositories import LegalRulesRepository
 
 @dataclass
 class CategoryRetrievedContext:
+    """Qdrant retrieval result grouped by category, item, and exception docs."""
+
     category_docs: list[Document]
     item_docs: dict[str, list[Document]]
     exception_docs: list[Document]
 
     @property
     def all_docs(self) -> list[Document]:
+        """Return de-duplicated documents across category and item retrievals."""
         merged: list[Document] = []
         for doc in self.category_docs + self.exception_docs:
             if _doc_key(doc) not in {_doc_key(existing) for existing in merged}:
@@ -47,6 +50,7 @@ def retrieve_category_context(
     block: CategoryInputBlock,
     collection: str,
 ) -> CategoryRetrievedContext:
+    """Retrieve category-level and item-level legal context from Qdrant."""
     repo = LegalRulesRepository()
     vectorstore = load_vectorstore(collection_name=collection)
     retriever = build_retriever(vectorstore, collection_name=collection)
@@ -86,6 +90,7 @@ def retrieve_category_context(
 
 
 def _retrieve_docs(*, question: str, retriever) -> list[Document]:
+    """Run retrieve/rerank with query rewrite retries when no docs are found."""
     state = {
         "question": question,
         "retrieved_docs": [],
@@ -104,6 +109,7 @@ def _retrieve_docs(*, question: str, retriever) -> list[Document]:
 
 
 def _build_category_query(block: CategoryInputBlock, *, repo: LegalRulesRepository) -> str:
+    """Build a category-level query focused on limits and broad legal rules."""
     hint_terms: list[str] = [block.category_code, block.category_name]
     law_terms: list[str] = []
     evidence_terms: list[str] = []
@@ -139,6 +145,7 @@ def _build_item_query(
     *,
     repo: LegalRulesRepository,
 ) -> str:
+    """Build an item-level query enriched with RDB hints from allowed rules."""
     extra = f" {item.remark}" if item.remark else ""
     item_text_norm = item.item_name.lower()
     prelim_matches = repo.find_validator_matches(
@@ -186,5 +193,6 @@ def _build_item_fallback_query(block: CategoryInputBlock, item: CategoryItemRow)
 
 
 def _doc_key(doc: Document) -> tuple[str, str]:
+    """Return a stable document key for lightweight de-duplication."""
     source = str(doc.metadata.get("source", ""))
     return source, doc.page_content[:120]

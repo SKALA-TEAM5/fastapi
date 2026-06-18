@@ -1,6 +1,7 @@
 # --------------------------------------------------------------------------
 # 작성자   : 송상민(ss19801)
 # 작성일   : 2026-06-04
+# 수정일   : 2026-06-18
 #
 # [ 주요 함수 정의 ]
 #
@@ -22,7 +23,6 @@
 # --------------------------------------------------------------------------
 from __future__ import annotations
 
-import json
 import logging
 import os
 import re
@@ -105,18 +105,6 @@ def _format_docs(docs) -> str:
         f"[출처: {_clean_source(doc.metadata.get('source', doc.metadata.get('title', '알 수 없음')))}]\n{doc.page_content}"
         for doc in docs
     )
-
-
-def _parse_json(raw: str) -> dict:
-    """LLM 응답에서 JSON을 안전하게 파싱한다.
-
-    LLM이 ```json ... ``` 코드블록으로 감싸는 경우를 처리한다.
-    str.strip("```json")은 문자 집합을 제거하므로 사용하지 않는다.
-    """
-    raw = raw.strip()
-    raw = re.sub(r"^```(?:json)?\s*", "", raw)
-    raw = re.sub(r"\s*```$", "", raw)
-    return json.loads(raw.strip())
 
 
 def _extract_sources(docs) -> list[str]:
