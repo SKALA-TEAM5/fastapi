@@ -366,9 +366,12 @@ def call_vision_gemini(
         return {"error": f"파일 로드 실패: {e}"}
 
     try:
+        # [재현성] temperature=0 으로 고정해 동일 입력에 대한 출력 변동을 최소화한다.
+        from google.genai import types
         response = client.models.generate_content(
             model=_model,
             contents=[content_part, prompt],
+            config=types.GenerateContentConfig(temperature=0),
         )
         raw_text = response.text
         usage = response.usage_metadata
